@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import SCHEMA_VERSION, __version__
+from . import SCHEMA_VERSION, display_version
 from .logic import (
     OPTION_PATH,
     JsonObject,
@@ -368,7 +368,7 @@ class UpdateCheckerWindow(QMainWindow):
             lambda: QMessageBox.about(
                 self,
                 "About NixOS Update Checker",
-                f"<b>NixOS Update Checker {__version__}</b><br><br>"
+                f"<b>NixOS Update Checker {display_version()}</b><br><br>"
                 "Official Qt for Python interface for the currently running NixOS system.",
             ),
         )
@@ -1152,7 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
             "NIXOS_UPDATE_CHECKER_REPORT", "/var/lib/nixos-update-checker/report.json"
         ),
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {display_version()}")
     return parser
 
 
@@ -1162,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("NixOS Update Checker")
     app.setApplicationDisplayName("NixOS Update Checker")
     app.setOrganizationName("nixos-update-checker")
-    app.setApplicationVersion(__version__)
+    app.setApplicationVersion(display_version())
     repository = namespace.repository or environment(
         "NIXOS_UPDATE_CHECKER_REPOSITORY", "/etc/nixos"
     )

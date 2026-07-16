@@ -229,11 +229,17 @@ def test_fast_package_comparison_uses_running_closure_after_lock_was_updated() -
 
 def test_realized_nixos_package_option_promotes_build_change() -> None:
     nvidia_path = "/nix/store/bbbbbbbb-nvidia-x11-575.2"
+    nvidia_open_path = "/nix/store/dddddddd-nvidia-open-575.2-6.18.1"
     changes = [
         {
             "name": "nvidia-x11",
             "kind": "version",
             "after": {"path": nvidia_path, "paths": [nvidia_path]},
+        },
+        {
+            "name": "nvidia-open",
+            "kind": "version",
+            "after": {"path": nvidia_open_path, "paths": [nvidia_open_path]},
         },
         {
             "name": "libdrm",
@@ -248,10 +254,18 @@ def test_realized_nixos_package_option_promotes_build_change() -> None:
             "version": "575.2",
             "path": nvidia_path,
             "option": "hardware.nvidia.package",
-        }
+        },
+        {
+            "name": "nvidia-open-575.2-6.18.1",
+            "pname": "nvidia-open",
+            "version": "575.2-6.18.1",
+            "path": nvidia_open_path,
+            "option": "hardware.nvidia.package",
+            "component": "open",
+        },
     ]
     primary, dependencies = partition_priority_changes(changes, option_packages)
-    assert [change["name"] for change in primary] == ["nvidia-x11"]
+    assert [change["name"] for change in primary] == ["nvidia-x11", "nvidia-open"]
     assert [change["name"] for change in dependencies] == ["libdrm"]
 
 

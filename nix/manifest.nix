@@ -134,17 +134,9 @@ let
     in
     if enableScopes == [ ] then isHardwareOption else builtins.all scopeIsEnabled enableScopes;
 
-  packagesFromOption =
-    optionInfo:
+  serializePackages =
+    values:
     let
-      optionName = builtins.concatStringsSep "." optionInfo.path;
-      optionValue = getAttrFromPath null optionInfo.path config;
-      packageValues =
-        if optionInfo.list then
-          if builtins.isList optionValue then optionValue else [ ]
-        else
-          [ optionValue ];
-      values = map (packageValue: package packageValue // { option = optionName; }) packageValues;
       result = builtins.tryEval (
         let
           serialized = builtins.unsafeDiscardStringContext (builtins.toJSON values);
@@ -155,15 +147,63 @@ let
     in
     if result.success && builtins.isList result.value then result.value else [ ];
 
+  packageComponents =
+    optionName: packageValue:
+    let
+      componentNamesResult = builtins.tryEval (builtins.attrNames (packageValue.passthru or { }));
+      componentNames =
+        if componentNamesResult.success && builtins.isList componentNamesResult.value then
+          componentNamesResult.value
+        else
+          [ ];
+    in
+    builtins.concatMap (
+      componentName:
+      let
+        componentResult = builtins.tryEval packageValue.passthru.${componentName};
+        componentValue = if componentResult.success then componentResult.value else null;
+      in
+      if builtins.isAttrs componentValue && componentValue ? name && componentValue ? outPath then
+        serializePackages [
+          (
+            package componentValue
+            // {
+              option = optionName;
+              component = componentName;
+            }
+          )
+        ]
+      else
+        [ ]
+    ) componentNames;
+
+  packagesFromOption =
+    includeComponents: optionInfo:
+    let
+      optionName = builtins.concatStringsSep "." optionInfo.path;
+      optionValue = getAttrFromPath null optionInfo.path config;
+      packageValues =
+        if optionInfo.list then
+          if builtins.isList optionValue then optionValue else [ ]
+        else
+          [ optionValue ];
+      values = serializePackages (
+        map (packageValue: package packageValue // { option = optionName; }) packageValues
+      );
+      components =
+        if includeComponents then builtins.concatMap (packageComponents optionName) packageValues else [ ];
+    in
+    values ++ components;
+
   packageOptions = collectPackageOptions [ ] options;
 
-  activeOptionPackages = builtins.concatMap packagesFromOption (
+  activeOptionPackages = builtins.concatMap (packagesFromOption false) (
     builtins.filter (optionInfo: pathIsEnabled optionInfo.path) packageOptions
   );
 
   priorityOptionPackages =
     if includePriorityOptionPackages then
-      builtins.concatMap packagesFromOption (
+      builtins.concatMap (packagesFromOption true) (
         builtins.filter (optionInfo: pathIsPriorityCandidate optionInfo.path) packageOptions
       )
     else

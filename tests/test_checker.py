@@ -5,7 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from nixos_update_checker import checker
+from nixos_update_checker import checker, display_version
+
+
+def test_display_version_includes_packaged_flake_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_REVISION", "72ffd10-dirty")
+    assert display_version() == "1.0.0 (72ffd10-dirty)"
+
+
+def test_display_version_omits_unknown_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_REVISION", "unknown")
+    assert display_version() == "1.0.0"
 
 
 def test_discovery_selects_output_name_that_differs_from_hostname(

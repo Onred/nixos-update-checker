@@ -1,4 +1,8 @@
 {
+  revision ? "unknown",
+}:
+
+{
   config,
   lib,
   pkgs,
@@ -71,6 +75,7 @@ in
         inherit pkgs;
         defaultCpuQuota = cfg.cpuQuota;
         defaultRepository = cfg.repository;
+        inherit revision;
       };
       description = "Packaged Qt application and native checker backend.";
     };

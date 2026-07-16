@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import SCHEMA_VERSION, __version__
+from . import SCHEMA_VERSION, __version__, build_revision, display_version
 from .logic import (
     ClosureInformation,
     ConfigurationCandidate,
@@ -540,6 +540,7 @@ def run_check(options: CheckOptions) -> JsonObject:
     report: JsonObject = {
         "schemaVersion": SCHEMA_VERSION,
         "backendVersion": environment("NIXOS_UPDATE_CHECKER_VERSION", __version__),
+        "buildRevision": build_revision(),
         "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": "success",
         "repository": str(repository),
@@ -668,6 +669,7 @@ def error_report(repository: str, error: CheckerError) -> JsonObject:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "backendVersion": environment("NIXOS_UPDATE_CHECKER_VERSION", __version__),
+        "buildRevision": build_revision(),
         "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": "error",
         "repository": str(Path(repository).expanduser().resolve()),
@@ -729,7 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--service", action="store_true")
     parser.add_argument("--report", default="/var/lib/nixos-update-checker/report.json")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {display_version()}")
     return parser
 
 

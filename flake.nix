@@ -12,11 +12,21 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      revision =
+        if self ? shortRev then
+          self.shortRev
+        else if self ? dirtyShortRev then
+          self.dirtyShortRev
+        else if self ? narHash then
+          "dirty-${builtins.substring 7 12 self.narHash}"
+        else
+          "unknown";
     in
     {
       packages = forAllSystems (system: rec {
         default = import ./nix/package.nix {
           pkgs = pkgsFor system;
+          inherit revision;
         };
         nixos-update-checker = default;
       });
@@ -43,6 +53,23 @@
         system:
         let
           pkgs = pkgsFor system;
+          componentFixture =
+            if pkgs.stdenv.hostPlatform.isx86_64 then
+              {
+                package = pkgs.linuxPackages.nvidia_x11;
+                component = "open";
+                pname = "nvidia-open";
+              }
+            else
+              {
+                package = pkgs.hello // {
+                  passthru = (pkgs.hello.passthru or { }) // {
+                    driver = pkgs.jq;
+                  };
+                };
+                component = "driver";
+                pname = "jq";
+              };
           fixtureModule =
             { lib, pkgs, ... }:
             {
@@ -67,6 +94,10 @@
               options.hardware.update-checker-manual.package = lib.mkOption {
                 type = lib.types.package;
                 default = pkgs.git;
+              };
+              options.hardware.update-checker-component.package = lib.mkOption {
+                type = lib.types.package;
+                default = componentFixture.package;
               };
 
               config = {
@@ -138,6 +169,12 @@
             assert builtins.any (
               package: package.option == "hardware.update-checker-manual.package"
             ) standalonePriorityOptionManifest.priorityOptionPackages;
+            assert builtins.any (
+              package:
+              package.option == "hardware.update-checker-component.package"
+              && (package.component or null) == componentFixture.component
+              && (package.pname or null) == componentFixture.pname
+            ) standalonePriorityOptionManifest.priorityOptionPackages;
             pkgs.runCommand "nixos-update-checker-module-check" { } ''
               touch "$out"
             '';
@@ -183,7 +220,7 @@
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 
       nixosModules = {
-        default = import ./nix/module.nix;
+        default = import ./nix/module.nix { inherit revision; };
         nixos-update-checker = self.nixosModules.default;
       };
     };

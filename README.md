@@ -187,7 +187,10 @@ under `hardware.*` when their package identity is present in the running
 closure. After a real build, the stronger rule is used: the option's exact
 output path must be in the candidate closure. This automatically recognizes
 choices such as `hardware.nvidia.package` without maintaining hardware-specific
-package names, while avoiding unrelated disabled service defaults.
+package names. Package-valued passthru components are inspected as well, so a
+realized `hardware.nvidia.package.open` derivation appears as `nvidia-open`
+alongside `nvidia-x11`. Non-package passthru metadata is ignored, as are
+unrelated disabled service defaults.
 
 There is no built-in NVIDIA, QEMU, Mesa, `kvmfr`, or other hardware-specific
 list. If the automatic rules cannot infer that an option is important, open
@@ -232,6 +235,18 @@ pytest
 ruff check .
 mypy src
 ```
+
+To confirm that `nix run` is using the package from the current checkout, compare
+its embedded flake revision with Git:
+
+```console
+git rev-parse --short HEAD
+nix run path:. -- --version
+```
+
+The GUI shows the same revision under **Help → About**, and backend reports
+include it as `buildRevision`. A dirty checkout is labeled with a content
+fingerprint instead of a commit revision.
 
 The pytest suite contains data-driven cases for single and multiple
 `nixosConfigurations`, output names that differ from hostnames, missing
