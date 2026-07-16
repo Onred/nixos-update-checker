@@ -1,5 +1,6 @@
 {
-  "direnv.restart.automatic": true,
+  "direnv.restart.automatic": false,
+  "direnv.watchForChanges": false,
   "nix.enableLanguageServer": true,
   "nix.serverPath": "${workspaceFolder}/.nixd",
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
