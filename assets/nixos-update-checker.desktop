@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NixOS Update Checker
+GenericName=System Update Checker
+Comment=Inspect, update, and rebuild a NixOS flake
+Exec=nixos-update-checker
+Icon=nixos-update-checker
+Terminal=false
+Categories=System;Utility;Qt;
+Keywords=NixOS;Nix;updates;flake;rebuild;
+StartupNotify=true

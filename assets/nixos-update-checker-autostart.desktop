@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NixOS Update Checker
+Comment=Show NixOS update status in the system tray
+Exec=nixos-update-checker --background
+Icon=nixos-update-checker
+Terminal=false
+Categories=System;Utility;Qt;
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+NoDisplay=true

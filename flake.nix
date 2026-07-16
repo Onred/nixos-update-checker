@@ -1,9 +1,10 @@
 {
-  description = "Inspect pending NixOS flake and package updates without modifying flake.lock";
+  description = "Qt NixOS flake update checker with tray and background service integration";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -13,23 +14,164 @@
       pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
-      packages = forAllSystems (system: {
+      packages = forAllSystems (system: rec {
         default = import ./nix/package.nix {
           pkgs = pkgsFor system;
         };
+        nixos-update-checker = default;
       });
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
+          program = "${self.packages.${system}.default}/bin/nixos-update-checker";
+          meta.description = "Open the NixOS Update Checker Qt application";
+        };
+        gui = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/nixos-update-checker";
+          meta.description = "Open the NixOS Update Checker Qt application";
+        };
+        cli = {
+          type = "app";
           program = "${self.packages.${system}.default}/bin/check-nixos-updates";
-          meta.description = "Check a NixOS flake for pending input and package updates";
+          meta.description = "Run the NixOS update checker backend in a terminal";
         };
       });
 
-      checks = forAllSystems (system: {
-        package = self.packages.${system}.default;
-      });
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+          fixtureModule =
+            { lib, pkgs, ... }:
+            {
+              options.services.update-checker-enabled = {
+                enable = lib.mkEnableOption "update checker manifest fixture";
+                package = lib.mkOption {
+                  type = lib.types.package;
+                  default = pkgs.hello;
+                };
+                packages = lib.mkOption {
+                  type = lib.types.listOf lib.types.package;
+                  default = [ pkgs.jq ];
+                };
+              };
+              options.services.update-checker-disabled = {
+                enable = lib.mkEnableOption "disabled update checker manifest fixture";
+                package = lib.mkOption {
+                  type = lib.types.package;
+                  default = pkgs.curl;
+                };
+              };
+              options.hardware.update-checker-manual.package = lib.mkOption {
+                type = lib.types.package;
+                default = pkgs.git;
+              };
+
+              config = {
+                services.update-checker-enabled.enable = true;
+                services.update-checker-disabled.enable = false;
+              };
+            };
+          hostModule =
+            { pkgs, ... }:
+            {
+              hardware.graphics = {
+                enable = true;
+                extraPackages = [ pkgs.libglvnd ];
+              };
+              system.stateVersion = "26.05";
+            };
+          moduleEvaluation = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              fixtureModule
+              hostModule
+              { programs.nixos-update-checker.enable = true; }
+            ];
+          };
+          moduleConfig = moduleEvaluation.config;
+          standaloneEvaluation = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              fixtureModule
+              hostModule
+            ];
+          };
+          standaloneManifest = import ./nix/manifest.nix {
+            inherit (standaloneEvaluation) config options;
+          };
+        in
+        {
+          package = self.packages.${system}.default;
+          module =
+            assert moduleConfig.systemd.services.nixos-update-checker.serviceConfig.CPUQuota == "25%";
+            assert moduleConfig.systemd.timers.nixos-update-checker.timerConfig.OnUnitActiveSec == "6h";
+            assert moduleConfig.environment.etc ? "xdg/autostart/nixos-update-checker.desktop";
+            assert builtins.length standaloneManifest.corePackages == 2;
+            assert builtins.any (
+              package: package.option == "hardware.graphics.package"
+            ) standaloneManifest.activeOptionPackages;
+            assert builtins.any (
+              package: package.option == "hardware.graphics.extraPackages"
+            ) standaloneManifest.activeOptionPackages;
+            assert builtins.any (
+              package: package.option == "services.update-checker-enabled.package"
+            ) standaloneManifest.activeOptionPackages;
+            assert builtins.any (
+              package: package.option == "services.update-checker-enabled.packages"
+            ) standaloneManifest.activeOptionPackages;
+            assert
+              !(builtins.any (
+                package: package.option == "services.update-checker-disabled.package"
+              ) standaloneManifest.activeOptionPackages);
+            assert
+              !(builtins.any (
+                package: package.option == "hardware.update-checker-manual.package"
+              ) standaloneManifest.activeOptionPackages);
+            pkgs.runCommand "nixos-update-checker-module-check" { } ''
+              touch "$out"
+            '';
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+          python = pkgs.python3.withPackages (
+            pythonPackages: with pythonPackages; [
+              mypy
+              pyside6
+              pytest
+              pytest-cov
+            ]
+          );
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.nixfmt-tree
+              pkgs.ruff
+              python
+              (pkgs.lib.getBin pkgs.coreutils)
+              (pkgs.lib.getBin pkgs.jq)
+              (pkgs.lib.getBin pkgs.nix)
+              (pkgs.lib.getBin pkgs.nixd)
+              (pkgs.lib.getBin pkgs.systemd)
+              (pkgs.lib.getBin pkgs.util-linux)
+            ];
+
+            shellHook = ''
+              ln -sfn ${python} .venv
+              ln -sfn ${pkgs.lib.getExe pkgs.nixd} .nixd
+              export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"
+            '';
+          };
+        }
+      );
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 

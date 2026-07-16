@@ -1,176 +1,146 @@
-{ config, lib, options, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.programs.nixos-update-checker;
-
-  packageManifest = { config, options }:
-    let
-      package = packageValue: {
-        name = packageValue.name;
-        pname = packageValue.pname or null;
-        version = packageValue.version or null;
-        path = packageValue.outPath;
-      };
-
-      packageList = packages: map package packages;
-
-      filterAttrs = predicate: attrs:
-        builtins.listToAttrs (
-          builtins.concatMap
-            (name:
-              if predicate name attrs.${name} then
-                [ { inherit name; value = attrs.${name}; } ]
-              else
-                [ ])
-            (builtins.attrNames attrs)
-        );
-
-      getAttrFromPath = default: path: attrs:
-        if path == [ ] then
-          attrs
-        else if !builtins.isAttrs attrs || !builtins.hasAttr (builtins.head path) attrs then
-          default
-        else
-          getAttrFromPath default (builtins.tail path) attrs.${builtins.head path};
-
-      take = count: values:
-        if count == 0 || values == [ ] then
-          [ ]
-        else
-          [ (builtins.head values) ] ++ take (count - 1) (builtins.tail values);
-
-      collectPackageOptions = path: attrs:
-        builtins.concatMap
-          (name:
-            let
-              value = attrs.${name};
-              optionPath = path ++ [ name ];
-            in
-            if builtins.isAttrs value && (value._type or null) == "option" then
-              if value.type.name == "package" then [ optionPath ] else [ ]
-            else if builtins.isAttrs value then
-              collectPackageOptions optionPath value
-            else
-              [ ])
-          (builtins.attrNames attrs);
-
-      ancestorPaths = optionPath:
-        let
-          parentLength = builtins.length optionPath - 1;
-        in
-        builtins.genList
-          (index: take (index + 1) optionPath)
-          parentLength;
-
-      pathIsEnabled = optionPath:
-        let
-          hasCurrentEnableOption = ancestorPath:
-            let
-              enableOption = getAttrFromPath null (ancestorPath ++ [ "enable" ]) options;
-            in
-            builtins.isAttrs enableOption
-            && (enableOption._type or null) == "option"
-            && (enableOption.visible or true);
-
-          enableScopes = builtins.filter hasCurrentEnableOption (ancestorPaths optionPath);
-
-          scopeIsEnabled = ancestorPath:
-            let
-              result = builtins.tryEval (
-                getAttrFromPath false (ancestorPath ++ [ "enable" ]) config == true
-              );
-            in
-            result.success && result.value;
-        in
-        enableScopes != [ ] && builtins.all scopeIsEnabled enableScopes;
-
-      packageFromOption = optionPath:
-        let
-          packageValue = package (getAttrFromPath null optionPath config);
-          result = builtins.tryEval (builtins.deepSeq packageValue packageValue);
-        in
-        if result.success then
-          result.value // { option = builtins.concatStringsSep "." optionPath; }
-        else
-          null;
-
-      activeOptionPackages = builtins.filter (value: value != null) (
-        map packageFromOption (
-          builtins.filter pathIsEnabled (collectPackageOptions [ ] options)
-        )
-      );
-
-      maybePackage = packageValue:
-        let
-          value = package packageValue;
-          result = builtins.tryEval (builtins.deepSeq value value);
-        in
-        if result.success then result.value else null;
-    in
-    {
-      toplevelDeriver = config.system.build.toplevel.drvPath;
-
-      userPackages = builtins.mapAttrs (_: user: packageList (user.packages or [ ])) (
-        filterAttrs (_: user: (user.packages or [ ]) != [ ]) config.users.users
-      );
-
-      systemPackages = packageList config.environment.systemPackages;
-
-      inherit activeOptionPackages;
-
-      manual = {
-        systemd = maybePackage config.systemd.package;
-        kernel = maybePackage config.boot.kernelPackages.kernel;
-        nvidia = maybePackage config.hardware.nvidia.package;
-        qemu = maybePackage config.virtualisation.libvirtd.qemu.package;
-        kvmfr = maybePackage config.boot.kernelPackages.kvmfr;
-      };
-    };
+  reportPath = "/var/lib/nixos-update-checker/report.json";
 
 in
 {
   options.programs.nixos-update-checker = {
     enable = lib.mkEnableOption "the NixOS flake update checker";
 
-    host = lib.mkOption {
-      type = lib.types.str;
-      default = "nixos";
-      description = "Flake nixosConfigurations attribute checked by default.";
+    repository = lib.mkOption {
+      type = lib.types.strMatching "/.*";
+      default = "/etc/nixos";
+      example = "/home/alice/nixos-config";
+      description = "Absolute path to the NixOS flake checked by the GUI and background service.";
     };
 
     cpuQuota = lib.mkOption {
       type = lib.types.strMatching "[1-9][0-9]*%";
       default = "25%";
-      description = "Default transient systemd scope CPU quota.";
+      description = "CPU quota used by limited terminal checks and the background service.";
+    };
+
+    tray.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Start the Qt tray application for graphical desktop sessions.";
+    };
+
+    service = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Run periodic update checks as a low-priority system service.";
+      };
+
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "root";
+        description = "User account used by the background checker service.";
+      };
+
+      onBootSec = lib.mkOption {
+        type = lib.types.str;
+        default = "10m";
+        description = "Delay after boot before the first background check.";
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.str;
+        default = "6h";
+        description = "Interval between background update checks.";
+      };
+
+      randomizedDelaySec = lib.mkOption {
+        type = lib.types.str;
+        default = "30m";
+        description = "Maximum random delay added to timer activations.";
+      };
     };
 
     package = lib.mkOption {
       type = lib.types.package;
       default = import ./package.nix {
         inherit pkgs;
-        defaultHost = cfg.host;
         defaultCpuQuota = cfg.cpuQuota;
+        defaultRepository = cfg.repository;
       };
-      description = "Packaged update-checker command.";
+      description = "Packaged Qt application and native checker backend.";
     };
 
-    manifest = lib.mkOption {
-      type = lib.types.raw;
-      readOnly = true;
-      internal = true;
-      description = "Evaluated package manifest consumed by the checker.";
-    };
   };
 
-  config = lib.mkMerge [
-    {
-      programs.nixos-update-checker.manifest = packageManifest {
-        inherit config options;
-      };
-    }
+  config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
 
-    (lib.mkIf cfg.enable {
-      environment.systemPackages = [ cfg.package ];
-    })
-  ];
+    environment.etc = lib.mkIf cfg.tray.enable {
+      "xdg/autostart/nixos-update-checker.desktop".source =
+        "${cfg.package}/share/nixos-update-checker/autostart.desktop";
+    };
+
+    systemd.services = lib.mkIf cfg.service.enable {
+      nixos-update-checker = {
+        description = "Check the NixOS flake for available updates";
+        documentation = [ "https://github.com/Onred/nixos-update-checker" ];
+        after = [
+          "network-online.target"
+          "nix-daemon.socket"
+        ];
+        wants = [ "network-online.target" ];
+
+        environment = {
+          HOME = "/var/lib/nixos-update-checker";
+        };
+
+        script = ''
+          exec ${cfg.package}/bin/check-nixos-updates \
+            --service \
+            --report ${reportPath} \
+            ${lib.escapeShellArg cfg.repository}
+        '';
+
+        serviceConfig = {
+          Type = "oneshot";
+          User = cfg.service.user;
+          StateDirectory = "nixos-update-checker";
+          StateDirectoryMode = "0755";
+          UMask = "0022";
+          CPUQuota = cfg.cpuQuota;
+          CPUWeight = 1;
+          IOWeight = 1;
+          Nice = 19;
+          IOSchedulingClass = "idle";
+          IOSchedulingPriority = 7;
+          OOMScoreAdjust = 500;
+          TimeoutStartSec = "infinity";
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = "read-only";
+          NoNewPrivileges = true;
+          LockPersonality = true;
+          RestrictSUIDSGID = true;
+        };
+      };
+    };
+
+    systemd.timers = lib.mkIf cfg.service.enable {
+      nixos-update-checker = {
+        description = "Periodically check the NixOS flake for updates";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = cfg.service.onBootSec;
+          OnUnitActiveSec = cfg.service.interval;
+          RandomizedDelaySec = cfg.service.randomizedDelaySec;
+          Unit = "nixos-update-checker.service";
+        };
+      };
+    };
+  };
 }

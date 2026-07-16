@@ -1,1 +1,9 @@
 /result
+/.direnv/
+/.mypy_cache/
+/.nixd
+/.pytest_cache/
+/.ruff_cache/
+/.venv
+__pycache__/
+*.py[cod]

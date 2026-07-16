@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "charliermarsh.ruff",
+    "jnoortheen.nix-ide",
+    "mkhl.direnv",
+    "ms-python.python",
+    "ms-python.vscode-pylance"
+  ]
+}
