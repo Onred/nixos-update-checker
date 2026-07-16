@@ -124,6 +124,96 @@ def update_sort_key(update: JsonObject) -> tuple[Any, ...]:
     )
 
 
+PACKAGE_SET_PATTERNS = (
+    (re.compile(r"^python(?P<version>\d+(?:\.\d+)?)-"), "python", "Python"),
+    (re.compile(r"^perl(?P<version>\d+(?:\.\d+)*)-"), "perl", "Perl"),
+    (re.compile(r"^ruby(?P<version>\d+(?:\.\d+)*)-"), "ruby", "Ruby"),
+    (re.compile(r"^lua(?P<version>\d+(?:[._]\d+)*)-"), "lua", "Lua"),
+    (re.compile(r"^ghc(?P<version>\d+(?:\.\d+)*)-"), "ghc", "GHC"),
+    (re.compile(r"^emacs-"), "emacs", "Emacs"),
+)
+
+
+def package_set_identity(name: str) -> tuple[str, str] | None:
+    for pattern, key, label in PACKAGE_SET_PATTERNS:
+        match = pattern.match(name)
+        if match is None:
+            continue
+        version = str(match.groupdict().get("version") or "").replace("_", ".")
+        suffix = f" {version}" if version else ""
+        return (f"{key}:{version}", f"{label}{suffix} package set")
+    return None
+
+
+def group_package_update_rows(rows: list[JsonObject]) -> list[JsonObject]:
+    grouped: dict[tuple[str, str], list[JsonObject]] = {}
+    labels: dict[tuple[str, str], str] = {}
+    ungrouped: list[JsonObject] = []
+    for row in rows:
+        identity = package_set_identity(str(row.get("name", "")))
+        if identity is None:
+            ungrouped.append(row)
+            continue
+        set_key, label = identity
+        key = (str(row.get("channel", "unknown")), set_key)
+        grouped.setdefault(key, []).append(row)
+        labels[key] = label
+
+    result = list(ungrouped)
+    for key, members in grouped.items():
+        if len(members) == 1:
+            result.extend(members)
+            continue
+        channel, _set_key = key
+        count = len(members)
+        result.append(
+            {
+                "type": f"nixPkg · {channel}",
+                "channel": channel,
+                "name": labels[key],
+                "description": f"{count} package updates in this set",
+                "current": "Multiple versions",
+                "available": f"{count} updates",
+                "packageChanges": sorted(
+                    members, key=lambda member: str(member.get("name", "")).casefold()
+                ),
+                "updateCount": count,
+            }
+        )
+    return result
+
+
+def update_detail_lines(update: JsonObject) -> list[str]:
+    package_changes = update.get("packageChanges", [])
+    store_changes = update.get("storeChanges", [])
+    details = package_changes if package_changes else store_changes
+    if not isinstance(details, list):
+        return []
+    lines: list[str] = []
+    for change in details:
+        if not isinstance(change, dict):
+            continue
+        if package_changes:
+            current = str(change.get("current", "unknown"))
+            available = str(change.get("available", "unknown"))
+            description = str(change.get("description") or "")
+        else:
+            before = change.get("before")
+            after = change.get("after")
+            current = package_version(before)
+            available = package_version(after)
+            description = str(
+                change.get("description")
+                or (after.get("description") if isinstance(after, dict) else "")
+                or (before.get("description") if isinstance(before, dict) else "")
+                or ""
+            )
+        lines.append(f"• {change.get('name', 'unknown')}: {current} → {available}")
+        if description:
+            lines.append(f"  {description}")
+    return lines
+
+
 class UpdateItemDelegate(QStyledItemDelegate):
     def item_option(self, option: QStyleOptionViewItem, index: Any) -> QStyleOptionViewItem:
         item_option = QStyleOptionViewItem(option)
@@ -1066,7 +1156,7 @@ class UpdateCheckerWindow(QMainWindow):
         inputs: list[JsonObject],
         store_changes: list[JsonObject],
     ) -> None:
-        rows: list[JsonObject] = []
+        package_rows: list[JsonObject] = []
         for change in packages:
             after = change.get("after")
             before = change.get("before")
@@ -1083,7 +1173,7 @@ class UpdateCheckerWindow(QMainWindow):
                 or (before or {}).get("channel")
                 or "unknown"
             )
-            rows.append(
+            package_rows.append(
                 {
                     "type": f"nixPkg · {channel}",
                     "channel": channel,
@@ -1093,6 +1183,7 @@ class UpdateCheckerWindow(QMainWindow):
                     "available": available,
                 }
             )
+        rows = group_package_update_rows(package_rows)
         for change in inputs:
             after = input_revision(change.get("after"))
             rows.append(
@@ -1126,7 +1217,7 @@ class UpdateCheckerWindow(QMainWindow):
             type_item = QTableWidgetItem(str(update["type"]))
             name_text = str(update["name"])
             if update["description"]:
-                name_text += f"\n{update['description']}"
+                name_text += f"\n• {update['description']}"
             name_item = QTableWidgetItem(name_text)
             available_item = QTableWidgetItem(str(update["available"]))
             type_item.setData(Qt.ItemDataRole.UserRole, update)
@@ -1163,15 +1254,8 @@ class UpdateCheckerWindow(QMainWindow):
         self.information_type.setText(f"Type: {update.get('type', '—')}")
         self.information_current.setText(f"Current: {update.get('current', '—')}")
         self.information_available.setText(f"Available: {update.get('available', '—')}")
-        store_changes = update.get("storeChanges", [])
-        if isinstance(store_changes, list) and store_changes:
-            lines = []
-            for change in store_changes:
-                if not isinstance(change, dict):
-                    continue
-                current = package_version(change.get("before"))
-                available = package_version(change.get("after"))
-                lines.append(f"{change.get('name', 'unknown')}: {current} → {available}")
+        lines = update_detail_lines(update)
+        if lines:
             self.information_list.setPlainText("\n".join(lines))
             self.information_list.setVisible(True)
         else:

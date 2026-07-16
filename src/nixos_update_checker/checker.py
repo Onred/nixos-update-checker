@@ -338,224 +338,6 @@ def configuration_platform(configuration: str, candidate_lock: Path) -> str:
     return result.stdout.strip()
 
 
-PROVENANCE_CACHE_SCHEMA = 2
-
-
-def provenance_cache_path(source: str, system: str) -> Path:
-    configured = environment("NIXOS_UPDATE_CHECKER_CACHE")
-    if configured:
-        cache_root = Path(configured).expanduser()
-    else:
-        cache_home = environment("XDG_CACHE_HOME")
-        cache_root = (
-            Path(cache_home).expanduser()
-            if cache_home
-            else Path.home() / ".cache"
-        ) / "nixos-update-checker"
-    key = hashlib.sha256(f"{source}\0{system}".encode()).hexdigest()
-    return cache_root / "package-provenance" / f"{key}.json"
-
-
-def read_provenance_cache(path: Path) -> JsonObject:
-    try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(value, dict) or value.get("schemaVersion") != PROVENANCE_CACHE_SCHEMA:
-        return {}
-    return value
-
-
-def write_provenance_cache(path: Path, value: JsonObject, *, debug: bool) -> None:
-    temporary_path: Path | None = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary_path = Path(temporary_name)
-        with os.fdopen(descriptor, "w") as stream:
-            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-        os.replace(temporary_path, path)
-    except OSError as error:
-        if debug:
-            print(f"Could not save package provenance cache {path}: {error}", file=sys.stderr)
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-def package_search_aliases(names: set[str]) -> set[str]:
-    aliases = set(names)
-    nested_prefix = re.compile(
-        r"^(?:python\d+(?:\.\d+)?|perl\d+|ruby\d+(?:\.\d+)?|lua\d+(?:_\d+)?|nodejs)-(.+)$"
-    )
-    for name in names:
-        match = nested_prefix.match(name)
-        if match:
-            aliases.add(match.group(1))
-    return aliases
-
-
-def nix_search_regex_literal(value: str) -> str:
-    # `nix search` uses an extended regular expression dialect where escaping a
-    # non-special character such as `-` is invalid.
-    return re.sub(r"([\\.^$|?*+(){}\[\]])", r"\\\1", value)
-
-
-def discover_package_attributes(
-    source: str,
-    system: str,
-    names: set[str],
-    *,
-    debug: bool,
-) -> set[str] | None:
-    if not names:
-        return set()
-    aliases = package_search_aliases(names)
-    expression = "^(" + "|".join(
-        nix_search_regex_literal(name) for name in sorted(aliases)
-    ) + ")$"
-    result = run_command(
-        nix_executable(),
-        [
-            "search",
-            "--quiet",
-            "--json",
-            f"path:{source}#legacyPackages.{system}",
-            expression,
-        ],
-    )
-    if not result.succeeded:
-        if debug:
-            print(
-                f"Could not search nested packages in {source}:\n{result.stderr}",
-                file=sys.stderr,
-            )
-        return None
-    values = parse_json(result.stdout, f"Invalid nested package search result for {source}")
-    if not isinstance(values, dict):
-        return set()
-    prefix = f"legacyPackages.{system}."
-    return {
-        attribute.removeprefix(prefix)
-        for attribute in map(str, values)
-        if attribute.startswith(prefix)
-    }
-
-
-def evaluate_package_attributes(
-    source: str,
-    system: str,
-    attributes: set[str],
-    *,
-    debug: bool,
-) -> set[str] | None:
-    if not attributes:
-        return set()
-    candidates = "\n".join(
-        f"    {{ attribute = {nix_quote(attribute)}; value = pkgs.{attribute}; }}"
-        for attribute in sorted(attributes)
-    )
-    apply = f"""
-pkgs:
-let
-  candidates = [
-{candidates}
-  ];
-  outputsFor = candidate:
-    let
-      outputsResult = builtins.tryEval (
-        builtins.deepSeq candidate.value.outputs candidate.value.outputs
-      );
-      outputNames =
-        if outputsResult.success && builtins.isList outputsResult.value
-        then outputsResult.value
-        else [ ];
-      outputPath = outputName:
-        let
-          result = builtins.tryEval (
-            if outputName == "out" && !(candidate.value ? out)
-            then candidate.value.outPath
-            else (builtins.getAttr outputName candidate.value).outPath
-          );
-        in if result.success && builtins.isString result.value then result.value else null;
-    in builtins.filter (path: path != null) (map outputPath outputNames);
-in builtins.concatMap outputsFor candidates
-"""
-    result = run_command(
-        nix_executable(),
-        ["eval", "--json", "--apply", apply, f"path:{source}#legacyPackages.{system}"],
-    )
-    if not result.succeeded:
-        if debug:
-            print(
-                f"Could not evaluate nested packages in {source}:\n{result.stderr}",
-                file=sys.stderr,
-            )
-        return None
-    values = parse_json(result.stdout, f"Invalid nested package evaluation for {source}")
-    if not isinstance(values, list):
-        return set()
-    return {str(value) for value in values if isinstance(value, str) and value}
-
-
-def package_output_paths(
-    source: str,
-    system: str,
-    names: set[str],
-    *,
-    debug: bool,
-) -> set[str]:
-    path = provenance_cache_path(source, system)
-    cache = read_provenance_cache(path)
-    searched_names = {
-        str(name) for name in cache.get("searchedNames", []) if isinstance(name, str)
-    }
-    attributes = {
-        str(attribute)
-        for attribute in cache.get("attributes", [])
-        if isinstance(attribute, str)
-    }
-    output_paths = {
-        str(output_path)
-        for output_path in cache.get("outputPaths", [])
-        if isinstance(output_path, str)
-    }
-    evaluated_attributes = {
-        str(attribute)
-        for attribute in cache.get("evaluatedAttributes", [])
-        if isinstance(attribute, str)
-    }
-
-    missing_names = names - searched_names
-    discovered = discover_package_attributes(
-        source, system, missing_names, debug=debug
-    )
-    if discovered is not None:
-        searched_names.update(missing_names)
-        attributes.update(discovered)
-
-    pending_attributes = attributes - evaluated_attributes
-    evaluated = evaluate_package_attributes(
-        source, system, pending_attributes, debug=debug
-    )
-    if evaluated is not None:
-        output_paths.update(evaluated)
-        evaluated_attributes.update(pending_attributes)
-
-    write_provenance_cache(
-        path,
-        {
-            "schemaVersion": PROVENANCE_CACHE_SCHEMA,
-            "searchedNames": sorted(searched_names),
-            "attributes": sorted(attributes),
-            "evaluatedAttributes": sorted(evaluated_attributes),
-            "outputPaths": sorted(output_paths),
-        },
-        debug=debug,
-    )
-    return output_paths
-
-
 def annotate_closure_change_channels(
     changes: list[JsonObject],
     source_channels: dict[str, str],
@@ -572,6 +354,20 @@ def annotate_closure_change_channels(
     )
     if not unresolved_names:
         return
+    names = " ".join(nix_quote(name) for name in unresolved_names)
+    apply = f"""
+pkgs:
+let
+  names = [ {names} ];
+  packagePath = name:
+    let result = builtins.tryEval (
+      if builtins.hasAttr name pkgs && builtins.isAttrs pkgs.${{name}}
+      then pkgs.${{name}}.outPath or null
+      else null
+    );
+    in {{ inherit name; path = if result.success then result.value else null; }};
+in builtins.filter (item: item.path != null) (map packagePath names)
+"""
     change_paths: dict[str, list[JsonObject]] = {}
     for change in changes:
         after = change.get("after")
@@ -581,19 +377,26 @@ def annotate_closure_change_channels(
         for path in paths:
             if path:
                 change_paths.setdefault(path, []).append(change)
-    matches: dict[int, list[str]] = {}
-    changes_by_identity = {id(change): change for change in changes}
     for source, channel in source_channels.items():
-        output_paths = package_output_paths(
-            source, system, set(unresolved_names), debug=debug
+        result = run_command(
+            nix_executable(),
+            ["eval", "--json", "--apply", apply, f"path:{source}#legacyPackages.{system}"],
         )
-        for output_path in output_paths:
-            for change in change_paths.get(output_path, []):
-                labels = matches.setdefault(id(change), [])
-                if channel not in labels:
-                    labels.append(channel)
-    for identity, labels in matches.items():
-        changes_by_identity[identity]["channel"] = " / ".join(labels)
+        if not result.succeeded:
+            if debug:
+                print(
+                    f"Could not resolve package provenance from {channel}:\n{result.stderr}",
+                    file=sys.stderr,
+                )
+            continue
+        values = parse_json(result.stdout, f"Invalid package provenance result for {channel}")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for change in change_paths.get(str(value.get("path") or ""), []):
+                change["channel"] = channel
 
 
 PACKAGE_APPLY = r"""

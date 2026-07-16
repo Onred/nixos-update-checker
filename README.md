@@ -20,11 +20,12 @@ configuration discovered as belonging to the current machine.
 The update table places flake inputs first, then sorts packages by their locked
 nixpkgs channel (for example `26.05` or `unstable`). Package provenance comes
 from evaluated package source metadata and exact candidate output matches
-across recursively exposed package sets in each locked nixpkgs input. The
-recursive lookup is shared by fast and full-build checks and cached by immutable
-nixpkgs source revision. Packages whose origin cannot be recovered safely are
-labeled `unknown`. Store-path-only changes are collapsed into one final rebuild
-row; selecting it lists every underlying package in the Information pane.
+against direct packages in each locked nixpkgs input. Packages whose origin
+cannot be recovered safely are labeled `unknown`. Recognizable Python, Perl,
+Ruby, Lua, GHC, and Emacs package-set updates are collapsed by package set and
+channel; every underlying update still contributes to the summary count and is
+listed in the Information pane. Store-path-only changes are collapsed into one
+final rebuild row in the same way.
 
 ## Nix flake outputs
 
