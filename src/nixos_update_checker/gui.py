@@ -257,8 +257,8 @@ class UpdateCheckerWindow(QMainWindow):
         self.report_timer.setInterval(15_000)
         self.report_timer.timeout.connect(self.load_cached_report)
         self.report_timer.start()
-        if not self.load_cached_report():
-            QTimer.singleShot(750, lambda: self.start_check(False, True))
+        self.load_cached_report()
+        QTimer.singleShot(750, self.start_automatic_check)
 
     def _load_icon(self) -> QIcon:
         icon_path = environment("NIXOS_UPDATE_CHECKER_ICON")
@@ -313,7 +313,7 @@ class UpdateCheckerWindow(QMainWindow):
         self.check_button = QPushButton("Refresh")
         self.check_button.setObjectName("primaryAction")
         self.check_button.setToolTip("Build the updated system closure without applying it")
-        self.check_button.clicked.connect(lambda: self.start_check(True, True))
+        self.check_button.clicked.connect(self.start_manual_check)
         self.rebuild_button = QPushButton("Rebuild")
         self.rebuild_button.clicked.connect(self.confirm_rebuild)
         command_layout.addWidget(self.check_button)
@@ -462,7 +462,7 @@ class UpdateCheckerWindow(QMainWindow):
         file_menu.addSeparator()
         self._add_action(file_menu, "Quit", self.request_quit)
         actions = self.menuBar().addMenu("&Actions")
-        self._add_action(actions, "Refresh", lambda: self.start_check(True, True))
+        self._add_action(actions, "Refresh", self.start_manual_check)
         self._add_action(actions, "Rebuild", self.confirm_rebuild)
         help_menu = self.menuBar().addMenu("&Help")
         self._add_action(
@@ -483,7 +483,7 @@ class UpdateCheckerWindow(QMainWindow):
         menu = QMenu(self)
         self._add_action(menu, "Open NixOS Update Checker", self.show_and_raise)
         menu.addSeparator()
-        self._add_action(menu, "Refresh", lambda: self.start_check(True, True))
+        self._add_action(menu, "Refresh", self.start_manual_check)
         self._add_action(menu, "Rebuild…", self.confirm_rebuild)
         menu.addSeparator()
         self._add_action(menu, "Quit", self.request_quit)
@@ -734,7 +734,7 @@ class UpdateCheckerWindow(QMainWindow):
             )
             return
         self.append_log(f"Saved settings to {self.settings_path}")
-        self.start_check(False, True)
+        self.start_automatic_check()
 
     def load_cached_report(self) -> bool:
         try:
@@ -771,6 +771,12 @@ class UpdateCheckerWindow(QMainWindow):
             else "Checking for updates…",
             interactive,
         )
+
+    def start_automatic_check(self) -> None:
+        self.start_check(False, False)
+
+    def start_manual_check(self) -> None:
+        self.start_check(True, True)
 
     def confirm_rebuild(self) -> None:
         self.show_and_raise()
@@ -935,7 +941,7 @@ class UpdateCheckerWindow(QMainWindow):
         if job == "settings":
             self.cleanup_pending_settings()
             self.set_busy(False, "Settings saved")
-            QTimer.singleShot(0, lambda: self.start_check(False, True))
+            QTimer.singleShot(0, self.start_automatic_check)
             return
         if job == "update-for-rebuild":
             self.start_rebuild()
@@ -965,7 +971,7 @@ class UpdateCheckerWindow(QMainWindow):
         else:
             label = "System rebuild complete"
         self.set_busy(False, label)
-        QTimer.singleShot(0, lambda: self.start_check(False, True))
+        QTimer.singleShot(0, self.start_automatic_check)
 
     def cleanup_pending_settings(self) -> None:
         if self.pending_settings_temp is not None:

@@ -10,6 +10,9 @@ complete candidate NixOS system, and compares its realized closure with the
 running system. It does not modify `flake.lock`, create a profile generation,
 or apply the result.
 
+Opening the GUI starts a fast evaluated-manifest check. The explicit
+**Refresh** action runs the more accurate full build check.
+
 **Rebuild** first updates the repository's real `flake.lock`, then requests
 administrator authorization and runs `nixos-rebuild switch` for the
 configuration discovered as belonging to the current machine.
@@ -17,10 +20,11 @@ configuration discovered as belonging to the current machine.
 The update table places flake inputs first, then sorts packages by their locked
 nixpkgs channel (for example `26.05` or `unstable`). Package provenance comes
 from evaluated package source metadata and exact candidate output matches
-against top-level packages in each locked nixpkgs input. Packages whose origin
-cannot be recovered safely are labeled `unknown`. Store-path-only changes are
-collapsed into one final rebuild row; selecting it lists every underlying
-package in the Information pane.
+across recursively exposed package sets in each locked nixpkgs input. The
+recursive lookup is shared by fast and full-build checks and cached by immutable
+nixpkgs source revision. Packages whose origin cannot be recovered safely are
+labeled `unknown`. Store-path-only changes are collapsed into one final rebuild
+row; selecting it lists every underlying package in the Information pane.
 
 ## Nix flake outputs
 

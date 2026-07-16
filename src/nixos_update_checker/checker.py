@@ -916,6 +916,13 @@ def run_check(options: CheckOptions) -> JsonObject:
                     [*candidate_selected.packages, *candidate_option_packages],
                 ),
             )
+            if candidate_source_channels:
+                annotate_closure_change_channels(
+                    package_changes,
+                    candidate_source_channels,
+                    configuration_platform(configuration, candidate_lock),
+                    debug=options.debug,
+                )
             package_source = "evaluatedManifestAgainstRunningClosure"
 
         if lock_before != file_hash(lock_path):

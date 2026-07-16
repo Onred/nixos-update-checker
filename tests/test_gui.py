@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from nixos_update_checker.gui import initial_repository, update_sort_key
+from nixos_update_checker.gui import (
+    UpdateCheckerWindow,
+    initial_repository,
+    update_sort_key,
+)
 
 
 def test_repository_selection_prefers_explicit_then_saved_then_configured_default() -> None:
@@ -31,3 +35,15 @@ def test_updates_sort_flakes_then_channels_then_rebuild() -> None:
         "unknown",
         "Rebuild-only package changes",
     ]
+
+
+def test_automatic_and_manual_gui_checks_select_expected_modes() -> None:
+    calls: list[tuple[bool, bool]] = []
+
+    class Window:
+        def start_check(self, interactive: bool, real_build: bool) -> None:
+            calls.append((interactive, real_build))
+
+    UpdateCheckerWindow.start_automatic_check(Window())  # type: ignore[arg-type]
+    UpdateCheckerWindow.start_manual_check(Window())  # type: ignore[arg-type]
+    assert calls == [(False, False), (True, True)]
