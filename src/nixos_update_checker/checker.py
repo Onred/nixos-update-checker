@@ -24,9 +24,11 @@ from .logic import (
     collect_packages,
     compare_closures,
     compare_inputs,
-    compare_packages,
+    compare_packages_to_closure,
     nix_quote,
     package_summary,
+    packages_matching_closure,
+    partition_priority_changes,
     select_current_configuration,
     split_package_changes,
 )
@@ -280,7 +282,13 @@ def evaluate_selected_packages(
     return SelectedPackages(packages, resolved_options)
 
 
-def evaluate_manifest(configuration: str, candidate_lock: Path, *, candidate: bool) -> JsonObject:
+def evaluate_manifest(
+    configuration: str,
+    candidate_lock: Path,
+    *,
+    candidate: bool,
+    include_priority_options: bool = False,
+) -> JsonObject:
     evaluator = manifest_evaluator_path()
     try:
         evaluator_source = evaluator.read_text()
@@ -288,7 +296,12 @@ def evaluate_manifest(configuration: str, candidate_lock: Path, *, candidate: bo
         raise CheckerError(
             f"Could not read the bundled package manifest evaluator: {evaluator}", str(error)
         ) from error
-    apply = f"configuration: (({evaluator_source}) {{ inherit (configuration) config options; }})"
+    apply = (
+        f"configuration: (({evaluator_source}) "
+        "{ inherit (configuration) config options; "
+        "includePriorityOptionPackages = "
+        f"{'true' if include_priority_options else 'false'}; }})"
+    )
     arguments = ["eval"]
     if candidate:
         arguments.extend(["--reference-lock-file", str(candidate_lock)])
@@ -355,7 +368,12 @@ def run_check(options: CheckOptions) -> JsonObject:
 
         current_manifest: JsonObject = {}
         if options.inspect_packages and not real_build:
-            current_manifest = evaluate_manifest(configuration, candidate_lock, candidate=False)
+            current_manifest = evaluate_manifest(
+                configuration,
+                candidate_lock,
+                candidate=False,
+                include_priority_options=True,
+            )
 
         configuration_state = "unavailable"
         if declared_deriver and running_deriver:
@@ -386,6 +404,7 @@ def run_check(options: CheckOptions) -> JsonObject:
         input_changes = compare_inputs(current_lock, candidate_lock_value)
 
         package_changes: list[JsonObject] = []
+        dependency_changes: list[JsonObject] = []
         resolved_options: set[str] = set()
         package_source = "none"
         baseline_system = ""
@@ -416,11 +435,40 @@ def run_check(options: CheckOptions) -> JsonObject:
             candidate_system = candidate_paths[0]
             baseline_closure = query_closure(baseline_system)
             candidate_closure = query_closure(candidate_system)
-            package_changes = compare_closures(baseline_closure, candidate_closure)
+            closure_changes = compare_closures(baseline_closure, candidate_closure)
+            candidate_manifest = evaluate_manifest(
+                configuration,
+                candidate_lock,
+                candidate=True,
+                include_priority_options=True,
+            )
+            candidate_selected = evaluate_selected_packages(
+                configuration,
+                selected_options,
+                candidate_lock,
+                candidate=True,
+                debug=options.debug,
+            )
+            resolved_options = candidate_selected.resolved_options
+            direct_packages = collect_packages(candidate_manifest, candidate_selected.packages)
+            realized_option_packages = [
+                package
+                for package in candidate_manifest.get("priorityOptionPackages", [])
+                if isinstance(package, dict)
+                and str(package.get("path", "")) in candidate_closure.paths
+            ]
+            package_changes, dependency_changes = partition_priority_changes(
+                closure_changes,
+                [*direct_packages.values(), *realized_option_packages],
+            )
             package_source = "realizedClosure"
-            resolved_options.update(selected_options)
         elif options.inspect_packages:
-            candidate_manifest = evaluate_manifest(configuration, candidate_lock, candidate=True)
+            candidate_manifest = evaluate_manifest(
+                configuration,
+                candidate_lock,
+                candidate=True,
+                include_priority_options=True,
+            )
             current_selected = evaluate_selected_packages(
                 configuration,
                 selected_options,
@@ -438,17 +486,57 @@ def run_check(options: CheckOptions) -> JsonObject:
             resolved_options = (
                 current_selected.resolved_options | candidate_selected.resolved_options
             )
-            package_changes = compare_packages(
-                collect_packages(current_manifest, current_selected.packages),
-                collect_packages(candidate_manifest, candidate_selected.packages),
+            baseline_system = running_system or boot_system
+            if not baseline_system:
+                raise CheckerError("No running or next-boot system closure is available.")
+            baseline_closure = query_closure(baseline_system)
+            current_option_packages = packages_matching_closure(
+                (
+                    package
+                    for package in current_manifest.get("priorityOptionPackages", [])
+                    if isinstance(package, dict)
+                ),
+                baseline_closure,
             )
-            package_source = "evaluatedManifest"
+            candidate_option_packages = packages_matching_closure(
+                (
+                    package
+                    for package in candidate_manifest.get("priorityOptionPackages", [])
+                    if isinstance(package, dict)
+                ),
+                baseline_closure,
+            )
+            package_changes = compare_packages_to_closure(
+                baseline_closure,
+                collect_packages(
+                    current_manifest,
+                    [*current_selected.packages, *current_option_packages],
+                ),
+                collect_packages(
+                    candidate_manifest,
+                    [*candidate_selected.packages, *candidate_option_packages],
+                ),
+            )
+            package_source = "evaluatedManifestAgainstRunningClosure"
 
         if lock_before != file_hash(lock_path):
             raise CheckerError("flake.lock changed unexpectedly during the candidate check.")
 
     limited = options.service or environment("NIXOS_UPDATE_CHECKER_IN_SCOPE") == "1"
-    meaningful_package_changes, store_only_changes = split_package_changes(package_changes)
+    meaningful_package_changes, primary_store_changes = split_package_changes(package_changes)
+    meaningful_dependency_changes, dependency_store_changes = split_package_changes(
+        dependency_changes
+    )
+    store_only_changes = [*primary_store_changes, *dependency_store_changes]
+    summary = package_summary(
+        [*meaningful_package_changes, *meaningful_dependency_changes, *store_only_changes]
+    )
+    summary.update(
+        {
+            "primary": len(meaningful_package_changes),
+            "dependencies": len(meaningful_dependency_changes),
+        }
+    )
     report: JsonObject = {
         "schemaVersion": SCHEMA_VERSION,
         "backendVersion": environment("NIXOS_UPDATE_CHECKER_VERSION", __version__),
@@ -480,8 +568,9 @@ def run_check(options: CheckOptions) -> JsonObject:
             "inspected": options.inspect_packages or real_build,
             "source": package_source,
             "changes": meaningful_package_changes,
+            "dependencyChanges": meaningful_dependency_changes,
             "storeOnlyChanges": store_only_changes,
-            "summary": package_summary(package_changes),
+            "summary": summary,
             "selectedOptions": selected_options,
             "unresolvedOptions": [
                 option
@@ -494,14 +583,22 @@ def run_check(options: CheckOptions) -> JsonObject:
             "requestedBy": build_requester,
             "baselineSystem": baseline_system or None,
             "candidateSystem": candidate_system or None,
-            "baselineClosureBytes": baseline_closure.nar_size,
-            "candidateClosureBytes": candidate_closure.nar_size,
-            "closureSizeDeltaBytes": candidate_closure.nar_size - baseline_closure.nar_size,
-            "addedStorePaths": len(candidate_closure.paths - baseline_closure.paths),
-            "removedStorePaths": len(baseline_closure.paths - candidate_closure.paths),
+            "baselineClosureBytes": baseline_closure.nar_size if real_build else 0,
+            "candidateClosureBytes": candidate_closure.nar_size if real_build else 0,
+            "closureSizeDeltaBytes": (
+                candidate_closure.nar_size - baseline_closure.nar_size if real_build else 0
+            ),
+            "addedStorePaths": (
+                len(candidate_closure.paths - baseline_closure.paths) if real_build else 0
+            ),
+            "removedStorePaths": (
+                len(baseline_closure.paths - candidate_closure.paths) if real_build else 0
+            ),
             "buildLimits": {"maxJobs": 1, "cores": 1} if options.service and real_build else None,
         },
-        "updatesAvailable": bool(input_changes or meaningful_package_changes),
+        "updatesAvailable": bool(
+            input_changes or meaningful_package_changes or meaningful_dependency_changes
+        ),
         "lockFile": {"path": str(lock_path), "modified": False},
     }
     if options.debug:
@@ -518,6 +615,7 @@ def print_human_report(report: JsonObject) -> None:
     inputs = report["inputs"]
     packages_object = report["packages"]
     packages = packages_object["changes"]
+    dependencies = packages_object.get("dependencyChanges", [])
     store_only = packages_object.get("storeOnlyChanges", [])
     build = report["build"]
     print(f"NixOS update check ({report['configuration']})")
@@ -532,6 +630,10 @@ def print_human_report(report: JsonObject) -> None:
     print(f"\nPackages: {len(packages)} change(s) ({source})")
     for change in packages:
         print(f"  {change['name']} ({change['kind']})")
+    if dependencies:
+        print(f"\nDependency changes: {len(dependencies)}")
+        for change in dependencies:
+            print(f"  {change['name']} ({change['kind']})")
     if store_only:
         print(f"\nStore-only package changes: {len(store_only)}")
         for change in store_only:

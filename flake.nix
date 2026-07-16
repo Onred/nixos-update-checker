@@ -103,6 +103,10 @@
           standaloneManifest = import ./nix/manifest.nix {
             inherit (standaloneEvaluation) config options;
           };
+          standalonePriorityOptionManifest = import ./nix/manifest.nix {
+            inherit (standaloneEvaluation) config options;
+            includePriorityOptionPackages = true;
+          };
         in
         {
           package = self.packages.${system}.default;
@@ -131,6 +135,9 @@
               !(builtins.any (
                 package: package.option == "hardware.update-checker-manual.package"
               ) standaloneManifest.activeOptionPackages);
+            assert builtins.any (
+              package: package.option == "hardware.update-checker-manual.package"
+            ) standalonePriorityOptionManifest.priorityOptionPackages;
             pkgs.runCommand "nixos-update-checker-module-check" { } ''
               touch "$out"
             '';

@@ -1,4 +1,8 @@
-{ config, options }:
+{
+  config,
+  options,
+  includePriorityOptionPackages ? false,
+}:
 
 let
   package = packageValue: {
@@ -50,28 +54,37 @@ let
       let
         value = attrs.${name};
         optionPath = path ++ [ name ];
+        optionInfo = builtins.tryEval (
+          let
+            visible = value.visible or true;
+            typeName = value.type.name;
+            elementTypeName =
+              if typeName == "listOf" then value.type.nestedTypes.elemType.name or null else null;
+            result =
+              if visible == false then
+                [ ]
+              else if typeName == "package" then
+                [
+                  {
+                    path = optionPath;
+                    list = false;
+                  }
+                ]
+              else if typeName == "listOf" && elementTypeName == "package" then
+                [
+                  {
+                    path = optionPath;
+                    list = true;
+                  }
+                ]
+              else
+                [ ];
+          in
+          builtins.deepSeq result result
+        );
       in
       if builtins.isAttrs value && (value._type or null) == "option" then
-        if (value.visible or true) == false then
-          [ ]
-        else if value.type.name == "package" then
-          [
-            {
-              path = optionPath;
-              list = false;
-            }
-          ]
-        else if
-          value.type.name == "listOf" && (value.type.nestedTypes.elemType.name or null) == "package"
-        then
-          [
-            {
-              path = optionPath;
-              list = true;
-            }
-          ]
-        else
-          [ ]
+        if optionInfo.success then optionInfo.value else [ ]
       else if builtins.isAttrs value then
         collectPackageOptions optionPath value
       else
@@ -85,7 +98,7 @@ let
     in
     builtins.genList (index: take (index + 1) optionPath) parentLength;
 
-  pathIsEnabled =
+  enableScopesFor =
     optionPath:
     let
       hasCurrentEnableOption =
@@ -95,18 +108,31 @@ let
         in
         builtins.isAttrs enableOption
         && (enableOption._type or null) == "option"
-        && (enableOption.visible or true);
+        && (enableOption.visible or true) != false;
+    in
+    builtins.filter hasCurrentEnableOption (ancestorPaths optionPath);
 
-      enableScopes = builtins.filter hasCurrentEnableOption (ancestorPaths optionPath);
+  scopeIsEnabled =
+    ancestorPath:
+    let
+      result = builtins.tryEval (getAttrFromPath false (ancestorPath ++ [ "enable" ]) config == true);
+    in
+    result.success && result.value;
 
-      scopeIsEnabled =
-        ancestorPath:
-        let
-          result = builtins.tryEval (getAttrFromPath false (ancestorPath ++ [ "enable" ]) config == true);
-        in
-        result.success && result.value;
+  pathIsEnabled =
+    optionPath:
+    let
+      enableScopes = enableScopesFor optionPath;
     in
     enableScopes != [ ] && builtins.all scopeIsEnabled enableScopes;
+
+  pathIsPriorityCandidate =
+    optionPath:
+    let
+      enableScopes = enableScopesFor optionPath;
+      isHardwareOption = optionPath != [ ] && builtins.head optionPath == "hardware";
+    in
+    if enableScopes == [ ] then isHardwareOption else builtins.all scopeIsEnabled enableScopes;
 
   packagesFromOption =
     optionInfo:
@@ -120,7 +146,11 @@ let
           [ optionValue ];
       values = map (packageValue: package packageValue // { option = optionName; }) packageValues;
       result = builtins.tryEval (
-        builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.toJSON values))
+        let
+          serialized = builtins.unsafeDiscardStringContext (builtins.toJSON values);
+          parsed = builtins.fromJSON serialized;
+        in
+        builtins.deepSeq parsed parsed
       );
     in
     if result.success && builtins.isList result.value then result.value else [ ];
@@ -130,6 +160,14 @@ let
   activeOptionPackages = builtins.concatMap packagesFromOption (
     builtins.filter (optionInfo: pathIsEnabled optionInfo.path) packageOptions
   );
+
+  priorityOptionPackages =
+    if includePriorityOptionPackages then
+      builtins.concatMap packagesFromOption (
+        builtins.filter (optionInfo: pathIsPriorityCandidate optionInfo.path) packageOptions
+      )
+    else
+      [ ];
 in
 {
   toplevelDeriver = config.system.build.toplevel.drvPath;
@@ -145,5 +183,5 @@ in
     config.boot.kernelPackages.kernel
   ];
 
-  inherit activeOptionPackages;
+  inherit activeOptionPackages priorityOptionPackages;
 }

@@ -239,16 +239,7 @@ class UpdateCheckerWindow(QMainWindow):
     def _build_updates_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        input_group = QGroupBox("Flake inputs")
-        input_layout = QVBoxLayout(input_group)
-        self.input_table = QTableWidget(0, 3)
-        self.input_table.setHorizontalHeaderLabels(["Input", "Current", "Available"])
-        self.input_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.input_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        input_layout.addWidget(self.input_table)
-        layout.addWidget(input_group, 1)
-
-        package_group = QGroupBox("Packages")
+        package_group = QGroupBox("Important package updates")
         package_layout = QVBoxLayout(package_group)
         self.package_table = QTableWidget(0, 4)
         self.package_table.setHorizontalHeaderLabels(["Package", "Change", "Current", "Available"])
@@ -257,12 +248,47 @@ class UpdateCheckerWindow(QMainWindow):
             0, QHeaderView.ResizeMode.Stretch
         )
         package_layout.addWidget(self.package_table)
+        layout.addWidget(package_group, 2)
+
+        details_group = QGroupBox("Additional details")
+        details_layout = QVBoxLayout(details_group)
+
+        self.input_toggle = QToolButton()
+        self.input_toggle.setCheckable(True)
+        self.input_toggle.setChecked(False)
+        self.input_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.input_toggle.toggled.connect(self.toggle_input_changes)
+        details_layout.addWidget(self.input_toggle)
+        self.input_table = QTableWidget(0, 3)
+        self.input_table.setHorizontalHeaderLabels(["Input", "Current", "Available"])
+        self.input_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.input_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.input_table.setVisible(False)
+        details_layout.addWidget(self.input_table)
+
+        self.dependency_toggle = QToolButton()
+        self.dependency_toggle.setCheckable(True)
+        self.dependency_toggle.setChecked(False)
+        self.dependency_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.dependency_toggle.toggled.connect(self.toggle_dependency_changes)
+        details_layout.addWidget(self.dependency_toggle)
+        self.dependency_table = QTableWidget(0, 4)
+        self.dependency_table.setHorizontalHeaderLabels(
+            ["Package", "Change", "Current", "Available"]
+        )
+        self.dependency_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dependency_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.dependency_table.setVisible(False)
+        details_layout.addWidget(self.dependency_table)
+
         self.store_only_toggle = QToolButton()
         self.store_only_toggle.setCheckable(True)
         self.store_only_toggle.setChecked(False)
         self.store_only_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.store_only_toggle.toggled.connect(self.toggle_store_only_changes)
-        package_layout.addWidget(self.store_only_toggle)
+        details_layout.addWidget(self.store_only_toggle)
         self.store_only_table = QTableWidget(0, 4)
         self.store_only_table.setHorizontalHeaderLabels(
             ["Package", "Change", "Current", "Available"]
@@ -272,9 +298,11 @@ class UpdateCheckerWindow(QMainWindow):
             0, QHeaderView.ResizeMode.Stretch
         )
         self.store_only_table.setVisible(False)
-        package_layout.addWidget(self.store_only_table)
+        details_layout.addWidget(self.store_only_table)
+        self.set_input_changes([])
+        self.set_dependency_changes([])
         self.set_store_only_changes([])
-        layout.addWidget(package_group, 2)
+        layout.addWidget(details_group, 1)
         return tab
 
     def _build_system_tab(self) -> QWidget:
@@ -379,8 +407,9 @@ class UpdateCheckerWindow(QMainWindow):
         self.last_report = {}
         self.summary_title.setText("Configuration repository changed")
         self.summary_detail.setText("Select Check now to load update information.")
-        self.input_table.setRowCount(0)
         self.package_table.setRowCount(0)
+        self.set_input_changes([])
+        self.set_dependency_changes([])
         self.set_store_only_changes([])
 
     def choose_repository(self) -> None:
@@ -800,22 +829,33 @@ class UpdateCheckerWindow(QMainWindow):
         packages_object = report.get("packages", {})
         reported_packages = packages_object.get("changes", [])
         packages = [change for change in reported_packages if change.get("kind") != "store"]
+        reported_dependencies = packages_object.get("dependencyChanges", [])
+        dependencies = [change for change in reported_dependencies if change.get("kind") != "store"]
         store_only = [change for change in reported_packages if change.get("kind") == "store"]
+        store_only.extend(
+            change for change in reported_dependencies if change.get("kind") == "store"
+        )
         store_only.extend(packages_object.get("storeOnlyChanges", []))
         system = report.get("system", {})
         build = report.get("build", {})
-        update_count = len(inputs) + len(packages)
         updates = bool(report.get("updatesAvailable"))
         rebuild = system.get("configurationState") == "differs"
         if updates:
-            self.summary_title.setText(
-                f"{update_count} {'update' if update_count == 1 else 'updates'} available"
-            )
+            if packages:
+                self.summary_title.setText(
+                    f"{len(packages)} important package "
+                    f"{'update' if len(packages) == 1 else 'updates'} available"
+                )
+            elif dependencies:
+                self.summary_title.setText("System dependency updates available")
+            else:
+                self.summary_title.setText("Flake input updates available")
             suffix = " from a realized system build" if build.get("performed") else ""
             self.summary_detail.setText(
-                f"{len(inputs)} input changes and {len(packages)} package changes{suffix}"
+                f"{len(packages)} important packages, {len(dependencies)} dependencies, "
+                f"and {len(inputs)} flake inputs{suffix}"
             )
-            self.set_tray_state("updates", update_count)
+            self.set_tray_state("updates", len(packages) or len(dependencies) or len(inputs))
         elif rebuild:
             self.summary_title.setText("Configuration is ready to rebuild")
             self.summary_detail.setText(
@@ -831,8 +871,9 @@ class UpdateCheckerWindow(QMainWindow):
         generated = str(report.get("generatedAt", ""))
         self.last_checked.setText(f"Last checked: {display_time(generated)}")
         self.status_message.setText(f"Loaded {source} report")
-        self.populate_inputs(inputs)
+        self.set_input_changes(inputs)
         self.populate_packages(packages)
+        self.set_dependency_changes(dependencies)
         self.set_store_only_changes(store_only)
         self.populate_system(report)
         for option in packages_object.get("unresolvedOptions", []):
@@ -861,6 +902,19 @@ class UpdateCheckerWindow(QMainWindow):
             self.input_table.setItem(row, 1, QTableWidgetItem(input_revision(change.get("before"))))
             self.input_table.setItem(row, 2, QTableWidgetItem(input_revision(change.get("after"))))
 
+    def set_input_changes(self, inputs: list[JsonObject]) -> None:
+        self.populate_inputs(inputs)
+        self.input_toggle.setText(f"Flake input changes ({len(inputs)})")
+        self.input_toggle.setVisible(bool(inputs))
+        self.input_toggle.setChecked(False)
+        self.toggle_input_changes(False)
+
+    def toggle_input_changes(self, expanded: bool) -> None:
+        self.input_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.input_table.setVisible(expanded and self.input_table.rowCount() > 0)
+
     def populate_packages(self, packages: list[JsonObject]) -> None:
         self.populate_package_table(self.package_table, packages)
 
@@ -871,6 +925,19 @@ class UpdateCheckerWindow(QMainWindow):
             table.setItem(row, 1, QTableWidgetItem(str(change.get("kind", ""))))
             table.setItem(row, 2, QTableWidgetItem(package_version(change.get("before"))))
             table.setItem(row, 3, QTableWidgetItem(package_version(change.get("after"))))
+
+    def set_dependency_changes(self, packages: list[JsonObject]) -> None:
+        self.populate_package_table(self.dependency_table, packages)
+        self.dependency_toggle.setText(f"Dependency changes ({len(packages)})")
+        self.dependency_toggle.setVisible(bool(packages))
+        self.dependency_toggle.setChecked(False)
+        self.toggle_dependency_changes(False)
+
+    def toggle_dependency_changes(self, expanded: bool) -> None:
+        self.dependency_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.dependency_table.setVisible(expanded and self.dependency_table.rowCount() > 0)
 
     def set_store_only_changes(self, packages: list[JsonObject]) -> None:
         self.populate_package_table(self.store_only_table, packages)
@@ -918,8 +985,8 @@ class UpdateCheckerWindow(QMainWindow):
                 f"Realized closure ({build.get('addedStorePaths', 0)} added, "
                 f"{build.get('removedStorePaths', 0)} removed store paths)"
             )
-        elif packages.get("source") == "evaluatedManifest":
-            report_source = "Evaluated package manifest"
+        elif packages.get("source") == "evaluatedManifestAgainstRunningClosure":
+            report_source = "Evaluated packages compared with running system"
         else:
             report_source = "Input changes only"
         self.system_values["reportSource"].setText(report_source)
@@ -1035,6 +1102,14 @@ class UpdateCheckerWindow(QMainWindow):
                         "after": {"version": "2.0"},
                     }
                 ],
+                "dependencyChanges": [
+                    {
+                        "name": "library-example",
+                        "kind": "version",
+                        "before": {"version": "3.0"},
+                        "after": {"version": "4.0"},
+                    }
+                ],
                 "storeOnlyChanges": [
                     {
                         "name": "rebuilt-example",
@@ -1053,9 +1128,12 @@ class UpdateCheckerWindow(QMainWindow):
         if (
             self.input_table.rowCount() != 1
             or self.package_table.rowCount() != 1
+            or self.dependency_table.rowCount() != 1
             or self.store_only_table.rowCount() != 1
+            or not self.input_table.isHidden()
+            or not self.dependency_table.isHidden()
             or not self.store_only_table.isHidden()
-            or self.summary_title.text() != "2 updates available"
+            or self.summary_title.text() != "1 important package update available"
         ):
             raise RuntimeError("GUI report rendering self-test failed")
 

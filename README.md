@@ -12,10 +12,12 @@ authorization when the repository is not writable by the desktop user.
 **Rebuild system** always requests authorization and runs `nixos-rebuild switch`
 for the configuration discovered as belonging to the current machine.
 
-**Check now** performs the fast manifest evaluation. **Check with build** uses
-the temporary updated lock file to build the complete candidate NixOS system,
-then compares its realized closure with `/run/current-system`. It does not
-modify `flake.lock`, create a profile generation, or apply the result.
+**Check now** evaluates important candidate packages and compares them with the
+realized `/run/current-system` closure. Saved lock-file or configuration changes
+therefore remain visible until they are actually rebuilt. **Check with build**
+uses the temporary updated lock file to build the complete candidate NixOS
+system, then compares both realized closures. It does not modify `flake.lock`,
+create a profile generation, or apply the result.
 
 ## Nix flake outputs
 
@@ -150,16 +152,18 @@ same low-impact scheduling policy. `--no-limit` is intended for the enclosing
 NixOS service, which supplies its own resource controls.
 
 `--build` realizes the candidate system and changes the package report source
-from `evaluatedManifest` to `realizedClosure`. The JSON report includes the
-candidate system path, closure sizes, size delta, and added/removed store-path
-counts. The GUI's two check buttons always pass `--no-limit`, so deliberate
-foreground checks and builds are not CPU throttled. Only automatic background
-work uses the low-impact policy.
+from `evaluatedManifestAgainstRunningClosure` to `realizedClosure`. The JSON
+report includes the candidate system path, closure sizes, size delta, and
+added/removed store-path counts. The GUI's two check buttons always pass
+`--no-limit`, so deliberate foreground checks and builds are not CPU throttled.
+Only automatic background work uses the low-impact policy.
 
-Package entries whose version is unchanged but whose Nix store path changed are
-reported separately as store-only changes. They do not contribute to package
-update totals or update notifications, and their GUI table is collapsed by
-default. Flake input changes continue to count as available updates.
+The GUI gives directly configured and important option-backed packages the
+primary table. Flake inputs, transitive runtime dependencies, and package
+entries whose version is unchanged but whose Nix store path changed are placed
+in separate collapsed sections. Store-only entries do not contribute to update
+totals or notifications; input and dependency changes still indicate that an
+update is available.
 
 The GUI uses the official PySide6 Qt bindings. The CLI, service publisher, and
 shared comparison logic are typed Python. The service invokes the same checker
@@ -168,8 +172,7 @@ runner.
 
 The package evaluator is bundled with the application. It reads `config` and
 `options` from the selected `nixosConfigurations` result, so the checked system
-does not need to define any update-checker-specific options. A real build reads
-only that configuration's `config.system.build.toplevel`.
+does not need to define any update-checker-specific options.
 
 ### Package discovery and additional options
 
@@ -179,11 +182,18 @@ The manifest automatically compares:
 - systemd and the active kernel as core NixOS components;
 - package-valued and `listOf package` options beneath enabled NixOS modules.
 
+The fast check also promotes enabled-module package options and package options
+under `hardware.*` when their package identity is present in the running
+closure. After a real build, the stronger rule is used: the option's exact
+output path must be in the candidate closure. This automatically recognizes
+choices such as `hardware.nvidia.package` without maintaining hardware-specific
+package names, while avoiding unrelated disabled service defaults.
+
 There is no built-in NVIDIA, QEMU, Mesa, `kvmfr`, or other hardware-specific
-list. If an active package choice has no enclosing `enable` option, open
-**Actions → Settings…** and enter its NixOS option path, for example
-`hardware.nvidia.package`. The GUI stores these choices and background policy
-in the shared, repository-local `.nixos-update-checker.json` file:
+list. If the automatic rules cannot infer that an option is important, open
+**Actions → Settings…** and enter its NixOS option path. The GUI stores these
+overrides and background policy in the shared, repository-local
+`.nixos-update-checker.json` file:
 
 ```json
 {

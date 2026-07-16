@@ -10,10 +10,13 @@ from nixos_update_checker.logic import (
     SettingsError,
     compare_closures,
     compare_inputs,
+    compare_packages_to_closure,
     garbage_collection_arguments,
     interactive_check_arguments,
     package_summary,
+    packages_matching_closure,
     parse_store_path,
+    partition_priority_changes,
     select_current_configuration,
     split_package_changes,
 )
@@ -202,3 +205,75 @@ def test_store_only_package_changes_do_not_count_as_updates() -> None:
         "removals": 0,
         "storeOnly": 1,
     }
+
+
+def test_fast_package_comparison_uses_running_closure_after_lock_was_updated() -> None:
+    running = ClosureInformation.from_path_info(
+        {"/nix/store/aaaaaaaa-nvidia-x11-570.1": {"narSize": 10}}
+    )
+    updated_package = {
+        "name": "nvidia-x11-575.2",
+        "pname": "nvidia-x11",
+        "version": "575.2",
+        "path": "/nix/store/bbbbbbbb-nvidia-x11-575.2",
+    }
+    changes = compare_packages_to_closure(
+        running,
+        {"nvidia-x11": updated_package},
+        {"nvidia-x11": updated_package},
+    )
+    assert [(change["name"], change["kind"]) for change in changes] == [("nvidia-x11", "version")]
+    assert changes[0]["before"]["version"] == "570.1"
+    assert changes[0]["after"]["version"] == "575.2"
+
+
+def test_realized_nixos_package_option_promotes_build_change() -> None:
+    nvidia_path = "/nix/store/bbbbbbbb-nvidia-x11-575.2"
+    changes = [
+        {
+            "name": "nvidia-x11",
+            "kind": "version",
+            "after": {"path": nvidia_path, "paths": [nvidia_path]},
+        },
+        {
+            "name": "libdrm",
+            "kind": "version",
+            "after": {"path": "/nix/store/cccccccc-libdrm-2.4"},
+        },
+    ]
+    option_packages = [
+        {
+            "name": "nvidia-x11-575.2",
+            "pname": "nvidia-x11",
+            "version": "575.2",
+            "path": nvidia_path,
+            "option": "hardware.nvidia.package",
+        }
+    ]
+    primary, dependencies = partition_priority_changes(changes, option_packages)
+    assert [change["name"] for change in primary] == ["nvidia-x11"]
+    assert [change["name"] for change in dependencies] == ["libdrm"]
+
+
+def test_nixos_package_option_is_relevant_when_identity_is_in_running_closure() -> None:
+    running = ClosureInformation.from_path_info(
+        {"/nix/store/aaaaaaaa-nvidia-x11-570.1": {"narSize": 10}}
+    )
+    options = [
+        {
+            "name": "nvidia-x11-575.2",
+            "pname": "nvidia-x11",
+            "version": "575.2",
+            "path": "/nix/store/bbbbbbbb-nvidia-x11-575.2",
+            "option": "hardware.nvidia.package",
+        },
+        {
+            "name": "nagios-4.5",
+            "pname": "nagios",
+            "version": "4.5",
+            "path": "/nix/store/cccccccc-nagios-4.5",
+            "option": "services.nagios.package",
+        },
+    ]
+    relevant = packages_matching_closure(options, running)
+    assert [package["option"] for package in relevant] == ["hardware.nvidia.package"]

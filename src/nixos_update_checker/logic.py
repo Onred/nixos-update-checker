@@ -249,6 +249,94 @@ def compare_packages(
     return changes
 
 
+def package_aliases(package: JsonObject) -> set[str]:
+    aliases = {package_key(package)}
+    path = str(package.get("path", ""))
+    if path:
+        aliases.add(parse_store_path(path).name)
+    return {alias for alias in aliases if alias}
+
+
+def packages_matching_closure(
+    packages: Iterable[JsonObject], closure: ClosureInformation
+) -> list[JsonObject]:
+    closure_names = set(closure.packages)
+    return [package for package in packages if package_aliases(package) & closure_names]
+
+
+def compare_packages_to_closure(
+    baseline: ClosureInformation,
+    current: dict[str, JsonObject],
+    candidate: dict[str, JsonObject],
+) -> list[JsonObject]:
+    changes: list[JsonObject] = []
+    for name in sorted(set(current) | set(candidate)):
+        before_package = current.get(name)
+        after_package = candidate.get(name)
+        aliases: set[str] = set()
+        if before_package:
+            aliases.update(package_aliases(before_package))
+        if after_package:
+            aliases.update(package_aliases(after_package))
+        before_entries = [entry for alias in aliases for entry in baseline.packages.get(alias, [])]
+        before_paths = {entry.identity.path for entry in before_entries}
+        after_path = str((after_package or {}).get("path", ""))
+        if after_path and after_path in before_paths:
+            continue
+        if after_package is None:
+            if not before_entries:
+                continue
+            kind = "removed"
+        elif not before_entries:
+            kind = "added"
+        elif str(after_package.get("version") or "unknown") not in {
+            entry.identity.version or "unknown" for entry in before_entries
+        }:
+            kind = "version"
+        else:
+            kind = "store"
+        changes.append(
+            {
+                "name": name,
+                "kind": kind,
+                "before": (
+                    _closure_package_details(name, before_entries) if before_entries else None
+                ),
+                "after": package_details(after_package) if after_package else None,
+            }
+        )
+    return changes
+
+
+def partition_priority_changes(
+    changes: list[JsonObject], priority_packages: Iterable[JsonObject]
+) -> tuple[list[JsonObject], list[JsonObject]]:
+    priority_names: set[str] = set()
+    priority_paths: set[str] = set()
+    for package in priority_packages:
+        priority_names.update(package_aliases(package))
+        path = str(package.get("path", ""))
+        if path:
+            priority_paths.add(path)
+
+    primary: list[JsonObject] = []
+    dependencies: list[JsonObject] = []
+    for change in changes:
+        change_paths: set[str] = set()
+        for side in (change.get("before"), change.get("after")):
+            if not isinstance(side, dict):
+                continue
+            path = str(side.get("path", ""))
+            if path:
+                change_paths.add(path)
+            change_paths.update(str(value) for value in side.get("paths", []))
+        if str(change.get("name", "")) in priority_names or change_paths & priority_paths:
+            primary.append(change)
+        else:
+            dependencies.append(change)
+    return primary, dependencies
+
+
 @dataclass(frozen=True)
 class ClosureEntry:
     identity: StorePathIdentity
