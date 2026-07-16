@@ -188,7 +188,27 @@ def compare_inputs(current_lock: JsonObject, candidate_lock: JsonObject) -> list
 
 
 def package_key(package: JsonObject) -> str:
-    return str(package.get("pname") or package.get("name") or "")
+    pname = str(package.get("pname") or "")
+    if pname:
+        return pname
+    path = str(package.get("path") or "")
+    if path:
+        parsed_name = parse_store_path(path).name
+        if parsed_name:
+            return parsed_name
+    return str(package.get("name") or "")
+
+
+def package_version_identity(package: JsonObject) -> str:
+    version = str(package.get("version") or "")
+    if version:
+        return version
+    path = str(package.get("path") or "")
+    if path:
+        parsed_version = parse_store_path(path).version
+        if parsed_version:
+            return parsed_version
+    return "unknown"
 
 
 def collect_packages(manifest: JsonObject, selected: list[JsonObject]) -> dict[str, JsonObject]:
@@ -215,7 +235,7 @@ def package_details(package: JsonObject) -> JsonObject:
     return {
         "name": package.get("name"),
         "pname": package.get("pname"),
-        "version": package.get("version") or "unknown",
+        "version": package_version_identity(package),
         "path": path,
         "storeHash": match.group(1)[:8] if match else "unknown",
     }
@@ -234,7 +254,7 @@ def compare_packages(
             kind = "added"
         elif after is None:
             kind = "removed"
-        elif (before.get("version") or "unknown") != (after.get("version") or "unknown"):
+        elif package_version_identity(before) != package_version_identity(after):
             kind = "version"
         else:
             kind = "store"
@@ -289,7 +309,7 @@ def compare_packages_to_closure(
             kind = "removed"
         elif not before_entries:
             kind = "added"
-        elif str(after_package.get("version") or "unknown") not in {
+        elif package_version_identity(after_package) not in {
             entry.identity.version or "unknown" for entry in before_entries
         }:
             kind = "version"

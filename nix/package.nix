@@ -77,7 +77,7 @@ pkgs.python3Packages.buildPythonApplication {
     "--set"
     "NIXOS_UPDATE_CHECKER_ICON"
     "${output}/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
-    "--set"
+    "--set-default"
     "NIXOS_UPDATE_CHECKER_REPOSITORY"
     defaultRepository
     "--set"

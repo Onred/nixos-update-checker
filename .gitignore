@@ -5,5 +5,6 @@
 /.pytest_cache/
 /.ruff_cache/
 /.venv
+.env.local
 __pycache__/
 *.py[cod]

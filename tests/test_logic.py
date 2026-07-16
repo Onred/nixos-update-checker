@@ -14,6 +14,7 @@ from nixos_update_checker.logic import (
     garbage_collection_arguments,
     interactive_check_arguments,
     package_summary,
+    package_version_identity,
     packages_matching_closure,
     parse_store_path,
     partition_priority_changes,
@@ -101,6 +102,38 @@ def test_store_path_parsing(path: str, name: str, version: str) -> None:
     assert identity.path == path
     assert identity.name == name
     assert identity.version == version
+
+
+def test_wrapper_package_without_version_uses_store_path_identity() -> None:
+    package = {
+        "name": "steam-1.0.0.85-shell-env",
+        "pname": None,
+        "version": None,
+        "path": "/nix/store/aaaaaaaa-steam-1.0.0.85-shell-env",
+    }
+    assert package_version_identity(package) == "1.0.0.85-shell-env"
+
+
+def test_fast_comparison_treats_unchanged_wrapper_version_as_store_only() -> None:
+    running = ClosureInformation.from_path_info(
+        {
+            "/nix/store/aaaaaaaa-steam-1.0.0.85": {"narSize": 10},
+            "/nix/store/bbbbbbbb-steam-1.0.0.85-shell-env": {"narSize": 20},
+        }
+    )
+    rebuilt_wrapper = {
+        "name": "steam-1.0.0.85-shell-env",
+        "pname": None,
+        "version": None,
+        "path": "/nix/store/cccccccc-steam-1.0.0.85-shell-env",
+    }
+    changes = compare_packages_to_closure(
+        running,
+        {"steam": rebuilt_wrapper},
+        {"steam": rebuilt_wrapper},
+    )
+    assert [(change["name"], change["kind"]) for change in changes] == [("steam", "store")]
+    assert changes[0]["after"]["version"] == "1.0.0.85-shell-env"
 
 
 def test_legacy_settings_defaults() -> None:

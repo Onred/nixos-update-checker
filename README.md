@@ -194,7 +194,7 @@ unrelated disabled service defaults.
 
 There is no built-in NVIDIA, QEMU, Mesa, `kvmfr`, or other hardware-specific
 list. If the automatic rules cannot infer that an option is important, open
-**Actions → Settings…** and enter its NixOS option path. The GUI stores these
+**Settings** in the sidebar and enter its NixOS option path. The GUI stores these
 overrides and background policy in the shared, repository-local
 `.nixos-update-checker.json` file:
 
@@ -217,7 +217,7 @@ the repository is not writable by the desktop user, the GUI requests Polkit
 authorization before installing the settings file.
 
 Garbage collection is opt-in and defaults to retaining 30 days. It runs only
-after **Rebuild system** has completed successfully—never after a check, a
+after **Apply system update** has completed successfully—never after a check, a
 candidate build, or merely updating `flake.lock`. It uses
 `nix-collect-garbage --delete-older-than 30d`, so generations older than the
 configured retention period and subsequently unreferenced paths can no longer
@@ -273,6 +273,22 @@ already configured to use both paths. Integrated terminals remain normal shell
 terminals and inherit the loaded project environment; no custom terminal
 profile or automatic task is required.
 
+For a checkout-specific default configuration source, create the ignored
+`.env.local` file:
+
+```console
+NIXOS_UPDATE_CHECKER_REPOSITORY=/absolute/path/to/your/nixos-flake
+```
+
+The tracked `.envrc` loads that file, and the packaged launcher preserves the
+variable when using `nix run .`. After choosing a different source in the GUI,
+the GUI remembers that choice with Qt's per-user settings. On Linux the setting
+normally lives in
+`~/.config/nixos-update-checker/nixos-update-checker.conf`; an explicit path on
+the command line still takes precedence. Repository-local package-discovery,
+background-build, and garbage-collection policy remains separate in
+`.nixos-update-checker.json`.
+
 If direnv is not configured yet, the immediate no-setup fallback is:
 
 ```console
@@ -282,9 +298,9 @@ nix develop -c code .
 ## Safety notes
 
 - Normal checks never write the repository's `flake.lock`.
-- **Update inputs** deliberately runs `nix flake update` and writes `flake.lock`;
+- **Update lock file** deliberately runs `nix flake update` and writes `flake.lock`;
   it requests administrator authorization for a non-writable repository.
-- **Rebuild system** uses `pkexec` to request authorization, then runs
+- **Apply system update** uses `pkexec` to request authorization, then runs
   `nixos-rebuild switch --flake REPOSITORY#DISCOVERED-CONFIGURATION`.
 - Optional garbage collection runs only after that rebuild succeeds and retains
   generations newer than the configured age (30 days by default).

@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -31,11 +31,11 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QStyle,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -58,6 +58,10 @@ def environment(name: str, fallback: str = "") -> str:
 
 def canonical_path(path: str) -> str:
     return str(Path(path).expanduser().resolve())
+
+
+def initial_repository(explicit: str | None, saved: str, configured_default: str) -> str:
+    return explicit or saved or configured_default
 
 
 def display_time(value: Any) -> str:
@@ -111,8 +115,8 @@ class UpdateCheckerWindow(QMainWindow):
 
         self.setWindowIcon(self.base_icon)
         self.setWindowTitle("NixOS Update Checker")
-        self.setMinimumSize(800, 600)
-        self.resize(980, 720)
+        self.setMinimumSize(900, 640)
+        self.resize(1120, 780)
         self._build_ui()
         self._build_menus()
         self._build_tray()
@@ -151,13 +155,95 @@ class UpdateCheckerWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget(self)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(18, 18, 18, 14)
-        root.setSpacing(12)
+        central.setObjectName("applicationSurface")
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        navigation = QFrame()
+        navigation.setObjectName("navigationRail")
+        navigation.setFixedWidth(220)
+        navigation_layout = QVBoxLayout(navigation)
+        navigation_layout.setContentsMargins(18, 22, 18, 18)
+        navigation_layout.setSpacing(12)
+        brand = QHBoxLayout()
+        brand_icon = QLabel()
+        brand_icon.setPixmap(self.base_icon.pixmap(34, 34))
+        brand.addWidget(brand_icon)
+        brand_name = QLabel("NixOS\nUpdate Checker")
+        brand_name.setObjectName("brandName")
+        brand.addWidget(brand_name, 1)
+        navigation_layout.addLayout(brand)
+        navigation_label = QLabel("NAVIGATION")
+        navigation_label.setObjectName("eyebrow")
+        navigation_layout.addWidget(navigation_label)
+        self.navigation_list = QListWidget()
+        self.navigation_list.setObjectName("navigationList")
+        self.navigation_list.addItems(["Updates", "System state", "Activity log"])
+        self.navigation_list.setCurrentRow(0)
+        navigation_layout.addWidget(self.navigation_list)
+        navigation_layout.addStretch()
+        version_label = QLabel(display_version())
+        version_label.setObjectName("mutedText")
+        navigation_layout.addWidget(version_label)
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setObjectName("navigationButton")
+        self.settings_button.setToolTip(
+            "Configure package discovery, background builds, and garbage collection"
+        )
+        self.settings_button.clicked.connect(self.edit_settings)
+        navigation_layout.addWidget(self.settings_button)
+        root.addWidget(navigation)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(26, 22, 26, 14)
+        content_layout.setSpacing(14)
+
+        heading = QHBoxLayout()
+        heading_text = QVBoxLayout()
+        page_title = QLabel("System updates")
+        page_title.setObjectName("pageTitle")
+        page_subtitle = QLabel("Compare the running NixOS system with the latest flake inputs")
+        page_subtitle.setObjectName("mutedText")
+        heading_text.addWidget(page_title)
+        heading_text.addWidget(page_subtitle)
+        heading.addLayout(heading_text, 1)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedSize(150, 6)
+        self.progress.setTextVisible(False)
+        self.progress.hide()
+        heading.addWidget(self.progress, 0, Qt.AlignmentFlag.AlignVCenter)
+        content_layout.addLayout(heading)
+
+        target = QFrame()
+        target.setObjectName("sourceCard")
+        target_layout = QHBoxLayout(target)
+        target_layout.setContentsMargins(14, 10, 12, 10)
+        source_text = QVBoxLayout()
+        source_label = QLabel("CONFIGURATION SOURCE")
+        source_label.setObjectName("eyebrow")
+        source_hint = QLabel("The flake used to evaluate this running machine")
+        source_hint.setObjectName("mutedText")
+        source_text.addWidget(source_label)
+        source_text.addWidget(source_hint)
+        target_layout.addLayout(source_text)
+        self.repository_edit = QLineEdit(self.repository)
+        self.repository_edit.setObjectName("repositoryEdit")
+        self.repository_edit.editingFinished.connect(self.target_changed)
+        target_layout.addWidget(self.repository_edit, 1)
+        browse = QToolButton()
+        browse.setText("Browse…")
+        browse.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        browse.clicked.connect(self.choose_repository)
+        target_layout.addWidget(browse)
+        content_layout.addWidget(target)
 
         summary = QFrame()
         summary.setObjectName("summaryCard")
         summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(18, 16, 18, 16)
         self.summary_icon = QLabel()
         self.summary_icon.setPixmap(self.base_icon.pixmap(48, 48))
         self.summary_icon.setFixedSize(56, 56)
@@ -172,86 +258,131 @@ class UpdateCheckerWindow(QMainWindow):
         summary_text.addWidget(self.summary_detail)
         summary_layout.addLayout(summary_text, 1)
         self.last_checked = QLabel("Last checked: never")
+        self.last_checked.setObjectName("mutedText")
         self.last_checked.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         summary_layout.addWidget(self.last_checked)
-        root.addWidget(summary)
-
-        target_group = QGroupBox("Current system configuration")
-        target_layout = QHBoxLayout(target_group)
-        target_layout.addWidget(QLabel("Repository:"))
-        self.repository_edit = QLineEdit(self.repository)
-        self.repository_edit.editingFinished.connect(self.target_changed)
-        target_layout.addWidget(self.repository_edit, 1)
-        browse = QToolButton()
-        browse.setText("…")
-        browse.clicked.connect(self.choose_repository)
-        target_layout.addWidget(browse)
-        self.settings_button = QPushButton("Settings…")
-        self.settings_button.setToolTip(
-            "Configure package discovery, background builds, and garbage collection"
-        )
-        self.settings_button.clicked.connect(self.edit_settings)
-        target_layout.addWidget(self.settings_button)
-        root.addWidget(target_group)
+        content_layout.addWidget(summary)
 
         actions = QHBoxLayout()
-        self.check_button = QPushButton("Check now")
+        self.check_button = QPushButton("Check for updates")
+        self.check_button.setObjectName("primaryAction")
         self.check_button.clicked.connect(lambda: self.start_check(True, False))
-        self.build_check_button = QPushButton("Check with build")
+        self.build_check_button = QPushButton("Verify with a full build")
         self.build_check_button.setToolTip("Build the updated system closure without applying it")
         self.build_check_button.clicked.connect(lambda: self.start_check(True, True))
-        self.update_button = QPushButton("Update inputs")
-        self.update_button.clicked.connect(self.confirm_update)
-        self.rebuild_button = QPushButton("Rebuild system")
-        self.rebuild_button.clicked.connect(self.confirm_rebuild)
-        for button in (
-            self.check_button,
-            self.build_check_button,
-            self.update_button,
-            self.rebuild_button,
-        ):
-            actions.addWidget(button)
+        actions.addWidget(self.check_button)
+        actions.addWidget(self.build_check_button)
         actions.addStretch()
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.setMaximumWidth(190)
-        self.progress.setTextVisible(False)
-        self.progress.hide()
-        actions.addWidget(self.progress)
-        root.addLayout(actions)
+        self.update_button = QPushButton("Update lock file")
+        self.update_button.clicked.connect(self.confirm_update)
+        self.rebuild_button = QPushButton("Apply system update")
+        self.rebuild_button.clicked.connect(self.confirm_rebuild)
+        actions.addWidget(self.update_button)
+        actions.addWidget(self.rebuild_button)
+        content_layout.addLayout(actions)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_updates_tab(), "Updates")
-        tabs.addTab(self._build_system_tab(), "System")
-        tabs.addTab(self._build_activity_tab(), "Activity")
-        root.addWidget(tabs, 1)
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_updates_tab())
+        self.pages.addWidget(self._build_system_tab())
+        self.pages.addWidget(self._build_activity_tab())
+        self.navigation_list.currentRowChanged.connect(self.pages.setCurrentIndex)
+        content_layout.addWidget(self.pages, 1)
+        root.addWidget(content, 1)
         self.setCentralWidget(central)
         self.status_message = QLabel("Idle")
         self.statusBar().addWidget(self.status_message, 1)
-        self.statusBar().addPermanentWidget(QLabel(str(self.report_path)))
         self.setStyleSheet(
-            "QFrame#summaryCard { border: 1px solid palette(mid); border-radius: 8px; "
-            "background: palette(alternate-base); } "
-            "QLabel#summaryTitle { font-size: 18px; font-weight: 600; } "
-            "QGroupBox { font-weight: 600; }"
+            "QWidget#applicationSurface { background: palette(base); } "
+            "QFrame#navigationRail { background: palette(alternate-base); "
+            "border-right: 1px solid palette(mid); } "
+            "QLabel#brandName { font-size: 16px; font-weight: 700; } "
+            "QLabel#pageTitle { font-size: 25px; font-weight: 700; } "
+            "QLabel#summaryTitle { font-size: 19px; font-weight: 650; } "
+            "QLabel#sectionTitle { font-size: 16px; font-weight: 650; } "
+            "QLabel#metricValue { font-size: 24px; font-weight: 700; } "
+            "QLabel#eyebrow { font-size: 10px; font-weight: 700; color: palette(mid); } "
+            "QLabel#mutedText { color: palette(mid); } "
+            "QListWidget#navigationList { background: transparent; border: none; outline: none; } "
+            "QListWidget#navigationList::item { padding: 11px 10px; border-radius: 6px; } "
+            "QListWidget#navigationList::item:selected { background: palette(highlight); "
+            "color: palette(highlighted-text); } "
+            "QFrame#sourceCard, QFrame#metricCard, QFrame#contentCard { "
+            "border: 1px solid palette(mid); border-radius: 8px; background: palette(base); } "
+            "QFrame#summaryCard { border: 1px solid palette(mid); border-left: 5px solid #3daee9; "
+            "border-radius: 9px; background: palette(alternate-base); } "
+            "QPushButton, QToolButton { min-height: 30px; padding: 2px 12px; } "
+            "QPushButton#primaryAction { background: #2673d9; color: white; border: none; "
+            "border-radius: 5px; font-weight: 650; padding: 4px 16px; } "
+            "QPushButton#primaryAction:hover { background: #3583eb; } "
+            "QPushButton#navigationButton { text-align: left; } "
+            "QLineEdit#repositoryEdit { min-height: 30px; } "
+            "QHeaderView::section { padding: 7px; border: none; "
+            "border-bottom: 1px solid palette(mid); "
+            "font-weight: 650; } "
+            "QTableWidget { border: none; gridline-color: palette(mid); } "
+            "QProgressBar { border: none; background: palette(alternate-base); } "
+            "QProgressBar::chunk { background: #3daee9; }"
         )
+
+    def _metric_card(self, label: str) -> tuple[QFrame, QLabel]:
+        card = QFrame()
+        card.setObjectName("metricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 10)
+        value = QLabel("0")
+        value.setObjectName("metricValue")
+        caption = QLabel(label)
+        caption.setObjectName("mutedText")
+        layout.addWidget(value)
+        layout.addWidget(caption)
+        return card, value
+
+    def _configure_table(self, table: QTableWidget) -> None:
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
     def _build_updates_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        package_group = QGroupBox("Important package updates")
-        package_layout = QVBoxLayout(package_group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        metrics = QHBoxLayout()
+        important_card, self.important_count = self._metric_card("Important packages")
+        dependency_card, self.dependency_count = self._metric_card("Dependencies")
+        input_card, self.input_count = self._metric_card("Flake inputs")
+        store_card, self.store_count = self._metric_card("Rebuild-only changes")
+        for card in (important_card, dependency_card, input_card, store_card):
+            metrics.addWidget(card)
+        layout.addLayout(metrics)
+
+        package_card = QFrame()
+        package_card.setObjectName("contentCard")
+        package_layout = QVBoxLayout(package_card)
+        package_heading = QLabel("Important package updates")
+        package_heading.setObjectName("sectionTitle")
+        package_description = QLabel(
+            "Packages selected directly by the system configuration and enabled hardware modules"
+        )
+        package_description.setObjectName("mutedText")
+        package_layout.addWidget(package_heading)
+        package_layout.addWidget(package_description)
         self.package_table = QTableWidget(0, 4)
         self.package_table.setHorizontalHeaderLabels(["Package", "Change", "Current", "Available"])
-        self.package_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.package_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
+        self._configure_table(self.package_table)
+        self.package_table.setMinimumHeight(190)
         package_layout.addWidget(self.package_table)
-        layout.addWidget(package_group, 2)
+        layout.addWidget(package_card, 2)
 
-        details_group = QGroupBox("Additional details")
-        details_layout = QVBoxLayout(details_group)
+        details_card = QFrame()
+        details_card.setObjectName("contentCard")
+        details_layout = QVBoxLayout(details_card)
+        details_heading = QLabel("Additional changes")
+        details_heading.setObjectName("sectionTitle")
+        details_layout.addWidget(details_heading)
 
         self.input_toggle = QToolButton()
         self.input_toggle.setCheckable(True)
@@ -261,8 +392,7 @@ class UpdateCheckerWindow(QMainWindow):
         details_layout.addWidget(self.input_toggle)
         self.input_table = QTableWidget(0, 3)
         self.input_table.setHorizontalHeaderLabels(["Input", "Current", "Available"])
-        self.input_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.input_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._configure_table(self.input_table)
         self.input_table.setVisible(False)
         details_layout.addWidget(self.input_table)
 
@@ -276,10 +406,7 @@ class UpdateCheckerWindow(QMainWindow):
         self.dependency_table.setHorizontalHeaderLabels(
             ["Package", "Change", "Current", "Available"]
         )
-        self.dependency_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.dependency_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
+        self._configure_table(self.dependency_table)
         self.dependency_table.setVisible(False)
         details_layout.addWidget(self.dependency_table)
 
@@ -293,23 +420,26 @@ class UpdateCheckerWindow(QMainWindow):
         self.store_only_table.setHorizontalHeaderLabels(
             ["Package", "Change", "Current", "Available"]
         )
-        self.store_only_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.store_only_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
+        self._configure_table(self.store_only_table)
         self.store_only_table.setVisible(False)
         details_layout.addWidget(self.store_only_table)
         self.set_input_changes([])
         self.set_dependency_changes([])
         self.set_store_only_changes([])
-        layout.addWidget(details_group, 1)
+        layout.addWidget(details_card, 1)
         return tab
 
     def _build_system_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        group = QGroupBox("System state")
+        layout.setContentsMargins(0, 0, 0, 0)
+        heading = QLabel("Running system")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+        group = QFrame()
+        group.setObjectName("contentCard")
         form = QFormLayout(group)
+        form.setContentsMargins(18, 18, 18, 18)
         fields = [
             ("runningGeneration", "Running generation"),
             ("nextBootGeneration", "Next-boot generation"),
@@ -325,22 +455,39 @@ class UpdateCheckerWindow(QMainWindow):
             self.system_values[key] = value
             form.addRow(f"{label}:", value)
         layout.addWidget(group)
+        explanation_card = QFrame()
+        explanation_card.setObjectName("contentCard")
+        explanation_layout = QVBoxLayout(explanation_card)
+        explanation_heading = QLabel("How configuration matching works")
+        explanation_heading.setObjectName("sectionTitle")
         explanation = QLabel(
             "Checks discover the flake configuration matching this machine's hostname. "
             "Package options normally follow enabled NixOS modules; exceptional "
             "package-valued options can be selected in Settings."
         )
         explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        explanation_layout.addWidget(explanation_heading)
+        explanation_layout.addWidget(explanation)
+        layout.addWidget(explanation_card)
         layout.addStretch()
         return tab
 
     def _build_activity_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.activity = QPlainTextEdit()
         self.activity.setReadOnly(True)
         self.activity.document().setMaximumBlockCount(3000)
+        header = QHBoxLayout()
+        heading = QLabel("Activity log")
+        heading.setObjectName("sectionTitle")
+        header.addWidget(heading)
+        header.addStretch()
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self.activity.clear)
+        header.addWidget(clear)
+        layout.addLayout(header)
         layout.addWidget(self.activity)
         return tab
 
@@ -402,6 +549,9 @@ class UpdateCheckerWindow(QMainWindow):
         if repository == self.repository:
             return
         self.repository = repository
+        path = Path(repository)
+        if (path / "flake.nix").exists() and (path / "flake.lock").exists():
+            self.settings.setValue("repository", repository)
         self.repository_edit.setText(repository)
         self.report_mtime_ns = 0
         self.last_report = {}
@@ -903,6 +1053,7 @@ class UpdateCheckerWindow(QMainWindow):
             self.input_table.setItem(row, 2, QTableWidgetItem(input_revision(change.get("after"))))
 
     def set_input_changes(self, inputs: list[JsonObject]) -> None:
+        self.input_count.setText(str(len(inputs)))
         self.populate_inputs(inputs)
         self.input_toggle.setText(f"Flake input changes ({len(inputs)})")
         self.input_toggle.setVisible(bool(inputs))
@@ -916,6 +1067,7 @@ class UpdateCheckerWindow(QMainWindow):
         self.input_table.setVisible(expanded and self.input_table.rowCount() > 0)
 
     def populate_packages(self, packages: list[JsonObject]) -> None:
+        self.important_count.setText(str(len(packages)))
         self.populate_package_table(self.package_table, packages)
 
     def populate_package_table(self, table: QTableWidget, packages: list[JsonObject]) -> None:
@@ -927,6 +1079,7 @@ class UpdateCheckerWindow(QMainWindow):
             table.setItem(row, 3, QTableWidgetItem(package_version(change.get("after"))))
 
     def set_dependency_changes(self, packages: list[JsonObject]) -> None:
+        self.dependency_count.setText(str(len(packages)))
         self.populate_package_table(self.dependency_table, packages)
         self.dependency_toggle.setText(f"Dependency changes ({len(packages)})")
         self.dependency_toggle.setVisible(bool(packages))
@@ -940,6 +1093,7 @@ class UpdateCheckerWindow(QMainWindow):
         self.dependency_table.setVisible(expanded and self.dependency_table.rowCount() > 0)
 
     def set_store_only_changes(self, packages: list[JsonObject]) -> None:
+        self.store_count.setText(str(len(packages)))
         self.populate_package_table(self.store_only_table, packages)
         self.store_only_toggle.setText(f"Store-only changes ({len(packages)})")
         self.store_only_toggle.setVisible(bool(packages))
@@ -1134,6 +1288,10 @@ class UpdateCheckerWindow(QMainWindow):
             or not self.dependency_table.isHidden()
             or not self.store_only_table.isHidden()
             or self.summary_title.text() != "1 important package update available"
+            or self.important_count.text() != "1"
+            or self.dependency_count.text() != "1"
+            or self.input_count.text() != "1"
+            or self.store_count.text() != "1"
         ):
             raise RuntimeError("GUI report rendering self-test failed")
 
@@ -1163,8 +1321,12 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationDisplayName("NixOS Update Checker")
     app.setOrganizationName("nixos-update-checker")
     app.setApplicationVersion(display_version())
-    repository = namespace.repository or environment(
-        "NIXOS_UPDATE_CHECKER_REPOSITORY", "/etc/nixos"
+    application_settings = QSettings("nixos-update-checker", "nixos-update-checker")
+    saved_repository = str(application_settings.value("repository", "") or "")
+    repository = initial_repository(
+        namespace.repository,
+        saved_repository,
+        environment("NIXOS_UPDATE_CHECKER_REPOSITORY", "/etc/nixos"),
     )
     window = UpdateCheckerWindow(repository, namespace.report, not namespace.no_tray)
     app.setQuitOnLastWindowClosed(not window.use_tray)
