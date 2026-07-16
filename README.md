@@ -22,10 +22,12 @@ nixpkgs channel (for example `26.05` or `unstable`). Package provenance comes
 from evaluated package source metadata and exact candidate output matches
 against direct packages in each locked nixpkgs input. Packages whose origin
 cannot be recovered safely are labeled `unknown`. Recognizable Python, Perl,
-Ruby, Lua, GHC, and Emacs package-set updates are collapsed by package set and
-channel; every underlying update still contributes to the summary count and is
-listed in the Information pane. Store-path-only changes are collapsed into one
-final rebuild row in the same way.
+Ruby, Lua, GHC, and Emacs package-set updates are inferred from their output
+names. KDE membership is obtained with one targeted, non-recursive evaluation
+of the selected configuration's `pkgs.kdePackages`. Updates are collapsed by
+package set and channel; every underlying update still contributes to the
+summary count and is listed in the Information pane. Store-path-only changes
+are collapsed into one final rebuild row in the same way.
 
 ## Nix flake outputs
 

@@ -110,6 +110,52 @@ def test_closure_package_channel_requires_exact_output_match(
     assert "channel" not in changes[1]
 
 
+def test_package_set_annotation_requires_an_exact_candidate_output_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    values = [
+        {
+            "attribute": "dolphin",
+            "paths": ["/nix/store/aaaaaaaa-dolphin-26.05"],
+            "description": "KDE file manager",
+            "position": "/nix/store/nixpkgs-source/kde/dolphin.nix:1",
+        },
+        {
+            "attribute": "okular",
+            "paths": ["/nix/store/unrelated-okular-26.05"],
+            "description": "Document viewer",
+        },
+    ]
+    calls: list[list[str]] = []
+
+    def run_command(
+        _program: str, arguments: list[str], **_kwargs: object
+    ) -> checker.CommandResult:
+        calls.append(arguments)
+        return checker.CommandResult(0, json.dumps(values), "")
+
+    monkeypatch.setattr(checker, "run_command", run_command)
+    changes = [
+        {"name": "dolphin", "after": {"path": "/nix/store/aaaaaaaa-dolphin-26.05"}},
+        {"name": "okular", "after": {"path": "/nix/store/bbbbbbbb-okular-26.05"}},
+    ]
+    candidate_lock = tmp_path / "flake.lock"
+    checker.annotate_package_sets(
+        changes,
+        'path:/config#nixosConfigurations."workstation"',
+        candidate_lock,
+        ("kdePackages",),
+        {"/nix/store/nixpkgs-source": "unstable"},
+        debug=False,
+    )
+    assert changes[0]["packageSet"] == "kdePackages"
+    assert changes[0]["description"] == "KDE file manager"
+    assert changes[0]["channel"] == "unstable"
+    assert "packageSet" not in changes[1]
+    assert calls[0][-1].endswith(".pkgs.kdePackages")
+    assert calls[0][calls[0].index("--reference-lock-file") + 1] == str(candidate_lock)
+
+
 def test_service_report_is_atomically_replaced(tmp_path: Path) -> None:
     path = tmp_path / "state" / "report.json"
     checker.write_report(path, {"schemaVersion": 1, "status": "success"})

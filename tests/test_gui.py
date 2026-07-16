@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from PySide6.QtGui import QColor
+
 from nixos_update_checker.gui import (
     UpdateCheckerWindow,
+    color_contrast_ratio,
     group_package_update_rows,
     initial_repository,
     package_set_identity,
+    package_type_label,
+    readable_muted_color,
     update_detail_lines,
     update_sort_key,
 )
@@ -18,14 +23,14 @@ def test_repository_selection_prefers_explicit_then_saved_then_configured_defaul
 
 def test_updates_sort_flakes_then_channels_then_rebuild() -> None:
     updates = [
-        {"type": "nixPkg · unknown", "channel": "unknown", "name": "unknown"},
-        {"type": "nixPkg · 25.05", "channel": "25.05", "name": "old"},
+        {"type": "nixPkg", "channel": "unknown", "name": "unknown"},
+        {"type": "nixPkg 25.05", "channel": "25.05", "name": "old"},
         {"type": "rebuild", "name": "Rebuild-only package changes"},
-        {"type": "nixPkg · unstable", "channel": "unstable", "name": "edge"},
-        {"type": "nixPkg · 25.11", "channel": "25.11", "name": "stable-b"},
+        {"type": "nixPkg unstable", "channel": "unstable", "name": "edge"},
+        {"type": "nixPkg 25.11", "channel": "25.11", "name": "stable-b"},
         {"type": "flake", "name": "nixpkgs"},
-        {"type": "nixPkg · 26.05", "channel": "26.05", "name": "stable-a"},
-        {"type": "nixPkg · custom", "channel": "custom", "name": "custom"},
+        {"type": "nixPkg 26.05", "channel": "26.05", "name": "stable-a"},
+        {"type": "nixPkg custom", "channel": "custom", "name": "custom"},
     ]
     updates.sort(key=update_sort_key)
     assert [update["name"] for update in updates] == [
@@ -67,7 +72,7 @@ def test_package_set_identity_uses_recognizable_runtime_prefixes() -> None:
 def test_package_set_rows_group_by_set_and_channel_without_losing_count() -> None:
     rows = [
         {
-            "type": "nixPkg · unstable",
+            "type": "nixPkg unstable",
             "channel": "unstable",
             "name": "python3.13-pyside6",
             "description": "Qt bindings",
@@ -75,7 +80,7 @@ def test_package_set_rows_group_by_set_and_channel_without_losing_count() -> Non
             "available": "6.10",
         },
         {
-            "type": "nixPkg · unstable",
+            "type": "nixPkg unstable",
             "channel": "unstable",
             "name": "python3.13-rich",
             "description": "Terminal formatting",
@@ -83,7 +88,7 @@ def test_package_set_rows_group_by_set_and_channel_without_losing_count() -> Non
             "available": "14.0",
         },
         {
-            "type": "nixPkg · 26.05",
+            "type": "nixPkg 26.05",
             "channel": "26.05",
             "name": "python3.13-pytest",
             "description": "Test framework",
@@ -91,7 +96,7 @@ def test_package_set_rows_group_by_set_and_channel_without_losing_count() -> Non
             "available": "8.4",
         },
         {
-            "type": "nixPkg · unstable",
+            "type": "nixPkg unstable",
             "channel": "unstable",
             "name": "firefox",
             "description": "Web browser",
@@ -108,8 +113,53 @@ def test_package_set_rows_group_by_set_and_channel_without_losing_count() -> Non
     assert any(row["name"] == "python3.13-pytest" for row in grouped)
     assert any(row["name"] == "firefox" for row in grouped)
     assert update_detail_lines(python_group) == [
-        "• python3.13-pyside6: 6.9 → 6.10",
-        "  Qt bindings",
-        "• python3.13-rich: 13.9 → 14.0",
-        "  Terminal formatting",
+        "python3.13-pyside6",
+        "• 6.9 → 6.10",
+        "• Qt bindings",
+        "",
+        "python3.13-rich",
+        "• 13.9 → 14.0",
+        "• Terminal formatting",
     ]
+
+
+def test_explicit_kde_package_set_groups_names_without_a_shared_prefix() -> None:
+    rows = [
+        {
+            "type": "nixPkg",
+            "channel": "unknown",
+            "packageSet": "kdePackages",
+            "name": name,
+            "description": "",
+            "current": "1",
+            "available": "2",
+        }
+        for name in ("dolphin", "kwin", "okular")
+    ]
+    assert package_type_label("unknown") == "nixPkg"
+    assert package_type_label("unstable") == "nixPkg unstable"
+    grouped = group_package_update_rows(rows)
+    assert len(grouped) == 1
+    assert grouped[0]["name"] == "kdePackages"
+    assert grouped[0]["available"] == "3 updates"
+
+
+def test_individual_package_information_uses_unbulleted_name_and_bulleted_details() -> None:
+    assert update_detail_lines(
+        {
+            "type": "nixPkg",
+            "name": "firefox",
+            "current": "140",
+            "available": "141",
+            "description": "Web browser",
+        }
+    ) == ["firefox", "• 140 → 141", "• Web browser"]
+
+
+def test_muted_description_color_comes_from_palette_and_remains_readable() -> None:
+    text = QColor("#000000")
+    background = QColor("#ffffff")
+    muted = readable_muted_color(text, background)
+    assert muted != text
+    assert muted != background
+    assert color_contrast_ratio(muted, background) >= 4.5

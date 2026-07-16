@@ -399,6 +399,108 @@ in builtins.filter (item: item.path != null) (map packagePath names)
                 change["channel"] = channel
 
 
+TARGET_PACKAGE_SETS = ("kdePackages",)
+
+
+PACKAGE_SET_APPLY = r"""
+packageSet:
+let
+  package = attribute:
+    let
+      value = builtins.getAttr attribute packageSet;
+      outputNames =
+        if builtins.isAttrs value && value ? outputs && builtins.isList value.outputs
+        then value.outputs
+        else [ ];
+      paths = map (output: (builtins.getAttr output value).outPath) outputNames;
+      description =
+        if builtins.isAttrs value && builtins.isString (value.meta.description or null)
+        then value.meta.description
+        else null;
+      position =
+        if builtins.isAttrs value && builtins.isString (value.meta.position or null)
+        then value.meta.position
+        else null;
+      record = { inherit attribute paths description position; };
+      evaluated = builtins.tryEval (builtins.deepSeq record record);
+    in if evaluated.success then [ (evaluated.value) ] else [ ];
+in builtins.concatMap package (builtins.attrNames packageSet)
+"""
+
+
+def annotate_package_sets(
+    changes: list[JsonObject],
+    configuration: str,
+    candidate_lock: Path,
+    package_sets: tuple[str, ...],
+    source_channels: dict[str, str],
+    *,
+    debug: bool,
+) -> None:
+    if not changes:
+        return
+    changes_by_path: dict[str, list[JsonObject]] = {}
+    for change in changes:
+        after = change.get("after")
+        if not isinstance(after, dict):
+            continue
+        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
+        for path in paths:
+            if path:
+                changes_by_path.setdefault(path, []).append(change)
+    if not changes_by_path:
+        return
+    ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
+
+    for package_set in package_sets:
+        result = run_command(
+            nix_executable(),
+            [
+                "eval",
+                "--reference-lock-file",
+                str(candidate_lock),
+                "--json",
+                "--apply",
+                PACKAGE_SET_APPLY,
+                f"{configuration}.pkgs.{package_set}",
+            ],
+        )
+        if not result.succeeded:
+            if debug:
+                print(
+                    f"Could not inspect package set {package_set}:\n{result.stderr}",
+                    file=sys.stderr,
+                )
+            continue
+        values = parse_json(result.stdout, f"Invalid package-set result for {package_set}")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            matching_changes = {
+                id(change): change
+                for path in value.get("paths", [])
+                for change in changes_by_path.get(str(path), [])
+            }
+            for change in matching_changes.values():
+                change["packageSet"] = package_set
+                description = value.get("description")
+                if description and not change.get("description"):
+                    change["description"] = description
+                position = str(value.get("position") or "")
+                channel = next(
+                    (
+                        label
+                        for source, label in ordered_sources
+                        if position.startswith(f"{source}/")
+                    ),
+                    "",
+                )
+                if channel and not change.get("channel"):
+                    change["channel"] = channel
+
+
 PACKAGE_APPLY = r"""
 value:
 let
@@ -628,6 +730,14 @@ def run_check(options: CheckOptions) -> JsonObject:
                     configuration_platform(configuration, candidate_lock),
                     debug=options.debug,
                 )
+            annotate_package_sets(
+                closure_changes,
+                configuration,
+                candidate_lock,
+                TARGET_PACKAGE_SETS,
+                candidate_source_channels,
+                debug=options.debug,
+            )
             candidate_manifest = evaluate_manifest(
                 configuration,
                 candidate_lock,
@@ -726,6 +836,14 @@ def run_check(options: CheckOptions) -> JsonObject:
                     configuration_platform(configuration, candidate_lock),
                     debug=options.debug,
                 )
+            annotate_package_sets(
+                package_changes,
+                configuration,
+                candidate_lock,
+                TARGET_PACKAGE_SETS,
+                candidate_source_channels,
+                debug=options.debug,
+            )
             package_source = "evaluatedManifestAgainstRunningClosure"
 
         if lock_before != file_hash(lock_path):

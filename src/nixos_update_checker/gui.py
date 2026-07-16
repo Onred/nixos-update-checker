@@ -93,6 +93,42 @@ def package_version(value: Any) -> str:
     return str(value.get("version") or "unknown")
 
 
+def package_type_label(channel: str) -> str:
+    return "nixPkg" if not channel or channel == "unknown" else f"nixPkg {channel}"
+
+
+def color_contrast_ratio(first: QColor, second: QColor) -> float:
+    def luminance(color: QColor) -> float:
+        channels = (color.redF(), color.greenF(), color.blueF())
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    brighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+    return (brighter + 0.05) / (darker + 0.05)
+
+
+def readable_muted_color(text: QColor, background: QColor) -> QColor:
+    result = QColor(text)
+    for background_percent in range(5, 45, 5):
+        text_percent = 100 - background_percent
+        candidate = QColor(
+            round((text.red() * text_percent + background.red() * background_percent) / 100),
+            round(
+                (text.green() * text_percent + background.green() * background_percent) / 100
+            ),
+            round((text.blue() * text_percent + background.blue() * background_percent) / 100),
+        )
+        if color_contrast_ratio(candidate, background) < 4.5:
+            break
+        result = candidate
+    return result
+
+
 def channel_sort_key(channel: str) -> tuple[int, int, int, str]:
     labels = [label.strip() for label in channel.split("/") if label.strip()]
     folded_labels = [label.casefold() for label in labels]
@@ -150,12 +186,20 @@ def group_package_update_rows(rows: list[JsonObject]) -> list[JsonObject]:
     labels: dict[tuple[str, str], str] = {}
     ungrouped: list[JsonObject] = []
     for row in rows:
-        identity = package_set_identity(str(row.get("name", "")))
+        explicit_set = str(row.get("packageSet") or "")
+        identity = (
+            (f"explicit:{explicit_set}", explicit_set)
+            if explicit_set
+            else package_set_identity(str(row.get("name", "")))
+        )
         if identity is None:
             ungrouped.append(row)
             continue
         set_key, label = identity
-        key = (str(row.get("channel", "unknown")), set_key)
+        key = (
+            "" if explicit_set else str(row.get("channel", "unknown")),
+            set_key,
+        )
         grouped.setdefault(key, []).append(row)
         labels[key] = label
 
@@ -164,11 +208,20 @@ def group_package_update_rows(rows: list[JsonObject]) -> list[JsonObject]:
         if len(members) == 1:
             result.extend(members)
             continue
-        channel, _set_key = key
+        keyed_channel, _set_key = key
+        member_channels = sorted(
+            {
+                str(member.get("channel", "unknown"))
+                for member in members
+                if str(member.get("channel", "unknown")) != "unknown"
+            },
+            key=lambda channel: channel_sort_key(channel),
+        )
+        channel = " / ".join(member_channels) or keyed_channel or "unknown"
         count = len(members)
         result.append(
             {
-                "type": f"nixPkg · {channel}",
+                "type": package_type_label(channel),
                 "channel": channel,
                 "name": labels[key],
                 "description": f"{count} package updates in this set",
@@ -186,14 +239,17 @@ def group_package_update_rows(rows: list[JsonObject]) -> list[JsonObject]:
 def update_detail_lines(update: JsonObject) -> list[str]:
     package_changes = update.get("packageChanges", [])
     store_changes = update.get("storeChanges", [])
+    is_package = str(update.get("type", "")).startswith("nixPkg")
     details = package_changes if package_changes else store_changes
+    if not details and is_package:
+        details = [update]
     if not isinstance(details, list):
         return []
     lines: list[str] = []
     for change in details:
         if not isinstance(change, dict):
             continue
-        if package_changes:
+        if package_changes or (is_package and not store_changes):
             current = str(change.get("current", "unknown"))
             available = str(change.get("available", "unknown"))
             description = str(change.get("description") or "")
@@ -208,9 +264,12 @@ def update_detail_lines(update: JsonObject) -> list[str]:
                 or (before.get("description") if isinstance(before, dict) else "")
                 or ""
             )
-        lines.append(f"• {change.get('name', 'unknown')}: {current} → {available}")
+        if lines:
+            lines.append("")
+        lines.append(str(change.get("name", "unknown")))
+        lines.append(f"• {current} → {available}")
         if description:
-            lines.append(f"  {description}")
+            lines.append(f"• {description}")
     return lines
 
 
@@ -253,7 +312,13 @@ class PackageNameDelegate(UpdateItemDelegate):
         primary = (
             option.palette.highlightedText().color() if selected else option.palette.text().color()
         )
-        secondary = primary if selected else option.palette.placeholderText().color()
+        secondary = (
+            primary
+            if selected
+            else readable_muted_color(
+                option.palette.text().color(), option.palette.base().color()
+            )
+        )
         text_rect = option.rect.adjusted(12, 7, -8, -5)
         painter.save()
         painter.setPen(primary)
@@ -427,8 +492,8 @@ class UpdateCheckerWindow(QMainWindow):
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(70)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.update_table.setColumnWidth(0, 130)
-        self.update_table.setColumnWidth(1, 720)
+        self.update_table.setColumnWidth(0, 190)
+        self.update_table.setColumnWidth(1, 660)
         self.update_table.setColumnWidth(2, 170)
         self.update_table.setItemDelegate(UpdateItemDelegate(self.update_table))
         self.update_table.setItemDelegateForColumn(1, PackageNameDelegate(self.update_table))
@@ -1175,12 +1240,13 @@ class UpdateCheckerWindow(QMainWindow):
             )
             package_rows.append(
                 {
-                    "type": f"nixPkg · {channel}",
+                    "type": package_type_label(channel),
                     "channel": channel,
                     "name": str(change.get("name", "")),
                     "description": description,
                     "current": package_version(before),
                     "available": available,
+                    "packageSet": change.get("packageSet"),
                 }
             )
         rows = group_package_update_rows(package_rows)
@@ -1217,7 +1283,7 @@ class UpdateCheckerWindow(QMainWindow):
             type_item = QTableWidgetItem(str(update["type"]))
             name_text = str(update["name"])
             if update["description"]:
-                name_text += f"\n• {update['description']}"
+                name_text += f"\n{update['description']}"
             name_item = QTableWidgetItem(name_text)
             available_item = QTableWidgetItem(str(update["available"]))
             type_item.setData(Qt.ItemDataRole.UserRole, update)
@@ -1234,6 +1300,8 @@ class UpdateCheckerWindow(QMainWindow):
         self.information_type.setText("Type: —")
         self.information_current.setText("Current: —")
         self.information_available.setText("Available: —")
+        self.information_current.setVisible(True)
+        self.information_available.setVisible(True)
         self.information_list.clear()
         self.information_list.setVisible(False)
 
@@ -1248,12 +1316,18 @@ class UpdateCheckerWindow(QMainWindow):
             self.clear_selection_information()
             return
         self.information_title.setText(str(update.get("name", "")))
+        update_type = str(update.get("type", "—"))
+        is_package_details = update_type.startswith("nixPkg") or update_type == "rebuild"
         self.information_description.setText(
-            str(update.get("description") or "No package description is available.")
+            "Update details"
+            if is_package_details
+            else str(update.get("description") or "No description is available.")
         )
-        self.information_type.setText(f"Type: {update.get('type', '—')}")
+        self.information_type.setText(f"Type: {update_type}")
         self.information_current.setText(f"Current: {update.get('current', '—')}")
         self.information_available.setText(f"Available: {update.get('available', '—')}")
+        self.information_current.setVisible(not is_package_details)
+        self.information_available.setVisible(not is_package_details)
         lines = update_detail_lines(update)
         if lines:
             self.information_list.setPlainText("\n".join(lines))
@@ -1454,7 +1528,10 @@ class UpdateCheckerWindow(QMainWindow):
             self.update_table.rowCount() != 4
             or self.update_table.columnCount() != 3
             or self.update_table.item(0, 0).text() != "flake"
+            or self.update_table.item(1, 0).text() != "nixPkg"
             or self.update_table.item(3, 0).text() != "rebuild"
+            or "\n•" in self.update_table.item(1, 1).text()
+            or self.update_table.columnWidth(0) < 190
             or self.package_count.property("summaryValue") != "2"
             or self.flake_count.property("summaryValue") != "1"
             or self.rebuild_state.property("summaryValue") != "No"
