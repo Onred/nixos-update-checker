@@ -55,7 +55,8 @@ def test_automatic_and_manual_gui_checks_select_expected_modes() -> None:
 
     UpdateCheckerWindow.start_automatic_check(Window())  # type: ignore[arg-type]
     UpdateCheckerWindow.start_manual_check(Window())  # type: ignore[arg-type]
-    assert calls == [(False, False), (True, True)]
+    UpdateCheckerWindow.start_post_rebuild_check(Window())  # type: ignore[arg-type]
+    assert calls == [(False, False), (True, True), (False, True)]
 
 
 def test_package_set_identity_uses_recognizable_runtime_prefixes() -> None:

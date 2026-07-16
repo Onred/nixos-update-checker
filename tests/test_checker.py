@@ -113,14 +113,17 @@ def test_closure_package_channel_requires_exact_output_match(
 def test_package_set_annotation_requires_an_exact_candidate_output_match(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
     values = [
         {
+            "packageSet": "kdePackages",
             "attribute": "dolphin",
             "paths": ["/nix/store/aaaaaaaa-dolphin-26.05"],
             "description": "KDE file manager",
             "position": "/nix/store/nixpkgs-source/kde/dolphin.nix:1",
         },
         {
+            "packageSet": "kdePackages",
             "attribute": "okular",
             "paths": ["/nix/store/unrelated-okular-26.05"],
             "description": "Document viewer",
@@ -146,14 +149,88 @@ def test_package_set_annotation_requires_an_exact_candidate_output_match(
         candidate_lock,
         ("kdePackages",),
         {"/nix/store/nixpkgs-source": "unstable"},
+        "/nix/store/candidate-system.drv",
+        False,
         debug=False,
     )
     assert changes[0]["packageSet"] == "kdePackages"
     assert changes[0]["description"] == "KDE file manager"
     assert changes[0]["channel"] == "unstable"
     assert "packageSet" not in changes[1]
-    assert calls[0][-1].endswith(".pkgs.kdePackages")
+    assert calls[0][-1].endswith('nixosConfigurations."workstation"')
     assert calls[0][calls[0].index("--reference-lock-file") + 1] == str(candidate_lock)
+    apply = calls[0][calls[0].index("--apply") + 1]
+    assert "builtins.hasAttr attribute packageSet.value" in apply
+    assert '"dolphin"' in apply
+
+
+def test_full_package_set_results_are_cached_and_reused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    values = [
+        {
+            "packageSet": "kdePackages",
+            "attribute": "dolphin",
+            "paths": ["/nix/store/aaaaaaaa-dolphin-26.05"],
+            "description": None,
+            "position": None,
+        }
+    ]
+    calls = 0
+
+    def run_command(*_args: object, **_kwargs: object) -> checker.CommandResult:
+        nonlocal calls
+        calls += 1
+        return checker.CommandResult(0, json.dumps(values), "")
+
+    monkeypatch.setattr(checker, "run_command", run_command)
+    arguments = (
+        'path:/config#nixosConfigurations."workstation"',
+        tmp_path / "flake.lock",
+        ("kdePackages",),
+        {},
+        "/nix/store/candidate-system.drv",
+    )
+    first = [{"name": "dolphin", "after": {"path": values[0]["paths"][0]}}]
+    checker.annotate_package_sets(first, *arguments, full=True, debug=False)
+    assert first[0]["packageSet"] == "kdePackages"
+    assert calls == 1
+
+    second = [{"name": "dolphin", "after": {"path": values[0]["paths"][0]}}]
+    checker.annotate_package_sets(second, *arguments, full=False, debug=False)
+    assert second[0]["packageSet"] == "kdePackages"
+    assert calls == 1
+    assert checker.package_set_cache_path(arguments[-1]).is_file()
+
+
+def test_selective_package_set_names_include_ecosystem_aliases() -> None:
+    aliases = checker.package_set_candidate_names(
+        [
+            {"name": "python3.13-pyside6"},
+            {"name": "ghc9.10-aeson"},
+            {"name": "r-ggplot2"},
+        ]
+    )
+    assert {"pyside6", "aeson", "ggplot2"} <= aliases
+
+
+def test_package_set_cache_prunes_old_configuration_generations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    for index in range(checker.PACKAGE_SET_CACHE_LIMIT + 1):
+        identity = f"/nix/store/system-{index}.drv"
+        checker.write_package_set_cache(
+            identity,
+            ("kdePackages",),
+            [{"packageSet": "kdePackages", "paths": [f"/nix/store/package-{index}"]}],
+            debug=False,
+        )
+    assert len(list(checker.package_set_cache_directory().glob("*.json.gz"))) == 3
+    latest_identity = f"/nix/store/system-{checker.PACKAGE_SET_CACHE_LIMIT}.drv"
+    assert checker.read_package_set_cache(latest_identity, ("kdePackages",)) is not None
+    assert checker.read_package_set_cache(latest_identity, ("gnome",)) is None
 
 
 def test_service_report_is_atomically_replaced(tmp_path: Path) -> None:

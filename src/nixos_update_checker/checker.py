@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -399,20 +400,175 @@ in builtins.filter (item: item.path != null) (map packagePath names)
                 change["channel"] = channel
 
 
-TARGET_PACKAGE_SETS = ("kdePackages",)
+PACKAGE_SET_CACHE_SCHEMA = 1
+PACKAGE_SET_CACHE_LIMIT = 3
+PACKAGE_SET_SPECS = (
+    "kdePackages",
+    "gnome",
+    "xfce",
+    "mate",
+    "cinnamon",
+    "lxqt",
+    "pantheon",
+    "qt6Packages",
+    "qt5",
+    "gst_all_1",
+    "xorg",
+    "llvmPackages",
+    "cudaPackages",
+    "rocmPackages",
+    "beamPackages",
+    "haskellPackages",
+    "rPackages",
+    "emacsPackages",
+    "perlPackages",
+    "python3Packages",
+    "rustPackages",
+    "kernelPackages",
+)
 
 
-PACKAGE_SET_APPLY = r"""
-packageSet:
+def package_set_cache_directory() -> Path:
+    configured = environment("NIXOS_UPDATE_CHECKER_CACHE")
+    if configured:
+        root = Path(configured).expanduser()
+    else:
+        cache_home = environment("XDG_CACHE_HOME")
+        root = (
+            Path(cache_home).expanduser()
+            if cache_home
+            else Path.home() / ".cache"
+        ) / "nixos-update-checker"
+    return root / "package-sets"
+
+
+def package_set_cache_path(configuration_identity: str) -> Path:
+    key = hashlib.sha256(configuration_identity.encode()).hexdigest()
+    return package_set_cache_directory() / f"{key}.json.gz"
+
+
+def read_package_set_cache(
+    configuration_identity: str, package_sets: tuple[str, ...]
+) -> list[JsonObject] | None:
+    path = package_set_cache_path(configuration_identity)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schemaVersion") != PACKAGE_SET_CACHE_SCHEMA
+        or value.get("configurationIdentity") != configuration_identity
+        or value.get("packageSets") != list(package_sets)
+        or not isinstance(value.get("packages"), list)
+    ):
+        return None
+    return [package for package in value["packages"] if isinstance(package, dict)]
+
+
+def write_package_set_cache(
+    configuration_identity: str,
+    package_sets: tuple[str, ...],
+    packages: list[JsonObject],
+    *,
+    debug: bool,
+) -> None:
+    directory = package_set_cache_directory()
+    path = package_set_cache_path(configuration_identity)
+    temporary_path: Path | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        with gzip.open(temporary_path, "wt", encoding="utf-8", compresslevel=6) as stream:
+            json.dump(
+                {
+                    "schemaVersion": PACKAGE_SET_CACHE_SCHEMA,
+                    "configurationIdentity": configuration_identity,
+                    "packageSets": list(package_sets),
+                    "packages": packages,
+                },
+                stream,
+                separators=(",", ":"),
+            )
+        os.replace(temporary_path, path)
+        cached = sorted(
+            directory.glob("*.json.gz"),
+            key=lambda candidate: candidate.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in cached[PACKAGE_SET_CACHE_LIMIT:]:
+            stale.unlink(missing_ok=True)
+    except OSError as error:
+        if debug:
+            print(f"Could not save package-set cache {path}: {error}", file=sys.stderr)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def package_set_candidate_names(changes: list[JsonObject]) -> set[str]:
+    names = {str(change.get("name") or "") for change in changes}
+    aliases = {name for name in names if name}
+    prefix = re.compile(
+        r"^(?:python\d+(?:\.\d+)?|perl\d+(?:\.\d+)*|ruby\d+(?:\.\d+)*|"
+        r"lua\d+(?:[._]\d+)*|ghc\d+(?:\.\d+)*|emacs|r)-(.+)$",
+        re.IGNORECASE,
+    )
+    for name in names:
+        match = prefix.match(name)
+        if match:
+            aliases.add(match.group(1))
+        aliases.add(name.replace("-", "_"))
+        aliases.add(name.replace("_", "-"))
+    return {name for name in aliases if name}
+
+
+def package_set_apply(package_sets: tuple[str, ...], names: set[str] | None) -> str:
+    sets = "\n".join(
+        (
+            f"    {{ name = {nix_quote(package_set)}; value = "
+            "configuration.config.boot.kernelPackages; }"
+            if package_set == "kernelPackages"
+            else (
+                f"    {{ name = {nix_quote(package_set)}; value = "
+                f"if builtins.hasAttr {nix_quote(package_set)} configuration.pkgs "
+                f"then builtins.getAttr {nix_quote(package_set)} configuration.pkgs "
+                "else { }; }"
+            )
+        )
+        for package_set in package_sets
+    )
+    if names is None:
+        attributes = "builtins.attrNames packageSet.value"
+    else:
+        quoted_names = " ".join(nix_quote(name) for name in sorted(names))
+        attributes = (
+            "builtins.filter (attribute: builtins.hasAttr attribute packageSet.value) "
+            f"[ {quoted_names} ]"
+        )
+    return f"""
+configuration:
 let
-  package = attribute:
+  packageSets = [
+{sets}
+  ];
+  package = packageSet: attribute:
     let
-      value = builtins.getAttr attribute packageSet;
+      value = builtins.getAttr attribute packageSet.value;
       outputNames =
         if builtins.isAttrs value && value ? outputs && builtins.isList value.outputs
         then value.outputs
         else [ ];
-      paths = map (output: (builtins.getAttr output value).outPath) outputNames;
+      outputPath = output:
+        if output == "out" && value ? outPath && !(value ? out) then
+          value.outPath
+        else if builtins.hasAttr output value && (builtins.getAttr output value) ? outPath then
+          (builtins.getAttr output value).outPath
+        else
+          null;
+      paths = builtins.filter (path: path != null) (map outputPath outputNames);
       description =
         if builtins.isAttrs value && builtins.isString (value.meta.description or null)
         then value.meta.description
@@ -421,11 +577,47 @@ let
         if builtins.isAttrs value && builtins.isString (value.meta.position or null)
         then value.meta.position
         else null;
-      record = { inherit attribute paths description position; };
+      record = {{ inherit attribute paths description position; packageSet = packageSet.name; }};
       evaluated = builtins.tryEval (builtins.deepSeq record record);
-    in if evaluated.success then [ (evaluated.value) ] else [ ];
-in builtins.concatMap package (builtins.attrNames packageSet)
+    in
+      if evaluated.success && evaluated.value.paths != [ ]
+      then [ (evaluated.value) ]
+      else [ ];
+  packagesFromSet = packageSet:
+    builtins.concatMap (package packageSet) ({attributes});
+in builtins.concatMap packagesFromSet packageSets
 """
+
+
+def evaluate_package_sets(
+    configuration: str,
+    candidate_lock: Path,
+    package_sets: tuple[str, ...],
+    names: set[str] | None,
+    *,
+    debug: bool,
+) -> list[JsonObject] | None:
+    result = run_command(
+        nix_executable(),
+        [
+            "eval",
+            "--quiet",
+            "--reference-lock-file",
+            str(candidate_lock),
+            "--json",
+            "--apply",
+            package_set_apply(package_sets, names),
+            configuration,
+        ],
+    )
+    if not result.succeeded:
+        if debug:
+            print(f"Could not inspect package sets:\n{result.stderr}", file=sys.stderr)
+        return None
+    values = parse_json(result.stdout, "Invalid package-set evaluation result")
+    if not isinstance(values, list):
+        return None
+    return [value for value in values if isinstance(value, dict)]
 
 
 def annotate_package_sets(
@@ -434,6 +626,8 @@ def annotate_package_sets(
     candidate_lock: Path,
     package_sets: tuple[str, ...],
     source_channels: dict[str, str],
+    configuration_identity: str,
+    full: bool,
     *,
     debug: bool,
 ) -> None:
@@ -451,54 +645,48 @@ def annotate_package_sets(
     if not changes_by_path:
         return
     ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
-
-    for package_set in package_sets:
-        result = run_command(
-            nix_executable(),
-            [
-                "eval",
-                "--reference-lock-file",
-                str(candidate_lock),
-                "--json",
-                "--apply",
-                PACKAGE_SET_APPLY,
-                f"{configuration}.pkgs.{package_set}",
-            ],
+    values = (
+        read_package_set_cache(configuration_identity, package_sets)
+        if configuration_identity
+        else None
+    )
+    if values is None:
+        values = evaluate_package_sets(
+            configuration,
+            candidate_lock,
+            package_sets,
+            None if full else package_set_candidate_names(changes),
+            debug=debug,
         )
-        if not result.succeeded:
-            if debug:
-                print(
-                    f"Could not inspect package set {package_set}:\n{result.stderr}",
-                    file=sys.stderr,
-                )
-            continue
-        values = parse_json(result.stdout, f"Invalid package-set result for {package_set}")
-        if not isinstance(values, list):
-            continue
-        for value in values:
-            if not isinstance(value, dict):
-                continue
-            matching_changes = {
-                id(change): change
-                for path in value.get("paths", [])
-                for change in changes_by_path.get(str(path), [])
-            }
-            for change in matching_changes.values():
-                change["packageSet"] = package_set
-                description = value.get("description")
-                if description and not change.get("description"):
-                    change["description"] = description
-                position = str(value.get("position") or "")
-                channel = next(
-                    (
-                        label
-                        for source, label in ordered_sources
-                        if position.startswith(f"{source}/")
-                    ),
-                    "",
-                )
-                if channel and not change.get("channel"):
-                    change["channel"] = channel
+        if values is None:
+            return
+        if full and configuration_identity:
+            write_package_set_cache(
+                configuration_identity, package_sets, values, debug=debug
+            )
+    for value in values:
+        matching_changes = {
+            id(change): change
+            for path in value.get("paths", [])
+            for change in changes_by_path.get(str(path), [])
+        }
+        for change in matching_changes.values():
+            if not change.get("packageSet"):
+                change["packageSet"] = str(value.get("packageSet") or "")
+            description = value.get("description")
+            if description and not change.get("description"):
+                change["description"] = description
+            position = str(value.get("position") or "")
+            channel = next(
+                (
+                    label
+                    for source, label in ordered_sources
+                    if position.startswith(f"{source}/")
+                ),
+                "",
+            )
+            if channel and not change.get("channel"):
+                change["channel"] = channel
 
 
 PACKAGE_APPLY = r"""
@@ -730,19 +918,21 @@ def run_check(options: CheckOptions) -> JsonObject:
                     configuration_platform(configuration, candidate_lock),
                     debug=options.debug,
                 )
-            annotate_package_sets(
-                closure_changes,
-                configuration,
-                candidate_lock,
-                TARGET_PACKAGE_SETS,
-                candidate_source_channels,
-                debug=options.debug,
-            )
             candidate_manifest = evaluate_manifest(
                 configuration,
                 candidate_lock,
                 candidate=True,
                 include_priority_options=True,
+            )
+            annotate_package_sets(
+                closure_changes,
+                configuration,
+                candidate_lock,
+                PACKAGE_SET_SPECS,
+                candidate_source_channels,
+                str(candidate_manifest.get("toplevelDeriver") or candidate_system),
+                full=True,
+                debug=options.debug,
             )
             candidate_selected = evaluate_selected_packages(
                 configuration,
@@ -840,8 +1030,10 @@ def run_check(options: CheckOptions) -> JsonObject:
                 package_changes,
                 configuration,
                 candidate_lock,
-                TARGET_PACKAGE_SETS,
+                PACKAGE_SET_SPECS,
                 candidate_source_channels,
+                str(candidate_manifest.get("toplevelDeriver") or ""),
+                full=False,
                 debug=options.debug,
             )
             package_source = "evaluatedManifestAgainstRunningClosure"

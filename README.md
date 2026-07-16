@@ -23,11 +23,21 @@ from evaluated package source metadata and exact candidate output matches
 against direct packages in each locked nixpkgs input. Packages whose origin
 cannot be recovered safely are labeled `unknown`. Recognizable Python, Perl,
 Ruby, Lua, GHC, and Emacs package-set updates are inferred from their output
-names. KDE membership is obtained with one targeted, non-recursive evaluation
-of the selected configuration's `pkgs.kdePackages`. Updates are collapsed by
-package set and channel; every underlying update still contributes to the
-summary count and is listed in the Information pane. Store-path-only changes
-are collapsed into one final rebuild row in the same way.
+names and confirmed package-set membership uses exact candidate output paths.
+Updates are collapsed by package set and channel; every underlying update still
+contributes to the summary count and is listed in the Information pane.
+Store-path-only changes are collapsed into one final rebuild row in the same
+way.
+
+Fast checks batch only package names already present in the closure comparison
+across a curated set of desktop, framework, language, accelerator, and active
+kernel package sets. Full build checks enumerate those sets completely and save
+a compressed output-path membership map keyed by the candidate system
+derivation. A matching later check reuses that map; overlays, lock changes, and
+saved configuration changes naturally select a different key. Only the three
+newest maps are retained. A successful system rebuild is followed by a full
+check that warms this cache while the rebuilt system is already available in
+the Nix store.
 
 ## Nix flake outputs
 

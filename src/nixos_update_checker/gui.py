@@ -975,6 +975,9 @@ class UpdateCheckerWindow(QMainWindow):
     def start_manual_check(self) -> None:
         self.start_check(True, True)
 
+    def start_post_rebuild_check(self) -> None:
+        self.start_check(False, True)
+
     def confirm_rebuild(self) -> None:
         self.show_and_raise()
         if self.process is not None or not self.validate_target():
@@ -1168,7 +1171,7 @@ class UpdateCheckerWindow(QMainWindow):
         else:
             label = "System rebuild complete"
         self.set_busy(False, label)
-        QTimer.singleShot(0, self.start_automatic_check)
+        QTimer.singleShot(0, self.start_post_rebuild_check)
 
     def cleanup_pending_settings(self) -> None:
         if self.pending_settings_temp is not None:
