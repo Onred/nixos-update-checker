@@ -14,6 +14,14 @@ or apply the result.
 administrator authorization and runs `nixos-rebuild switch` for the
 configuration discovered as belonging to the current machine.
 
+The update table places flake inputs first, then sorts packages by their locked
+nixpkgs channel (for example `26.05` or `unstable`). Package provenance comes
+from evaluated package source metadata and exact candidate output matches
+against top-level packages in each locked nixpkgs input. Packages whose origin
+cannot be recovered safely are labeled `unknown`. Store-path-only changes are
+collapsed into one final rebuild row; selecting it lists every underlying
+package in the Information pane.
+
 ## Nix flake outputs
 
 - `packages.<system>.default`: Qt GUI plus the checker and service commands

@@ -92,14 +92,40 @@ def package_version(value: Any) -> str:
     return str(value.get("version") or "unknown")
 
 
-class PackageNameDelegate(QStyledItemDelegate):
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+class UpdateItemDelegate(QStyledItemDelegate):
+    def item_option(self, option: QStyleOptionViewItem, index: Any) -> QStyleOptionViewItem:
         item_option = QStyleOptionViewItem(option)
+        table = option.widget
+        if isinstance(table, UpdateTableWidget) and index.row() == table.hovered_row:
+            item_option.state |= QStyle.StateFlag.State_MouseOver
+        return item_option
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        item_option = self.item_option(option, index)
+        super().paint(painter, item_option, index)
+        self.paint_hover_overlay(painter, item_option, index)
+
+    def paint_hover_overlay(
+        self, painter: QPainter, option: QStyleOptionViewItem, index: Any
+    ) -> None:
+        table = option.widget
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if not isinstance(table, UpdateTableWidget) or index.row() != table.hovered_row or selected:
+            return
+        color = option.palette.highlight().color()
+        color.setAlpha(30)
+        painter.fillRect(option.rect, color)
+
+
+class PackageNameDelegate(UpdateItemDelegate):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
+        item_option = self.item_option(option, index)
         self.initStyleOption(item_option, index)
         name, _, description = item_option.text.partition("\n")
         item_option.text = ""
         style = item_option.widget.style() if item_option.widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, item_option, painter)
+        self.paint_hover_overlay(painter, item_option, index)
 
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         primary = (
@@ -137,6 +163,27 @@ class PackageNameDelegate(QStyledItemDelegate):
     def sizeHint(self, option: QStyleOptionViewItem, index: Any) -> QSize:
         size = super().sizeHint(option, index)
         return QSize(size.width(), max(56, size.height()))
+
+
+class UpdateTableWidget(QTableWidget):
+    def __init__(self) -> None:
+        super().__init__(0, 3)
+        self.hovered_row = -1
+        self.setMouseTracking(True)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        self.set_hovered_row(self.rowAt(event.position().toPoint().y()))
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: Any) -> None:
+        self.set_hovered_row(-1)
+        super().leaveEvent(event)
+
+    def set_hovered_row(self, row: int) -> None:
+        if row == self.hovered_row:
+            return
+        self.hovered_row = row
+        self.viewport().update()
 
 
 class UpdateCheckerWindow(QMainWindow):
@@ -241,7 +288,7 @@ class UpdateCheckerWindow(QMainWindow):
         command_layout.addWidget(self.rebuild_button)
         root.addWidget(command_bar)
 
-        self.update_table = QTableWidget(0, 3)
+        self.update_table = UpdateTableWidget()
         self.update_table.setObjectName("updateTable")
         self.update_table.setHorizontalHeaderLabels(["Type", "Package", "New version"])
         self.update_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -255,12 +302,13 @@ class UpdateCheckerWindow(QMainWindow):
         header = self.update_table.horizontalHeader()
         header.setHighlightSections(False)
         header.setSectionsMovable(False)
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.update_table.setColumnWidth(0, 105)
-        self.update_table.setColumnWidth(2, 150)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(70)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.update_table.setColumnWidth(0, 130)
+        self.update_table.setColumnWidth(1, 720)
+        self.update_table.setColumnWidth(2, 170)
+        self.update_table.setItemDelegate(UpdateItemDelegate(self.update_table))
         self.update_table.setItemDelegateForColumn(1, PackageNameDelegate(self.update_table))
         self.update_table.itemSelectionChanged.connect(self.update_selection_information)
 
@@ -301,16 +349,23 @@ class UpdateCheckerWindow(QMainWindow):
             "QTableWidget#updateTable { border: 1px solid palette(mid); "
             "selection-background-color: palette(highlight); "
             "selection-color: palette(highlighted-text); } "
-            "QTableWidget#updateTable::item { padding: 8px 12px; "
-            "border-bottom: 1px solid palette(alternate-base); } "
+            "QTableWidget#updateTable::item { padding: 8px 12px; border: none; } "
             "QProgressBar { border: none; background: palette(alternate-base); } "
             "QProgressBar::chunk { background: #3daee9; }"
         )
 
     def _summary_value(self, label: str) -> QLabel:
-        value = QLabel(f"0\n{label}")
+        value = QLabel()
         value.setObjectName("summaryLabel")
+        self.set_summary_value(value, "0", label)
         return value
+
+    def set_summary_value(self, widget: QLabel, value: str, label: str) -> None:
+        widget.setProperty("summaryValue", value)
+        widget.setText(
+            f'<span style="font-size: 21px; font-weight: 700">{value}</span><br>'
+            f'<span style="font-size: 11px">{label}</span>'
+        )
 
     def _build_information_panel(self) -> QWidget:
         panel = QWidget()
@@ -334,6 +389,10 @@ class UpdateCheckerWindow(QMainWindow):
         layout.addWidget(self.information_title)
         layout.addWidget(self.information_description)
         layout.addLayout(details)
+        self.information_list = QPlainTextEdit()
+        self.information_list.setReadOnly(True)
+        self.information_list.setVisible(False)
+        layout.addWidget(self.information_list, 1)
         layout.addStretch()
         return panel
 
@@ -416,9 +475,9 @@ class UpdateCheckerWindow(QMainWindow):
         self.report_mtime_ns = 0
         self.last_report = {}
         self.update_table.setRowCount(0)
-        self.package_count.setText("0\nPackage updates")
-        self.flake_count.setText("0\nFlake updates")
-        self.rebuild_state.setText("Unknown\nRebuild")
+        self.set_summary_value(self.package_count, "0", "Package updates")
+        self.set_summary_value(self.flake_count, "0", "Flake updates")
+        self.set_summary_value(self.rebuild_state, "Unknown", "Rebuild")
         self.clear_selection_information()
         self.status_message.setText("Configuration source changed; refresh to check it")
 
@@ -911,14 +970,20 @@ class UpdateCheckerWindow(QMainWindow):
         reported_dependencies = packages_object.get("dependencyChanges", [])
         dependencies = [change for change in reported_dependencies if change.get("kind") != "store"]
         package_updates = [*packages, *dependencies]
+        store_only = [
+            change
+            for change in [*reported_packages, *reported_dependencies]
+            if change.get("kind") == "store"
+        ]
+        store_only.extend(packages_object.get("storeOnlyChanges", []))
         system = report.get("system", {})
         build = report.get("build", {})
         updates = bool(report.get("updatesAvailable"))
         rebuild = system.get("configurationState") == "differs"
-        self.package_count.setText(f"{len(package_updates)}\nPackage updates")
-        self.flake_count.setText(f"{len(inputs)}\nFlake updates")
-        self.rebuild_state.setText(f"{'Yes' if rebuild else 'No'}\nRebuild")
-        self.populate_updates(package_updates, inputs)
+        self.set_summary_value(self.package_count, str(len(package_updates)), "Package updates")
+        self.set_summary_value(self.flake_count, str(len(inputs)), "Flake updates")
+        self.set_summary_value(self.rebuild_state, "Yes" if rebuild else "No", "Rebuild")
+        self.populate_updates(package_updates, inputs, store_only)
         if updates:
             source_label = "full build" if build.get("performed") else "fast evaluation"
             notification_text = (
@@ -957,7 +1022,12 @@ class UpdateCheckerWindow(QMainWindow):
                     9000,
                 )
 
-    def populate_updates(self, packages: list[JsonObject], inputs: list[JsonObject]) -> None:
+    def populate_updates(
+        self,
+        packages: list[JsonObject],
+        inputs: list[JsonObject],
+        store_changes: list[JsonObject],
+    ) -> None:
         rows: list[JsonObject] = []
         for change in packages:
             after = change.get("after")
@@ -969,13 +1039,20 @@ class UpdateCheckerWindow(QMainWindow):
                 or ""
             )
             available = "removed" if change.get("kind") == "removed" else package_version(after)
+            channel = str(
+                change.get("channel")
+                or (after or {}).get("channel")
+                or (before or {}).get("channel")
+                or "unknown"
+            )
             rows.append(
                 {
-                    "type": "nixPkg",
+                    "type": f"nixPkg · {channel}",
                     "name": str(change.get("name", "")),
                     "description": description,
                     "current": package_version(before),
                     "available": available,
+                    "sortGroup": 1,
                 }
             )
         for change in inputs:
@@ -987,8 +1064,32 @@ class UpdateCheckerWindow(QMainWindow):
                     "description": "Flake input",
                     "current": input_revision(change.get("before")),
                     "available": "removed" if after == "missing" else after,
+                    "sortGroup": 0,
                 }
             )
+        if store_changes:
+            rows.append(
+                {
+                    "type": "rebuild",
+                    "name": "Rebuild-only package changes",
+                    "description": (
+                        f"{len(store_changes)} packages changed store paths without "
+                        "changing versions"
+                    ),
+                    "current": f"{len(store_changes)} current store paths",
+                    "available": f"{len(store_changes)} packages",
+                    "storeChanges": store_changes,
+                    "sortGroup": 2,
+                }
+            )
+        rows.sort(
+            key=lambda update: (
+                int(update["sortGroup"]),
+                str(update["type"]).casefold(),
+                str(update["name"]).casefold(),
+            )
+        )
+        self.update_table.set_hovered_row(-1)
         self.update_table.clearSelection()
         self.update_table.setRowCount(len(rows))
         for row, update in enumerate(rows):
@@ -1012,6 +1113,8 @@ class UpdateCheckerWindow(QMainWindow):
         self.information_type.setText("Type: —")
         self.information_current.setText("Current: —")
         self.information_available.setText("Available: —")
+        self.information_list.clear()
+        self.information_list.setVisible(False)
 
     def update_selection_information(self) -> None:
         rows = self.update_table.selectionModel().selectedRows()
@@ -1030,6 +1133,20 @@ class UpdateCheckerWindow(QMainWindow):
         self.information_type.setText(f"Type: {update.get('type', '—')}")
         self.information_current.setText(f"Current: {update.get('current', '—')}")
         self.information_available.setText(f"Available: {update.get('available', '—')}")
+        store_changes = update.get("storeChanges", [])
+        if isinstance(store_changes, list) and store_changes:
+            lines = []
+            for change in store_changes:
+                if not isinstance(change, dict):
+                    continue
+                current = package_version(change.get("before"))
+                available = package_version(change.get("after"))
+                lines.append(f"{change.get('name', 'unknown')}: {current} → {available}")
+            self.information_list.setPlainText("\n".join(lines))
+            self.information_list.setVisible(True)
+        else:
+            self.information_list.clear()
+            self.information_list.setVisible(False)
 
     def populate_system(self, report: JsonObject) -> None:
         if not self.system_values:
@@ -1208,19 +1325,32 @@ class UpdateCheckerWindow(QMainWindow):
             "updatesAvailable": True,
         }
         self.apply_report(report, "self-test", False)
-        self.update_table.selectRow(0)
+        self.update_table.selectRow(1)
+        selected_current = self.information_current.text()
+        self.update_table.selectRow(3)
+        store_information_rendered = (
+            not self.information_list.isHidden()
+            and "rebuilt-example" in self.information_list.toPlainText()
+        )
         self.show_system_state()
         system_state_rendered = self.system_values["runningGeneration"].text() == "system-1-link"
         if self.system_window is not None:
             self.system_window.close()
         if (
-            self.update_table.rowCount() != 3
+            self.update_table.rowCount() != 4
             or self.update_table.columnCount() != 3
-            or self.package_count.text() != "2\nPackage updates"
-            or self.flake_count.text() != "1\nFlake updates"
-            or self.rebuild_state.text() != "No\nRebuild"
-            or self.information_current.text() != "Current: 1.0"
+            or self.update_table.item(0, 0).text() != "flake"
+            or self.update_table.item(3, 0).text() != "rebuild"
+            or self.package_count.property("summaryValue") != "2"
+            or self.flake_count.property("summaryValue") != "1"
+            or self.rebuild_state.property("summaryValue") != "No"
+            or selected_current != "Current: 1.0"
+            or not store_information_rendered
             or self.update_table.selectionBehavior() != QTableWidget.SelectionBehavior.SelectRows
+            or self.update_table.horizontalHeader().sectionResizeMode(0)
+            != QHeaderView.ResizeMode.Interactive
+            or not isinstance(self.update_table.itemDelegate(), UpdateItemDelegate)
+            or not isinstance(self.update_table.itemDelegateForColumn(1), PackageNameDelegate)
             or not system_state_rendered
         ):
             raise RuntimeError("GUI report rendering self-test failed")

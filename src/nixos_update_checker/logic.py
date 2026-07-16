@@ -237,6 +237,7 @@ def package_details(package: JsonObject) -> JsonObject:
         "pname": package.get("pname"),
         "version": package_version_identity(package),
         "description": package.get("description"),
+        "channel": package.get("channel"),
         "path": path,
         "storeHash": match.group(1)[:8] if match else "unknown",
     }
@@ -370,6 +371,9 @@ def enrich_package_changes(
         description = str((selected_package or {}).get("description") or "")
         if description:
             change["description"] = description
+        channel = str((selected_package or {}).get("channel") or "")
+        if channel:
+            change["channel"] = channel
     return changes
 
 

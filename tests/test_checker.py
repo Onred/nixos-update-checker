@@ -37,6 +37,79 @@ def test_discovery_selects_output_name_that_differs_from_hostname(
     assert checker.discover_configuration("path:/config", "nixos") == "workstation"
 
 
+def test_flake_input_sources_are_labeled_by_nixpkgs_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    archive = {
+        "inputs": {
+            "stable": {"path": "/nix/store/stable-source"},
+            "unstable": {"path": "/nix/store/unstable-source"},
+        }
+    }
+    monkeypatch.setattr(
+        checker,
+        "run_command",
+        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(archive), ""),
+    )
+    lock = {
+        "root": "root",
+        "nodes": {
+            "root": {"inputs": {"stable": "stable-node", "unstable": "unstable-node"}},
+            "stable-node": {"original": {"ref": "nixos-26.05"}},
+            "unstable-node": {"original": {"ref": "nixos-unstable"}},
+        },
+    }
+    sources = checker.flake_input_source_channels("path:/config", tmp_path / "lock", lock)
+    assert sources == {
+        "/nix/store/stable-source": "26.05",
+        "/nix/store/unstable-source": "unstable",
+    }
+
+    packages = [
+        {"position": "/nix/store/stable-source/pkgs/example.nix:1"},
+        {"position": "/nix/store/unstable-source/pkgs/example.nix:1"},
+        {"position": "/nix/store/other-source/package.nix:1"},
+    ]
+    checker.annotate_package_channels(packages, sources)
+    assert [package.get("channel") for package in packages] == [
+        "26.05",
+        "unstable",
+        None,
+    ]
+
+
+def test_closure_package_channel_requires_exact_output_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = [
+        {"name": "hello", "path": "/nix/store/aaaaaaaa-hello-2.12"},
+        {"name": "other", "path": "/nix/store/unrelated-other-1.0"},
+    ]
+    monkeypatch.setattr(
+        checker,
+        "run_command",
+        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(values), ""),
+    )
+    changes = [
+        {
+            "name": "hello",
+            "after": {
+                "path": "/nix/store/aaaaaaaa-hello-2.12",
+                "paths": ["/nix/store/aaaaaaaa-hello-2.12"],
+            },
+        },
+        {"name": "other", "after": {"path": "/nix/store/bbbbbbbb-other-1.0"}},
+    ]
+    checker.annotate_closure_change_channels(
+        changes,
+        {"/nix/store/nixpkgs-source": "unstable"},
+        "x86_64-linux",
+        debug=False,
+    )
+    assert changes[0]["channel"] == "unstable"
+    assert "channel" not in changes[1]
+
+
 def test_service_report_is_atomically_replaced(tmp_path: Path) -> None:
     path = tmp_path / "state" / "report.json"
     checker.write_report(path, {"schemaVersion": 1, "status": "success"})

@@ -235,6 +235,170 @@ def read_repository_settings(repository: Path) -> RepositorySettings:
         raise CheckerError(f"Invalid settings file: {path}", str(error)) from error
 
 
+def input_channel_label(input_name: str, node: JsonObject) -> str:
+    original = node.get("original", {})
+    reference = str(original.get("ref") or "")
+    if reference.startswith("nixos-"):
+        return reference.removeprefix("nixos-")
+    if reference.startswith("nixpkgs-"):
+        return reference.removeprefix("nixpkgs-")
+    return reference or input_name
+
+
+def flake_input_source_channels(
+    flake_reference: str, lock_path: Path, lock: JsonObject
+) -> dict[str, str]:
+    result = run_command(
+        nix_executable(),
+        [
+            "flake",
+            "archive",
+            "--json",
+            "--dry-run",
+            "--reference-lock-file",
+            str(lock_path),
+            flake_reference,
+        ],
+    )
+    require_success(result, "Could not inspect flake input source paths.")
+    archive = parse_json(result.stdout, "Invalid flake archive metadata.")
+    if not isinstance(archive, dict):
+        return {}
+    nodes = lock.get("nodes", {})
+    root_name = lock.get("root")
+    root = nodes.get(root_name, {}) if isinstance(nodes, dict) else {}
+    root_inputs = root.get("inputs", {}) if isinstance(root, dict) else {}
+    archive_inputs = archive.get("inputs", {})
+    if not isinstance(root_inputs, dict) or not isinstance(archive_inputs, dict):
+        return {}
+    sources: dict[str, str] = {}
+    for input_name, archived_input in archive_inputs.items():
+        node_name = root_inputs.get(input_name)
+        node = nodes.get(node_name, {}) if isinstance(node_name, str) else {}
+        original = node.get("original", {}) if isinstance(node, dict) else {}
+        locked = node.get("locked", {}) if isinstance(node, dict) else {}
+        repository_name = str(original.get("repo") or locked.get("repo") or "")
+        reference = str(original.get("ref") or "")
+        is_nixpkgs = (
+            repository_name == "nixpkgs"
+            or reference.startswith("nixos-")
+            or "nixpkgs" in str(input_name).lower()
+        )
+        if not is_nixpkgs:
+            continue
+        source_path = (
+            str(archived_input.get("path") or "") if isinstance(archived_input, dict) else ""
+        )
+        if source_path:
+            sources[source_path] = input_channel_label(str(input_name), node)
+    return sources
+
+
+def annotate_package_channels(packages: list[JsonObject], source_channels: dict[str, str]) -> None:
+    ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
+    for package in packages:
+        position = str(package.get("position") or "")
+        channel = next(
+            (label for source, label in ordered_sources if position.startswith(f"{source}/")),
+            "",
+        )
+        if channel:
+            package["channel"] = channel
+
+
+def annotate_manifest_channels(manifest: JsonObject, source_channels: dict[str, str]) -> None:
+    for key in (
+        "activeOptionPackages",
+        "priorityOptionPackages",
+        "systemPackages",
+        "corePackages",
+    ):
+        values = manifest.get(key, [])
+        if isinstance(values, list):
+            annotate_package_channels(values, source_channels)
+    users = manifest.get("userPackages", {})
+    if isinstance(users, dict):
+        for values in users.values():
+            if isinstance(values, list):
+                annotate_package_channels(values, source_channels)
+
+
+def configuration_platform(configuration: str, candidate_lock: Path) -> str:
+    result = run_command(
+        nix_executable(),
+        [
+            "eval",
+            "--raw",
+            "--reference-lock-file",
+            str(candidate_lock),
+            f"{configuration}.pkgs.stdenv.hostPlatform.system",
+        ],
+    )
+    require_success(result, "Could not determine the candidate NixOS platform.")
+    return result.stdout.strip()
+
+
+def annotate_closure_change_channels(
+    changes: list[JsonObject],
+    source_channels: dict[str, str],
+    system: str,
+    *,
+    debug: bool,
+) -> None:
+    unresolved_names = sorted(
+        {
+            str(change.get("name", ""))
+            for change in changes
+            if change.get("after") and not change.get("channel") and change.get("name")
+        }
+    )
+    if not unresolved_names:
+        return
+    names = " ".join(nix_quote(name) for name in unresolved_names)
+    apply = f"""
+pkgs:
+let
+  names = [ {names} ];
+  packagePath = name:
+    let result = builtins.tryEval (
+      if builtins.hasAttr name pkgs && builtins.isAttrs pkgs.${{name}}
+      then pkgs.${{name}}.outPath or null
+      else null
+    );
+    in {{ inherit name; path = if result.success then result.value else null; }};
+in builtins.filter (item: item.path != null) (map packagePath names)
+"""
+    change_paths: dict[str, list[JsonObject]] = {}
+    for change in changes:
+        after = change.get("after")
+        if not isinstance(after, dict):
+            continue
+        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
+        for path in paths:
+            if path:
+                change_paths.setdefault(path, []).append(change)
+    for source, channel in source_channels.items():
+        result = run_command(
+            nix_executable(),
+            ["eval", "--json", "--apply", apply, f"path:{source}#legacyPackages.{system}"],
+        )
+        if not result.succeeded:
+            if debug:
+                print(
+                    f"Could not resolve package provenance from {channel}:\n{result.stderr}",
+                    file=sys.stderr,
+                )
+            continue
+        values = parse_json(result.stdout, f"Invalid package provenance result for {channel}")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for change in change_paths.get(str(value.get("path") or ""), []):
+                change["channel"] = channel
+
+
 PACKAGE_APPLY = r"""
 value:
 let
@@ -245,6 +409,11 @@ let
     description =
       if builtins.isString (packageValue.meta.description or null) then
         packageValue.meta.description
+      else
+        null;
+    position =
+      if builtins.isString (packageValue.meta.position or null) then
+        packageValue.meta.position
       else
         null;
     path = packageValue.outPath;
@@ -408,6 +577,16 @@ def run_check(options: CheckOptions) -> JsonObject:
         current_lock = read_json_object(lock_path, "Invalid current flake.lock.")
         candidate_lock_value = read_json_object(candidate_lock, "Invalid candidate flake.lock.")
         input_changes = compare_inputs(current_lock, candidate_lock_value)
+        candidate_source_channels: dict[str, str] = {}
+        current_source_channels: dict[str, str] = {}
+        if options.inspect_packages or real_build:
+            candidate_source_channels = flake_input_source_channels(
+                flake_reference, candidate_lock, candidate_lock_value
+            )
+            if not real_build:
+                current_source_channels = flake_input_source_channels(
+                    flake_reference, lock_path, current_lock
+                )
 
         package_changes: list[JsonObject] = []
         dependency_changes: list[JsonObject] = []
@@ -442,6 +621,13 @@ def run_check(options: CheckOptions) -> JsonObject:
             baseline_closure = query_closure(baseline_system)
             candidate_closure = query_closure(candidate_system)
             closure_changes = compare_closures(baseline_closure, candidate_closure)
+            if candidate_source_channels:
+                annotate_closure_change_channels(
+                    closure_changes,
+                    candidate_source_channels,
+                    configuration_platform(configuration, candidate_lock),
+                    debug=options.debug,
+                )
             candidate_manifest = evaluate_manifest(
                 configuration,
                 candidate_lock,
@@ -455,6 +641,8 @@ def run_check(options: CheckOptions) -> JsonObject:
                 candidate=True,
                 debug=options.debug,
             )
+            annotate_manifest_channels(candidate_manifest, candidate_source_channels)
+            annotate_package_channels(candidate_selected.packages, candidate_source_channels)
             resolved_options = candidate_selected.resolved_options
             direct_packages = collect_packages(candidate_manifest, candidate_selected.packages)
             realized_option_packages = [
@@ -493,6 +681,10 @@ def run_check(options: CheckOptions) -> JsonObject:
                 candidate=True,
                 debug=options.debug,
             )
+            annotate_manifest_channels(current_manifest, current_source_channels)
+            annotate_manifest_channels(candidate_manifest, candidate_source_channels)
+            annotate_package_channels(current_selected.packages, current_source_channels)
+            annotate_package_channels(candidate_selected.packages, candidate_source_channels)
             resolved_options = (
                 current_selected.resolved_options | candidate_selected.resolved_options
             )

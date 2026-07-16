@@ -14,6 +14,11 @@ let
         packageValue.meta.description
       else
         null;
+    position =
+      if builtins.isString (packageValue.meta.position or null) then
+        packageValue.meta.position
+      else
+        null;
     path = packageValue.outPath;
   };
 
