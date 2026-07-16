@@ -32,12 +32,16 @@ way.
 Fast checks batch only package names already present in the closure comparison
 across a curated set of desktop, framework, language, accelerator, and active
 kernel package sets. Full build checks enumerate those sets completely and save
-a compressed output-path membership map keyed by the candidate system
-derivation. A matching later check reuses that map; overlays, lock changes, and
-saved configuration changes naturally select a different key. Only the three
-newest maps are retained. A successful system rebuild is followed by a full
-check that warms this cache while the rebuilt system is already available in
-the Nix store.
+two compressed caches. Exact evaluated output maps are retained by candidate
+system derivation, so a configuration already evaluated is never needlessly
+enumerated again. A durable package-name membership index is shared across lock
+revisions and lets later fast checks evaluate only likely sets. Cached membership
+is treated as a hint: candidate output paths are still matched exactly, while
+previously unseen names and stale positive memberships fall back to a broad
+selective lookup. Full checks refresh the entire index, including packages that
+newly moved from a top-level package into a nested set. A successful system
+rebuild is followed by a full check that refreshes both caches while the rebuilt
+system is already available in the Nix store.
 
 ## Nix flake outputs
 

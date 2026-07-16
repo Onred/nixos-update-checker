@@ -204,6 +204,38 @@ def test_full_package_set_results_are_cached_and_reused(
     assert checker.package_set_cache_path(arguments[-1]).is_file()
 
 
+def test_full_check_warms_cache_when_rebuilt_system_has_no_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    values = [
+        {
+            "packageSet": "kdePackages",
+            "attribute": "dolphin",
+            "paths": ["/nix/store/dolphin"],
+        }
+    ]
+    monkeypatch.setattr(
+        checker,
+        "run_command",
+        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(values), ""),
+    )
+    identity = "/nix/store/rebuilt-system.drv"
+    checker.annotate_package_sets(
+        [],
+        'path:/config#nixosConfigurations."workstation"',
+        tmp_path / "flake.lock",
+        ("kdePackages",),
+        {},
+        identity,
+        True,
+        debug=False,
+    )
+    assert checker.read_package_set_cache(identity, ("kdePackages",)) == values
+    memberships, _checked_names = checker.read_package_set_memberships(("kdePackages",))
+    assert memberships["dolphin"] == ("kdePackages",)
+
+
 def test_selective_package_set_names_include_ecosystem_aliases() -> None:
     aliases = checker.package_set_candidate_names(
         [
@@ -215,11 +247,11 @@ def test_selective_package_set_names_include_ecosystem_aliases() -> None:
     assert {"pyside6", "aeson", "ggplot2"} <= aliases
 
 
-def test_package_set_cache_prunes_old_configuration_generations(
+def test_package_set_cache_keeps_all_evaluated_configuration_generations(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    for index in range(checker.PACKAGE_SET_CACHE_LIMIT + 1):
+    for index in range(5):
         identity = f"/nix/store/system-{index}.drv"
         checker.write_package_set_cache(
             identity,
@@ -227,10 +259,115 @@ def test_package_set_cache_prunes_old_configuration_generations(
             [{"packageSet": "kdePackages", "paths": [f"/nix/store/package-{index}"]}],
             debug=False,
         )
-    assert len(list(checker.package_set_cache_directory().glob("*.json.gz"))) == 3
-    latest_identity = f"/nix/store/system-{checker.PACKAGE_SET_CACHE_LIMIT}.drv"
-    assert checker.read_package_set_cache(latest_identity, ("kdePackages",)) is not None
-    assert checker.read_package_set_cache(latest_identity, ("gnome",)) is None
+    assert len(list(checker.package_set_cache_directory().glob("*.json.gz"))) == 5
+    for index in range(5):
+        identity = f"/nix/store/system-{index}.drv"
+        assert checker.read_package_set_cache(identity, ("kdePackages",)) is not None
+    assert checker.read_package_set_cache(identity, ("gnome",)) is None
+
+
+def test_membership_cache_targets_a_new_lock_without_reenumerating_sets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    old_value = {
+        "packageSet": "kdePackages",
+        "attribute": "dolphin",
+        "paths": ["/nix/store/old-dolphin"],
+    }
+    checker.merge_package_set_memberships(
+        ("kdePackages", "gnome"), [old_value], debug=False
+    )
+    new_value = {**old_value, "paths": ["/nix/store/new-dolphin"]}
+    calls: list[list[str]] = []
+
+    def run_command(
+        _program: str, arguments: list[str], **_kwargs: object
+    ) -> checker.CommandResult:
+        calls.append(arguments)
+        return checker.CommandResult(0, json.dumps([new_value]), "")
+
+    monkeypatch.setattr(checker, "run_command", run_command)
+    changes = [{"name": "dolphin", "after": {"path": "/nix/store/new-dolphin"}}]
+    checker.annotate_package_sets(
+        changes,
+        'path:/config#nixosConfigurations."workstation"',
+        tmp_path / "new-flake.lock",
+        ("kdePackages", "gnome"),
+        {},
+        "/nix/store/new-system.drv",
+        False,
+        debug=False,
+    )
+
+    assert changes[0]["packageSet"] == "kdePackages"
+    assert len(calls) == 1
+    apply = calls[0][calls[0].index("--apply") + 1]
+    assert '"kdePackages" = [ "dolphin" ];' in apply
+    assert '"gnome" = [  ];' in apply
+
+
+def test_membership_cache_skips_known_nonmembers_on_new_locks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    checker.merge_package_set_memberships(
+        ("kdePackages",), [], {"hello"}, debug=False
+    )
+    monkeypatch.setattr(
+        checker,
+        "run_command",
+        lambda *_args, **_kwargs: pytest.fail("known nonmember should not be re-evaluated"),
+    )
+    changes = [{"name": "hello", "after": {"path": "/nix/store/new-hello"}}]
+    checker.annotate_package_sets(
+        changes,
+        'path:/config#nixosConfigurations."workstation"',
+        tmp_path / "new-flake.lock",
+        ("kdePackages",),
+        {},
+        "/nix/store/new-system.drv",
+        False,
+        debug=False,
+    )
+    assert "packageSet" not in changes[0]
+
+
+def test_stale_membership_falls_back_when_a_package_moves_sets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
+    checker.merge_package_set_memberships(
+        ("kdePackages", "qt6Packages"),
+        [{"packageSet": "kdePackages", "attribute": "dolphin"}],
+        debug=False,
+    )
+    moved = {
+        "packageSet": "qt6Packages",
+        "attribute": "dolphin",
+        "paths": ["/nix/store/new-dolphin"],
+    }
+    calls = 0
+
+    def run_command(*_args: object, **_kwargs: object) -> checker.CommandResult:
+        nonlocal calls
+        calls += 1
+        return checker.CommandResult(0, json.dumps([] if calls == 1 else [moved]), "")
+
+    monkeypatch.setattr(checker, "run_command", run_command)
+    changes = [{"name": "dolphin", "after": {"path": "/nix/store/new-dolphin"}}]
+    checker.annotate_package_sets(
+        changes,
+        'path:/config#nixosConfigurations."workstation"',
+        tmp_path / "new-flake.lock",
+        ("kdePackages", "qt6Packages"),
+        {},
+        "/nix/store/new-system.drv",
+        False,
+        debug=False,
+    )
+    assert calls == 2
+    assert changes[0]["packageSet"] == "qt6Packages"
 
 
 def test_service_report_is_atomically_replaced(tmp_path: Path) -> None:

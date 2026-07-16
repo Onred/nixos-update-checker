@@ -400,8 +400,7 @@ in builtins.filter (item: item.path != null) (map packagePath names)
                 change["channel"] = channel
 
 
-PACKAGE_SET_CACHE_SCHEMA = 1
-PACKAGE_SET_CACHE_LIMIT = 3
+PACKAGE_SET_CACHE_SCHEMA = 2
 PACKAGE_SET_SPECS = (
     "kdePackages",
     "gnome",
@@ -445,6 +444,10 @@ def package_set_cache_directory() -> Path:
 def package_set_cache_path(configuration_identity: str) -> Path:
     key = hashlib.sha256(configuration_identity.encode()).hexdigest()
     return package_set_cache_directory() / f"{key}.json.gz"
+
+
+def package_set_membership_cache_path() -> Path:
+    return package_set_cache_directory() / "membership.json.gz"
 
 
 def read_package_set_cache(
@@ -494,16 +497,93 @@ def write_package_set_cache(
                 separators=(",", ":"),
             )
         os.replace(temporary_path, path)
-        cached = sorted(
-            directory.glob("*.json.gz"),
-            key=lambda candidate: candidate.stat().st_mtime_ns,
-            reverse=True,
-        )
-        for stale in cached[PACKAGE_SET_CACHE_LIMIT:]:
-            stale.unlink(missing_ok=True)
     except OSError as error:
         if debug:
             print(f"Could not save package-set cache {path}: {error}", file=sys.stderr)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def read_package_set_memberships(
+    package_sets: tuple[str, ...],
+) -> tuple[dict[str, tuple[str, ...]], set[str]]:
+    try:
+        with gzip.open(package_set_membership_cache_path(), "rt", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return {}, set()
+    if (
+        not isinstance(value, dict)
+        or value.get("schemaVersion") != PACKAGE_SET_CACHE_SCHEMA
+        or value.get("packageSets") != list(package_sets)
+        or not isinstance(value.get("memberships"), dict)
+        or not isinstance(value.get("checkedNames"), list)
+    ):
+        return {}, set()
+    allowed = set(package_sets)
+    memberships: dict[str, tuple[str, ...]] = {}
+    for attribute, sets in value["memberships"].items():
+        if not isinstance(attribute, str) or not isinstance(sets, list):
+            continue
+        valid_sets = tuple(
+            package_set
+            for package_set in package_sets
+            if package_set in sets and package_set in allowed
+        )
+        if valid_sets:
+            memberships[attribute] = valid_sets
+    checked_names = {name for name in value["checkedNames"] if isinstance(name, str)}
+    return memberships, checked_names
+
+
+def merge_package_set_memberships(
+    package_sets: tuple[str, ...],
+    packages: list[JsonObject],
+    checked_names: set[str] | None = None,
+    *,
+    debug: bool,
+) -> None:
+    existing_memberships, existing_checked_names = read_package_set_memberships(package_sets)
+    memberships = {
+        attribute: set(sets)
+        for attribute, sets in existing_memberships.items()
+    }
+    allowed = set(package_sets)
+    for package in packages:
+        attribute = str(package.get("attribute") or "")
+        package_set = str(package.get("packageSet") or "")
+        if attribute and package_set in allowed:
+            memberships.setdefault(attribute, set()).add(package_set)
+            existing_checked_names.add(attribute)
+    existing_checked_names.update(checked_names or set())
+    serialized = {
+        attribute: [package_set for package_set in package_sets if package_set in sets]
+        for attribute, sets in sorted(memberships.items())
+        if sets
+    }
+    directory = package_set_cache_directory()
+    path = package_set_membership_cache_path()
+    temporary_path: Path | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        with gzip.open(temporary_path, "wt", encoding="utf-8", compresslevel=6) as stream:
+            json.dump(
+                {
+                    "schemaVersion": PACKAGE_SET_CACHE_SCHEMA,
+                    "packageSets": list(package_sets),
+                    "memberships": serialized,
+                    "checkedNames": sorted(existing_checked_names),
+                },
+                stream,
+                separators=(",", ":"),
+            )
+        os.replace(temporary_path, path)
+    except OSError as error:
+        if debug:
+            print(f"Could not save package-set memberships {path}: {error}", file=sys.stderr)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 
@@ -525,7 +605,9 @@ def package_set_candidate_names(changes: list[JsonObject]) -> set[str]:
     return {name for name in aliases if name}
 
 
-def package_set_apply(package_sets: tuple[str, ...], names: set[str] | None) -> str:
+def package_set_apply(
+    package_sets: tuple[str, ...], names_by_set: dict[str, set[str]] | None
+) -> str:
     sets = "\n".join(
         (
             f"    {{ name = {nix_quote(package_set)}; value = "
@@ -540,13 +622,20 @@ def package_set_apply(package_sets: tuple[str, ...], names: set[str] | None) -> 
         )
         for package_set in package_sets
     )
-    if names is None:
+    if names_by_set is None:
         attributes = "builtins.attrNames packageSet.value"
     else:
-        quoted_names = " ".join(nix_quote(name) for name in sorted(names))
+        attributes_by_set = "\n".join(
+            f"    {nix_quote(package_set)} = [ "
+            + " ".join(
+                nix_quote(name) for name in sorted(names_by_set.get(package_set, set()))
+            )
+            + " ];"
+            for package_set in package_sets
+        )
         attributes = (
             "builtins.filter (attribute: builtins.hasAttr attribute packageSet.value) "
-            f"[ {quoted_names} ]"
+            "(builtins.getAttr packageSet.name attributesBySet)"
         )
     return f"""
 configuration:
@@ -554,6 +643,9 @@ let
   packageSets = [
 {sets}
   ];
+  attributesBySet = {{
+{attributes_by_set if names_by_set is not None else ''}
+  }};
   package = packageSet: attribute:
     let
       value = builtins.getAttr attribute packageSet.value;
@@ -593,7 +685,7 @@ def evaluate_package_sets(
     configuration: str,
     candidate_lock: Path,
     package_sets: tuple[str, ...],
-    names: set[str] | None,
+    names_by_set: dict[str, set[str]] | None,
     *,
     debug: bool,
 ) -> list[JsonObject] | None:
@@ -606,7 +698,7 @@ def evaluate_package_sets(
             str(candidate_lock),
             "--json",
             "--apply",
-            package_set_apply(package_sets, names),
+            package_set_apply(package_sets, names_by_set),
             configuration,
         ],
     )
@@ -620,50 +712,31 @@ def evaluate_package_sets(
     return [value for value in values if isinstance(value, dict)]
 
 
-def annotate_package_sets(
+def package_set_name_selection(
     changes: list[JsonObject],
-    configuration: str,
-    candidate_lock: Path,
     package_sets: tuple[str, ...],
+    memberships: dict[str, tuple[str, ...]],
+    checked_names: set[str],
+) -> dict[str, set[str]]:
+    names = package_set_candidate_names(changes)
+    selection: dict[str, set[str]] = {package_set: set() for package_set in package_sets}
+    for name in names:
+        matching_sets = memberships.get(name)
+        if matching_sets:
+            for package_set in matching_sets:
+                selection[package_set].add(name)
+        elif name not in checked_names:
+            for package_set in package_sets:
+                selection[package_set].add(name)
+    return selection
+
+
+def apply_package_set_values(
+    changes_by_path: dict[str, list[JsonObject]],
+    values: list[JsonObject],
     source_channels: dict[str, str],
-    configuration_identity: str,
-    full: bool,
-    *,
-    debug: bool,
 ) -> None:
-    if not changes:
-        return
-    changes_by_path: dict[str, list[JsonObject]] = {}
-    for change in changes:
-        after = change.get("after")
-        if not isinstance(after, dict):
-            continue
-        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
-        for path in paths:
-            if path:
-                changes_by_path.setdefault(path, []).append(change)
-    if not changes_by_path:
-        return
     ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
-    values = (
-        read_package_set_cache(configuration_identity, package_sets)
-        if configuration_identity
-        else None
-    )
-    if values is None:
-        values = evaluate_package_sets(
-            configuration,
-            candidate_lock,
-            package_sets,
-            None if full else package_set_candidate_names(changes),
-            debug=debug,
-        )
-        if values is None:
-            return
-        if full and configuration_identity:
-            write_package_set_cache(
-                configuration_identity, package_sets, values, debug=debug
-            )
     for value in values:
         matching_changes = {
             id(change): change
@@ -687,6 +760,83 @@ def annotate_package_sets(
             )
             if channel and not change.get("channel"):
                 change["channel"] = channel
+
+
+def annotate_package_sets(
+    changes: list[JsonObject],
+    configuration: str,
+    candidate_lock: Path,
+    package_sets: tuple[str, ...],
+    source_channels: dict[str, str],
+    configuration_identity: str,
+    full: bool,
+    *,
+    debug: bool,
+) -> None:
+    if not changes and not full:
+        return
+    changes_by_path: dict[str, list[JsonObject]] = {}
+    for change in changes:
+        after = change.get("after")
+        if not isinstance(after, dict):
+            continue
+        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
+        for path in paths:
+            if path:
+                changes_by_path.setdefault(path, []).append(change)
+    if not changes_by_path and not full:
+        return
+    values = (
+        read_package_set_cache(configuration_identity, package_sets)
+        if configuration_identity
+        else None
+    )
+    if values is None:
+        memberships, checked_names = read_package_set_memberships(package_sets)
+        selection = None if full else package_set_name_selection(
+            changes, package_sets, memberships, checked_names
+        )
+        if selection is not None and not any(selection.values()):
+            values = []
+        else:
+            values = evaluate_package_sets(
+                configuration, candidate_lock, package_sets, selection, debug=debug
+            )
+        if values is None:
+            return
+        if full and configuration_identity:
+            write_package_set_cache(
+                configuration_identity, package_sets, values, debug=debug
+            )
+        elif not full:
+            evaluated_names = set().union(*selection.values()) if selection else set()
+            merge_package_set_memberships(
+                package_sets, values, evaluated_names, debug=debug
+            )
+            apply_package_set_values(changes_by_path, values, source_channels)
+            unresolved = [
+                change
+                for change in changes
+                if not change.get("packageSet")
+                and package_set_candidate_names([change]) & memberships.keys()
+            ]
+            if unresolved:
+                names = package_set_candidate_names(unresolved)
+                fallback = evaluate_package_sets(
+                    configuration,
+                    candidate_lock,
+                    package_sets,
+                    {package_set: names for package_set in package_sets},
+                    debug=debug,
+                )
+                if fallback is not None:
+                    values.extend(fallback)
+                    merge_package_set_memberships(
+                        package_sets, fallback, names, debug=debug
+                    )
+    if full:
+        merge_package_set_memberships(package_sets, values, debug=debug)
+    apply_package_set_values(changes_by_path, values, source_channels)
 
 
 PACKAGE_APPLY = r"""
