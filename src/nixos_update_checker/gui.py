@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDateTime, QProcess, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPainter, QPen
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -114,7 +114,7 @@ def color_contrast_ratio(first: QColor, second: QColor) -> float:
 
 def readable_muted_color(text: QColor, background: QColor) -> QColor:
     result = QColor(text)
-    for background_percent in range(5, 45, 5):
+    for background_percent in range(5, 80, 5):
         text_percent = 100 - background_percent
         candidate = QColor(
             round((text.red() * text_percent + background.red() * background_percent) / 100),
@@ -127,6 +127,28 @@ def readable_muted_color(text: QColor, background: QColor) -> QColor:
             break
         result = candidate
     return result
+
+
+def apply_readable_muted_palette(widget: QWidget) -> None:
+    palette = QPalette(widget.palette())
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        text = palette.color(group, QPalette.ColorRole.WindowText)
+        background = palette.color(group, QPalette.ColorRole.Window)
+        palette.setColor(
+            group,
+            QPalette.ColorRole.WindowText,
+            readable_muted_color(text, background),
+        )
+    widget.setPalette(palette)
+
+
+def hover_border_edges(column: int, column_count: int) -> set[str]:
+    edges = {"top", "bottom"}
+    if column == 0:
+        edges.add("left")
+    if column == column_count - 1:
+        edges.add("right")
+    return edges
 
 
 def channel_sort_key(channel: str) -> tuple[int, int, int, str]:
@@ -276,9 +298,10 @@ def update_detail_lines(update: JsonObject) -> list[str]:
 class UpdateItemDelegate(QStyledItemDelegate):
     def item_option(self, option: QStyleOptionViewItem, index: Any) -> QStyleOptionViewItem:
         item_option = QStyleOptionViewItem(option)
+        item_option.state &= ~QStyle.StateFlag.State_MouseOver
         table = option.widget
         if isinstance(table, UpdateTableWidget) and index.row() == table.hovered_row:
-            item_option.state |= QStyle.StateFlag.State_MouseOver
+            item_option.state &= ~QStyle.StateFlag.State_HasFocus
         return item_option
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
@@ -293,9 +316,24 @@ class UpdateItemDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if not isinstance(table, UpdateTableWidget) or index.row() != table.hovered_row or selected:
             return
-        color = option.palette.highlight().color()
-        color.setAlpha(30)
-        painter.fillRect(option.rect, color)
+        fill = option.palette.highlight().color()
+        fill.setAlpha(38)
+        border = option.palette.highlight().color()
+        border.setAlpha(180)
+        rect = option.rect
+        edges = hover_border_edges(index.column(), table.columnCount())
+        painter.save()
+        painter.fillRect(rect, fill)
+        painter.setPen(QPen(border, 1))
+        if "top" in edges:
+            painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+        if "bottom" in edges:
+            painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+        if "left" in edges:
+            painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+        if "right" in edges:
+            painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+        painter.restore()
 
 
 class PackageNameDelegate(UpdateItemDelegate):
@@ -454,6 +492,9 @@ class UpdateCheckerWindow(QMainWindow):
         self.package_count = self._summary_value("Package updates")
         self.flake_count = self._summary_value("Flake updates")
         self.rebuild_state = self._summary_value("Rebuild")
+        self.rebuild_state.setToolTip(
+            "Whether the saved NixOS configuration differs from the currently running system."
+        )
         information.addWidget(self.package_count)
         information.addWidget(self.flake_count)
         information.addWidget(self.rebuild_state)
@@ -517,6 +558,7 @@ class UpdateCheckerWindow(QMainWindow):
         self.statusBar().addWidget(self.status_message, 1)
         self.last_checked = QLabel("Last checked: never")
         self.last_checked.setObjectName("mutedText")
+        apply_readable_muted_palette(self.last_checked)
         self.statusBar().addPermanentWidget(self.last_checked)
         self.setStyleSheet(
             "QWidget#applicationSurface { background: palette(base); } "
@@ -525,7 +567,6 @@ class UpdateCheckerWindow(QMainWindow):
             "QLabel#summaryLabel { font-size: 12px; } "
             "QLabel#summaryLabel::first-line { font-weight: 700; } "
             "QLabel#informationTitle { font-size: 16px; font-weight: 650; } "
-            "QLabel#mutedText { color: palette(mid); } "
             "QPushButton, QToolButton { min-height: 30px; padding: 2px 12px; } "
             "QPushButton#primaryAction { background: #2673d9; color: white; border: none; "
             "border-radius: 5px; font-weight: 650; padding: 4px 16px; } "
@@ -565,6 +606,7 @@ class UpdateCheckerWindow(QMainWindow):
         )
         self.information_description.setObjectName("mutedText")
         self.information_description.setWordWrap(True)
+        apply_readable_muted_palette(self.information_description)
         details = QHBoxLayout()
         self.information_type = QLabel("Type: —")
         self.information_current = QLabel("Current: —")
@@ -771,7 +813,7 @@ class UpdateCheckerWindow(QMainWindow):
             "configures the source used by its background service."
         )
         source_help.setWordWrap(True)
-        source_help.setStyleSheet("color: palette(mid);")
+        apply_readable_muted_palette(source_help)
         layout.addWidget(source_help)
 
         package_label = QLabel(
@@ -793,7 +835,7 @@ class UpdateCheckerWindow(QMainWindow):
             "time and increase Nix store usage. Periodic garbage collection is recommended."
         )
         build_warning.setWordWrap(True)
-        build_warning.setStyleSheet("color: palette(mid);")
+        apply_readable_muted_palette(build_warning)
         layout.addWidget(build_warning)
 
         garbage_collection = QCheckBox(
@@ -818,7 +860,7 @@ class UpdateCheckerWindow(QMainWindow):
             "retention period will no longer be available."
         )
         gc_warning.setWordWrap(True)
-        gc_warning.setStyleSheet("color: palette(mid);")
+        apply_readable_muted_palette(gc_warning)
         layout.addWidget(gc_warning)
         layout.addStretch()
         buttons = QDialogButtonBox(
@@ -1175,7 +1217,11 @@ class UpdateCheckerWindow(QMainWindow):
         rebuild = system.get("configurationState") == "differs"
         self.set_summary_value(self.package_count, str(len(package_updates)), "Package updates")
         self.set_summary_value(self.flake_count, str(len(inputs)), "Flake updates")
-        self.set_summary_value(self.rebuild_state, "Yes" if rebuild else "No", "Rebuild")
+        self.set_summary_value(
+            self.rebuild_state,
+            "Needed" if rebuild else "Not needed",
+            "Rebuild",
+        )
         self.populate_updates(package_updates, inputs, store_only)
         if updates:
             source_label = "full build" if build.get("performed") else "fast evaluation"
@@ -1534,7 +1580,7 @@ class UpdateCheckerWindow(QMainWindow):
             or self.update_table.columnWidth(0) < 190
             or self.package_count.property("summaryValue") != "2"
             or self.flake_count.property("summaryValue") != "1"
-            or self.rebuild_state.property("summaryValue") != "No"
+            or self.rebuild_state.property("summaryValue") != "Not needed"
             or selected_current != "Current: 1.0"
             or not store_information_rendered
             or self.update_table.selectionBehavior() != QTableWidget.SelectionBehavior.SelectRows

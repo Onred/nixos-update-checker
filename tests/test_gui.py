@@ -6,6 +6,7 @@ from nixos_update_checker.gui import (
     UpdateCheckerWindow,
     color_contrast_ratio,
     group_package_update_rows,
+    hover_border_edges,
     initial_repository,
     package_set_identity,
     package_type_label,
@@ -163,3 +164,10 @@ def test_muted_description_color_comes_from_palette_and_remains_readable() -> No
     assert muted != text
     assert muted != background
     assert color_contrast_ratio(muted, background) >= 4.5
+    assert muted.red() >= 100
+
+
+def test_hover_border_edges_form_one_outer_row_outline() -> None:
+    assert hover_border_edges(0, 3) == {"top", "bottom", "left"}
+    assert hover_border_edges(1, 3) == {"top", "bottom"}
+    assert hover_border_edges(2, 3) == {"top", "bottom", "right"}
