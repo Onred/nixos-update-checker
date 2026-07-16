@@ -11,6 +11,7 @@ from nixos_update_checker.logic import (
     compare_closures,
     compare_inputs,
     compare_packages_to_closure,
+    enrich_package_changes,
     garbage_collection_arguments,
     interactive_check_arguments,
     package_summary,
@@ -300,6 +301,24 @@ def test_realized_nixos_package_option_promotes_build_change() -> None:
     primary, dependencies = partition_priority_changes(changes, option_packages)
     assert [change["name"] for change in primary] == ["nvidia-x11", "nvidia-open"]
     assert [change["name"] for change in dependencies] == ["libdrm"]
+
+
+def test_realized_build_change_receives_available_package_description() -> None:
+    changes = [{"name": "example", "kind": "version"}]
+    packages = [
+        {
+            "pname": "example",
+            "path": "/nix/store/aaaaaaaa-example-2.0",
+            "description": "An example package",
+        }
+    ]
+    assert enrich_package_changes(changes, packages) == [
+        {
+            "name": "example",
+            "kind": "version",
+            "description": "An example package",
+        }
+    ]
 
 
 def test_nixos_package_option_is_relevant_when_identity_is_in_running_closure() -> None:

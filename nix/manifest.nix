@@ -9,6 +9,11 @@ let
     name = packageValue.name;
     pname = packageValue.pname or null;
     version = packageValue.version or null;
+    description =
+      if builtins.isString (packageValue.meta.description or null) then
+        packageValue.meta.description
+      else
+        null;
     path = packageValue.outPath;
   };
 

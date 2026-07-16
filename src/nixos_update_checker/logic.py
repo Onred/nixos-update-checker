@@ -236,6 +236,7 @@ def package_details(package: JsonObject) -> JsonObject:
         "name": package.get("name"),
         "pname": package.get("pname"),
         "version": package_version_identity(package),
+        "description": package.get("description"),
         "path": path,
         "storeHash": match.group(1)[:8] if match else "unknown",
     }
@@ -355,6 +356,21 @@ def partition_priority_changes(
         else:
             dependencies.append(change)
     return primary, dependencies
+
+
+def enrich_package_changes(
+    changes: list[JsonObject], packages: Iterable[JsonObject]
+) -> list[JsonObject]:
+    metadata: dict[str, JsonObject] = {}
+    for package in packages:
+        for alias in package_aliases(package):
+            metadata[alias] = package
+    for change in changes:
+        selected_package = metadata.get(str(change.get("name", "")))
+        description = str((selected_package or {}).get("description") or "")
+        if description:
+            change["description"] = description
+    return changes
 
 
 @dataclass(frozen=True)

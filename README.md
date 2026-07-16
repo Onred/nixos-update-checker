@@ -5,19 +5,14 @@ for inspecting and applying updates to the currently running flake-based NixOS
 system. It includes a desktop window, tray status, a JSON/CLI checker, and a
 low-priority systemd timer.
 
-The checker resolves candidate inputs in a temporary lock file, compares the
-evaluated NixOS package manifest, and leaves the repository unchanged. Changes
-are made only when **Update inputs** is selected; the GUI requests administrator
-authorization when the repository is not writable by the desktop user.
-**Rebuild system** always requests authorization and runs `nixos-rebuild switch`
-for the configuration discovered as belonging to the current machine.
+**Refresh** resolves candidate inputs into a temporary lock file, builds the
+complete candidate NixOS system, and compares its realized closure with the
+running system. It does not modify `flake.lock`, create a profile generation,
+or apply the result.
 
-**Check now** evaluates important candidate packages and compares them with the
-realized `/run/current-system` closure. Saved lock-file or configuration changes
-therefore remain visible until they are actually rebuilt. **Check with build**
-uses the temporary updated lock file to build the complete candidate NixOS
-system, then compares both realized closures. It does not modify `flake.lock`,
-create a profile generation, or apply the result.
+**Rebuild** first updates the repository's real `flake.lock`, then requests
+administrator authorization and runs `nixos-rebuild switch` for the
+configuration discovered as belonging to the current machine.
 
 ## Nix flake outputs
 
@@ -193,8 +188,8 @@ alongside `nvidia-x11`. Non-package passthru metadata is ignored, as are
 unrelated disabled service defaults.
 
 There is no built-in NVIDIA, QEMU, Mesa, `kvmfr`, or other hardware-specific
-list. If the automatic rules cannot infer that an option is important, open
-**Settings** in the sidebar and enter its NixOS option path. The GUI stores these
+list. If the automatic rules cannot infer that an option should be included,
+open **File → Settings…** and enter its NixOS option path. The GUI stores these
 overrides and background policy in the shared, repository-local
 `.nixos-update-checker.json` file:
 
@@ -217,7 +212,7 @@ the repository is not writable by the desktop user, the GUI requests Polkit
 authorization before installing the settings file.
 
 Garbage collection is opt-in and defaults to retaining 30 days. It runs only
-after **Apply system update** has completed successfully—never after a check, a
+after **Rebuild** has completed successfully—never after a check, a
 candidate build, or merely updating `flake.lock`. It uses
 `nix-collect-garbage --delete-older-than 30d`, so generations older than the
 configured retention period and subsequently unreferenced paths can no longer
@@ -297,10 +292,9 @@ nix develop -c code .
 
 ## Safety notes
 
-- Normal checks never write the repository's `flake.lock`.
-- **Update lock file** deliberately runs `nix flake update` and writes `flake.lock`;
-  it requests administrator authorization for a non-writable repository.
-- **Apply system update** uses `pkexec` to request authorization, then runs
+- **Refresh** never writes the repository's `flake.lock`.
+- **Rebuild** deliberately updates `flake.lock`, requesting authorization when
+  the repository is not writable, then uses `pkexec` to run
   `nixos-rebuild switch --flake REPOSITORY#DISCOVERED-CONFIGURATION`.
 - Optional garbage collection runs only after that rebuild succeeds and retains
   generations newer than the configured age (30 days by default).

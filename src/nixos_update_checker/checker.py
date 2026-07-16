@@ -25,6 +25,7 @@ from .logic import (
     compare_closures,
     compare_inputs,
     compare_packages_to_closure,
+    enrich_package_changes,
     nix_quote,
     package_summary,
     packages_matching_closure,
@@ -241,6 +242,11 @@ let
     name = packageValue.name;
     pname = packageValue.pname or null;
     version = packageValue.version or null;
+    description =
+      if builtins.isString (packageValue.meta.description or null) then
+        packageValue.meta.description
+      else
+        null;
     path = packageValue.outPath;
   };
   values = if builtins.isList value then value else [ value ];
@@ -459,6 +465,10 @@ def run_check(options: CheckOptions) -> JsonObject:
             ]
             package_changes, dependency_changes = partition_priority_changes(
                 closure_changes,
+                [*direct_packages.values(), *realized_option_packages],
+            )
+            enrich_package_changes(
+                [*package_changes, *dependency_changes],
                 [*direct_packages.values(), *realized_option_packages],
             )
             package_source = "realizedClosure"
