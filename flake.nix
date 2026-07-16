@@ -18,7 +18,7 @@
         else if self ? dirtyShortRev then
           self.dirtyShortRev
         else if self ? narHash then
-          "dirty-${builtins.substring 7 12 self.narHash}"
+          "source-${builtins.substring 7 12 self.narHash}"
         else
           "unknown";
     in

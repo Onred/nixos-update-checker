@@ -241,12 +241,12 @@ its embedded flake revision with Git:
 
 ```console
 git rev-parse --short HEAD
-nix run path:. -- --version
+nix run . -- --version
 ```
 
 The GUI shows the same revision under **Help → About**, and backend reports
-include it as `buildRevision`. A dirty checkout is labeled with a content
-fingerprint instead of a commit revision.
+include it as `buildRevision`. A dirty Git checkout is labeled as dirty; a
+non-Git `path:` flake is labeled with a source-content fingerprint.
 
 The pytest suite contains data-driven cases for single and multiple
 `nixosConfigurations`, output names that differ from hostnames, missing
