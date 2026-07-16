@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -90,6 +91,37 @@ def package_version(value: Any) -> str:
     if not isinstance(value, dict):
         return "unknown"
     return str(value.get("version") or "unknown")
+
+
+def channel_sort_key(channel: str) -> tuple[int, int, int, str]:
+    labels = [label.strip() for label in channel.split("/") if label.strip()]
+    folded_labels = [label.casefold() for label in labels]
+    if any("unstable" in label for label in folded_labels):
+        return (0, 0, 0, channel.casefold())
+    releases = [
+        (int(match.group(1)), int(match.group(2)))
+        for label in labels
+        if (match := re.fullmatch(r"(\d+)\.(\d+)", label))
+    ]
+    if releases:
+        newest = max(releases)
+        return (1, -newest[0], -newest[1], channel.casefold())
+    if not labels or all(label == "unknown" for label in folded_labels):
+        return (3, 0, 0, channel.casefold())
+    return (2, 0, 0, channel.casefold())
+
+
+def update_sort_key(update: JsonObject) -> tuple[Any, ...]:
+    update_type = str(update.get("type", ""))
+    if update_type == "flake":
+        return (0, str(update.get("name", "")).casefold())
+    if update_type == "rebuild":
+        return (2, "")
+    return (
+        1,
+        *channel_sort_key(str(update.get("channel", "unknown"))),
+        str(update.get("name", "")).casefold(),
+    )
 
 
 class UpdateItemDelegate(QStyledItemDelegate):
@@ -1048,11 +1080,11 @@ class UpdateCheckerWindow(QMainWindow):
             rows.append(
                 {
                     "type": f"nixPkg · {channel}",
+                    "channel": channel,
                     "name": str(change.get("name", "")),
                     "description": description,
                     "current": package_version(before),
                     "available": available,
-                    "sortGroup": 1,
                 }
             )
         for change in inputs:
@@ -1064,7 +1096,6 @@ class UpdateCheckerWindow(QMainWindow):
                     "description": "Flake input",
                     "current": input_revision(change.get("before")),
                     "available": "removed" if after == "missing" else after,
-                    "sortGroup": 0,
                 }
             )
         if store_changes:
@@ -1079,16 +1110,9 @@ class UpdateCheckerWindow(QMainWindow):
                     "current": f"{len(store_changes)} current store paths",
                     "available": f"{len(store_changes)} packages",
                     "storeChanges": store_changes,
-                    "sortGroup": 2,
                 }
             )
-        rows.sort(
-            key=lambda update: (
-                int(update["sortGroup"]),
-                str(update["type"]).casefold(),
-                str(update["name"]).casefold(),
-            )
-        )
+        rows.sort(key=update_sort_key)
         self.update_table.set_hovered_row(-1)
         self.update_table.clearSelection()
         self.update_table.setRowCount(len(rows))
