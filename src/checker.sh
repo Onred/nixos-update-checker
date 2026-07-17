@@ -111,7 +111,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.0"
+      echo "nixos-update-checker-service 3.1.1"
       exit 0
       ;;
     --*)

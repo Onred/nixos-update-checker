@@ -9,6 +9,7 @@ let
   cfg = config.programs.nixos-update-checker;
   package = import ./package.nix { inherit pkgs; };
   report = "/var/lib/nixos-update-checker/report.json";
+  lock = "/var/lib/nixos-update-checker/operation.lock";
 in
 {
   options.programs.nixos-update-checker = {
@@ -46,7 +47,7 @@ in
       environment = {
         HOME = "/var/lib/nixos-update-checker";
         NIX_REMOTE = "local";
-        NIXOS_UPDATE_CHECKER_LOCK = "/run/lock/nixos-update-checker.lock";
+        NIXOS_UPDATE_CHECKER_LOCK = lock;
         NIXOS_UPDATE_CHECKER_STATE = "/var/lib/nixos-update-checker/system-lock.json";
       };
 
@@ -92,7 +93,7 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      environment.NIXOS_UPDATE_CHECKER_LOCK = "/run/lock/nixos-update-checker.lock";
+      environment.NIXOS_UPDATE_CHECKER_LOCK = lock;
 
       serviceConfig = {
         Type = "oneshot";
@@ -102,6 +103,8 @@ in
           cfg.repository
         ];
         User = "root";
+        StateDirectory = "nixos-update-checker";
+        StateDirectoryMode = "0755";
         TimeoutStartSec = "infinity";
       };
     };

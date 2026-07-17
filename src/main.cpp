@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QSplitter>
 #include <QStyle>
@@ -31,7 +32,7 @@
 
 namespace {
 
-constexpr auto Version = "3.1.0";
+constexpr auto Version = "3.1.1";
 constexpr int DetailRole = Qt::UserRole;
 
 QString environment(const char *name, const QString &fallback = {})
@@ -277,9 +278,15 @@ private:
         auto *footer = new QHBoxLayout;
         status_ = new QLabel("Waiting for a report", central);
         status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        progress_ = new QProgressBar(central);
+        progress_->setRange(0, 0);
+        progress_->setTextVisible(false);
+        progress_->setFixedWidth(90);
+        progress_->hide();
         applyButton_ = new QPushButton("Apply update", central);
         checkButton_ = new QPushButton("Check now", central);
         footer->addWidget(status_, 1);
+        footer->addWidget(progress_);
         footer->addWidget(applyButton_);
         footer->addWidget(checkButton_);
         layout->addLayout(footer);
@@ -342,7 +349,7 @@ private:
     void startCheck()
     {
         const QString service = environment("NIXOS_UPDATE_CHECKER_SERVICE", "nixos-update-checker.service");
-        startService(service, "check", "Check started. Progress is available in the system journal.");
+        startService(service, "check", "Check finished.");
     }
 
     void confirmApply()
@@ -357,27 +364,30 @@ private:
 
         const QString service = environment(
             "NIXOS_UPDATE_CHECKER_APPLY_SERVICE", "nixos-update-checker-apply.service");
-        startService(service, "update",
-            "Update started. Progress is available in the system journal.");
+        startService(service, "update", "Update finished.");
     }
 
-    void startService(const QString &service, const QString &action, const QString &startedMessage)
+    void startService(const QString &service, const QString &action, const QString &completedMessage)
     {
         if (activeProcess_)
             return;
 
         status_->setText("Requesting " + action + "…");
         activeProcess_ = new QProcess(this);
+        progress_->show();
         updateButtons();
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
         connect(activeProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-                [this, service, action, startedMessage](int exitCode, QProcess::ExitStatus) {
+                [this, service, action, completedMessage](int exitCode, QProcess::ExitStatus) {
                     const QString diagnostics = QString::fromUtf8(activeProcess_->readAllStandardError()).trimmed();
                     activeProcess_->deleteLater();
                     activeProcess_ = nullptr;
+                    progress_->hide();
                     updateButtons();
                     if (exitCode == 0) {
-                        status_->setText(startedMessage);
+                        status_->setText(completedMessage);
+                        loadReport(false);
+                        refreshLiveSystemState();
                         return;
                     }
                     const QString detail = diagnostics.isEmpty()
@@ -386,7 +396,9 @@ private:
                     QMessageBox::critical(this, "Could not start " + action, detail);
                     status_->setText("Could not start the " + action + " service");
                 });
-        activeProcess_->start(systemctl, {"--no-block", "start", service});
+        connect(activeProcess_, &QProcess::started, this,
+                [this, action] { status_->setText(action.left(1).toUpper() + action.mid(1) + " running…"); });
+        activeProcess_->start(systemctl, {"start", service});
     }
 
     bool canApply() const
@@ -599,6 +611,7 @@ private:
     QLabel *status_ = nullptr;
     QTableWidget *updates_ = nullptr;
     QPlainTextEdit *details_ = nullptr;
+    QProgressBar *progress_ = nullptr;
     QPushButton *applyButton_ = nullptr;
     QPushButton *checkButton_ = nullptr;
 };
