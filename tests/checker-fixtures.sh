@@ -29,6 +29,7 @@ run_check() {
     NIXOS_UPDATE_CHECKER_PROFILE_DIRECTORY="$work/profiles" \
     NIXOS_UPDATE_CHECKER_STATE="$state" \
     NIXOS_UPDATE_CHECKER_HOSTNAME=fixture \
+    NIXOS_UPDATE_CHECKER_CPU_LIST=0-31 \
     NIXOS_UPDATE_CHECKER_BASELINE_NIXPKGS_REVISION=old-nixpkgs-revision \
     FAKE_RUNNING_SYSTEM="$(readlink -f "$work/running-link")" \
     FAKE_BOOT_SYSTEM="$(readlink -f "$work/boot-link")" \
@@ -50,6 +51,10 @@ jq -e '
   .system.boot.generation == 38 and
   .system.baseline == "running" and
   .system.readyForBoot == false and
+  .build.logicalCpus == 32 and
+  .build.workerBudget == 32 and
+  .build.maxJobs == 5 and
+  .build.coresPerJob == 6 and
   (.inputs | map(select(
     .name == "nixpkgs" and
     .before.revision == "old-nixpkgs-revision" and

@@ -94,6 +94,38 @@ generation_number() {
   [[ -z "$highest" ]] || printf '%s\n' "$highest"
 }
 
+logical_cpu_count() {
+  local cpu_list=${NIXOS_UPDATE_CHECKER_CPU_LIST:-}
+  local key value
+  if [[ -z "$cpu_list" ]]; then
+    while read -r key value _; do
+      if [[ "$key" == "Cpus_allowed_list:" ]]; then
+        cpu_list=$value
+        break
+      fi
+    done </proc/self/status
+  fi
+
+  local total=0 item first last
+  local -a ranges
+  IFS=',' read -ra ranges <<<"$cpu_list"
+  for item in "${ranges[@]}"; do
+    if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      first=${BASH_REMATCH[1]}
+      last=${BASH_REMATCH[2]}
+      ((total += 10#$last - 10#$first + 1))
+    elif [[ "$item" =~ ^[0-9]+$ ]]; then
+      ((total += 1))
+    fi
+  done
+
+  if ((total > 0)); then
+    printf '%s\n' "$total"
+  else
+    nproc
+  fi
+}
+
 deriver_for() {
   local system=$1
   nix --store local path-info --derivation "$system" 2>/dev/null | head -n 1 || true
@@ -111,7 +143,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.1"
+      echo "nixos-update-checker-service 3.1.2"
       exit 0
       ;;
     --*)
@@ -260,7 +292,7 @@ jq -n \
   ]
 ' >"$temporary_directory/inputs.json"
 
-logical_cpus=$(nproc)
+logical_cpus=$(logical_cpu_count)
 worker_budget=$logical_cpus
 if ((worker_budget > 32)); then
   worker_budget=32

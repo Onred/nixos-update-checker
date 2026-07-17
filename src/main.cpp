@@ -32,7 +32,7 @@
 
 namespace {
 
-constexpr auto Version = "3.1.1";
+constexpr auto Version = "3.1.2";
 constexpr int DetailRole = Qt::UserRole;
 
 QString environment(const char *name, const QString &fallback = {})
