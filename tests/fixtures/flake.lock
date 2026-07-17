@@ -1,0 +1,9 @@
+{
+  "nodes": {
+    "root": { "inputs": { "nixpkgs": "nixpkgs", "tool": "tool" } },
+    "nixpkgs": { "locked": { "rev": "new-nixpkgs-revision", "narHash": "new-hash" } },
+    "tool": { "locked": { "rev": "tool-current" } }
+  },
+  "root": "root",
+  "version": 7
+}

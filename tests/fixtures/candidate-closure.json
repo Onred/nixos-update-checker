@@ -1,0 +1,8 @@
+{
+  "/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0": { "narSize": 100 },
+  "/nix/store/gggggggggggggggggggggggggggggggg-glibc-2.40": { "narSize": 21 },
+  "/nix/store/dddddddddddddddddddddddddddddddd-multi-2": { "narSize": 10 },
+  "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-multi-3": { "narSize": 15 },
+  "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-multi-4": { "narSize": 15 },
+  "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-added-1": { "narSize": 50 }
+}

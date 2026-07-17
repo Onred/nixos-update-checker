@@ -1,102 +1,103 @@
-{
-  pkgs,
-  defaultRepository ? "/etc/nixos",
-  revision ? "unknown",
-}:
+{ pkgs }:
 
-let
-  version = "2.1.0";
-  output = builtins.placeholder "out";
-in
-pkgs.python3Packages.buildPythonApplication {
+pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  inherit version;
-  pyproject = true;
+  version = "3.1.0";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
     filter =
       path: _type:
-      builtins.all (name: baseNameOf path != name) [
+      !builtins.elem (baseNameOf path) [
         ".direnv"
         ".git"
-        ".mypy_cache"
-        ".pytest_cache"
-        ".ruff_cache"
-        ".venv"
-        "__pycache__"
         "result"
       ];
   };
 
-  build-system = [ pkgs.python3Packages.setuptools ];
-  dependencies = [ pkgs.python3Packages.pyside6 ];
-  buildInputs = [ pkgs.qt6.qtbase ];
-  nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
-  nativeCheckInputs = [ pkgs.python3Packages.pytest ];
-
-  makeWrapperArgs = [
-    "--set"
-    "NIXOS_UPDATE_CHECKER_VERSION"
-    version
-    "--set"
-    "NIXOS_UPDATE_CHECKER_REVISION"
-    revision
-    "--set"
-    "NIXOS_UPDATE_CHECKER_BACKEND"
-    "${output}/bin/check-nixos-updates"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_NIX"
-    "${pkgs.nix}/bin/nix"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_APPLIED_LOCK"
-    "/var/lib/nixos-update-checker/applied-flake-lock.json"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_PKEXEC"
-    "${pkgs.polkit}/bin/pkexec"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_REBUILD"
-    "${pkgs.nixos-rebuild}/bin/nixos-rebuild"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_GC"
-    "${pkgs.nix}/bin/nix-collect-garbage"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_ICON"
-    "${output}/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
-    "--set-default"
-    "NIXOS_UPDATE_CHECKER_REPOSITORY"
-    defaultRepository
-    "--set"
-    "NIXOS_UPDATE_CHECKER_REPORT"
-    "/var/lib/nixos-update-checker/report.json"
+  nativeBuildInputs = [
+    pkgs.makeWrapper
+    pkgs.pkg-config
+    pkgs.qt6.wrapQtAppsHook
   ];
+  buildInputs = [ pkgs.qt6.qtbase ];
+  dontWrapQtApps = true;
 
-  postInstall = ''
-    mkdir -p "$out/share/applications" "$out/share/icons/hicolor/scalable/apps"
-    mkdir -p "$out/share/nixos-update-checker"
+  buildPhase = ''
+    runHook preBuild
+    $CXX -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+      $(pkg-config --cflags Qt6Widgets) \
+      src/main.cpp -o nixos-update-checker \
+      $(pkg-config --libs Qt6Widgets)
+    runHook postBuild
+  '';
 
-    install -m644 "$src/assets/nixos-update-checker.svg" \
+  installPhase = ''
+    runHook preInstall
+    install -Dm755 nixos-update-checker "$out/bin/nixos-update-checker"
+    install -Dm755 src/checker.sh "$out/bin/nixos-update-checker-service"
+    install -Dm755 src/apply.sh "$out/bin/nixos-update-checker-apply"
+    install -Dm644 assets/nixos-update-checker.svg \
       "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
-    install -m644 "$src/assets/nixos-update-checker.desktop" \
+    install -Dm644 assets/nixos-update-checker.desktop \
       "$out/share/applications/nixos-update-checker.desktop"
-    install -m644 "$src/assets/nixos-update-checker-autostart.desktop" \
+    install -Dm644 assets/nixos-update-checker-autostart.desktop \
       "$out/share/nixos-update-checker/autostart.desktop"
+
+    wrapProgram "$out/bin/nixos-update-checker-service" \
+      --prefix PATH : ${
+        pkgs.lib.makeBinPath [
+          pkgs.coreutils
+          pkgs.jq
+          pkgs.nix
+          pkgs.util-linux
+        ]
+      }
+
+    wrapProgram "$out/bin/nixos-update-checker-apply" \
+      --prefix PATH : ${
+        pkgs.lib.makeBinPath [
+          pkgs.coreutils
+          pkgs.jq
+          pkgs.nix
+          pkgs.nixos-rebuild
+          pkgs.util-linux
+        ]
+      }
+
+    runHook postInstall
+  '';
+
+  postFixup = ''
+    qtWrapperArgs+=(
+      --set NIXOS_UPDATE_CHECKER_ICON \
+        "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
+      --set NIXOS_UPDATE_CHECKER_SYSTEMCTL "${pkgs.systemd}/bin/systemctl"
+      --set NIXOS_UPDATE_CHECKER_REPORT "/var/lib/nixos-update-checker/report.json"
+      --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"
+    )
+    wrapQtApp "$out/bin/nixos-update-checker"
   '';
 
   doInstallCheck = true;
+  nativeInstallCheckInputs = [
+    pkgs.jq
+    pkgs.shellcheck
+  ];
   installCheckPhase = ''
     runHook preInstallCheck
-    pytest -p no:cacheprovider "$src/tests"
-    "$out/bin/nixos-update-checker" --version | grep -F "nixos-update-checker 2.1.0"
-    QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" \
-      --self-test --no-tray --report /nonexistent /etc/nixos
-    "$out/bin/check-nixos-updates" --version | grep -F "check-nixos-updates 2.1.0"
-    "$out/bin/check-nixos-updates" --help >/dev/null
+    patchShebangs src/checker.sh tests/checker-fixtures.sh tests/fixtures/bin/nix
+    shellcheck src/checker.sh src/apply.sh \
+      tests/checker-fixtures.sh tests/fixtures/bin/nix
+    tests/checker-fixtures.sh ./src/checker.sh
+    QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" --version
+    "$out/bin/nixos-update-checker-service" --help
+    "$out/bin/nixos-update-checker-apply" --help
     runHook postInstallCheck
   '';
 
   meta = {
-    description = "Graphical NixOS update checker based on realized system builds";
+    description = "Quiet background NixOS update builds with a native Qt report viewer";
     homepage = "https://github.com/Onred/nixos-update-checker";
     mainProgram = "nixos-update-checker";
     platforms = pkgs.lib.platforms.linux;

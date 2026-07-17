@@ -2,10 +2,10 @@
 Type=Application
 Name=NixOS Update Checker
 GenericName=System Update Checker
-Comment=Inspect, update, and rebuild a NixOS flake
+Comment=View the latest NixOS update report
 Exec=nixos-update-checker
 Icon=nixos-update-checker
 Terminal=false
 Categories=System;Utility;Qt;
-Keywords=NixOS;Nix;updates;flake;rebuild;
+Keywords=NixOS;Nix;updates;flake;
 StartupNotify=true

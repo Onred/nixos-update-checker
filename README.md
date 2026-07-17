@@ -1,62 +1,25 @@
 # NixOS Update Checker
 
-A PySide6 desktop application for checking and applying updates to the currently
-running, flake-based NixOS system.
+A small NixOS service that quietly builds an updated system once a day, plus a
+native Qt application that displays the resulting report.
 
-The checker has one source of truth: it resolves updated inputs into a temporary
-lock file, builds the complete candidate NixOS system, and compares that realized
-closure with the running system. There is no package manifest, recursive package
-set search, manual package list, or fast approximation.
+The application has a deliberately narrow boundary:
 
-The temporary candidate lock and completed build do not modify the repository,
-create a system generation, or switch the machine. The **Rebuild** action is the
-only operation that updates the real `flake.lock` and applies a system.
+- `nixos-update-checker-service` resolves a temporary candidate `flake.lock`,
+  builds it, compares it with the appropriate system generation, and atomically
+  writes a schema-2 JSON report.
+- `nixos-update-checker` reads that JSON and asks systemd to start the service
+  when **Check now** is selected.
+- `nixos-update-checker-apply` updates the real lock and switches the reported
+  configuration when the GUI starts the apply service.
 
-## What the GUI shows
+The GUI itself does not run Nix, modify the configuration, collect garbage, or
+duplicate service logs. Check and apply operations remain root-owned systemd
+services, with their output available through `journalctl`.
 
-The main update list has three native list sections:
+## Install
 
-- **Flake**: a locked input changed.
-- **Package**: a package was added, removed, or has a different parsed version in
-  the realized candidate closure.
-- **Rebuild**: one aggregate row for paths whose package version is unchanged but
-  whose store identity changed. Selecting it lists every underlying path change.
-
-Flake inputs appear first, packages second, and the rebuild-only aggregate last.
-There is no type column or custom window frame; the desktop supplies the normal
-window decorations. Selecting a row shows old versions and other detail in the
-Information tab. The Activity tab shows output from refresh, rebuild, and garbage
-collection commands.
-
-**Refresh** performs a complete unrestricted candidate build. **Rebuild** updates
-the repository lock, runs `nixos-rebuild switch`, and then refreshes the report.
-Optional garbage collection runs only after a successful rebuild and retains 30
-days by default.
-
-Opening the GUI loads the last report written by the background service. It does
-not automatically start a second build.
-
-The backend compares the system derivation described by the saved configuration
-with `/run/current-system`, so saved-but-unapplied changes remain in the report.
-Package comparisons keep using the running closure as their baseline until a
-rebuild is applied; merely changing `flake.lock` does not make pending changes
-disappear.
-
-Flake inputs use an applied-lock snapshot instead of assuming the working lock is
-running. A successful Rebuild records the applied lock, and a background check
-also refreshes the snapshot whenever the saved system derivation exactly matches
-the running derivation. Before the first snapshot exists, the embedded running
-NixOS nixpkgs revision keeps the primary `nixpkgs` row accurate. Arbitrary
-third-party input revisions cannot be reconstructed from a realized NixOS closure
-after the fact, so their fully accurate applied baseline begins once a snapshot
-has been recorded.
-
-As with every Git-backed Nix flake, newly created source files must be staged
-before Nix includes them, though they do not need to be committed.
-
-## Install on NixOS
-
-Add the flake input, normally following the system's nixpkgs input:
+Add the flake input:
 
 ```nix
 inputs.nixos-update-checker = {
@@ -65,7 +28,7 @@ inputs.nixos-update-checker = {
 };
 ```
 
-Import the module:
+Import and enable the module:
 
 ```nix
 {
@@ -78,48 +41,24 @@ Import the module:
 }
 ```
 
-This installs the application, adds its desktop and tray autostart entries, and
-enables the background timer. The flake exports packages and apps for
-`x86_64-linux` and `aarch64-linux`.
+The module installs the app, starts it from desktop autostart, and enables a
+daily persistent timer with up to one hour of random delay. A systemd path unit
+also starts the same low-priority check whenever the default system profile
+changes outside this application.
 
-The app only checks the running machine. With one `nixosConfigurations` entry,
-that entry is selected regardless of its attribute name. With several entries,
-the checker evaluates `config.networking.hostName` and requires exactly one match
-for `/proc/sys/kernel/hostname`. It does not require a custom `config.nix`, and
-the flake attribute name does not need to equal the hostname.
+Only three module options are exposed:
 
-## Background builds
+| Option | Default | Purpose |
+|---|---:|---|
+| `enable` | `false` | Install and enable the checker. |
+| `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
+| `cpuLimit` | `1` | Aggregate background CPU throughput, in logical CPUs. |
 
-The system timer defaults to one build per day:
+For example, `cpuLimit = 2` permits the service to use two CPUs' worth of total
+time. Nix workers and their cores are split with the following bounded square
+allocation, while systemd enforces the aggregate limit:
 
-```nix
-programs.nixos-update-checker = {
-  cpuQuota = "100%";
-  tray.enable = true;
-
-  service = {
-    enable = true;
-    onBootSec = "20m";
-    interval = "24h";
-    randomizedDelaySec = "1h";
-  };
-};
-```
-
-`cpuQuota = "100%"` means one CPU's aggregate throughput, not 100% of every CPU.
-The service uses a short 10 ms quota period, lowest CPU and I/O weights, nice 19,
-and idle I/O scheduling. This makes CPU time arrive in small slices rather than
-as sustained one-core bursts.
-
-The service deliberately runs Nix against the direct local store. Normal daemon
-builders live in `nix-daemon.service` and do not inherit the calling service's
-cgroup, so they would escape its CPU quota. Direct local builders remain inside
-`nixos-update-checker.service` and share its aggregate limit.
-
-Nix job parallelism adapts to the available logical CPUs and is capped at 32
-workers. It chooses an approximately square jobs-by-cores allocation:
-
-| Logical CPUs | Nix jobs | Cores per job | Worker budget |
+| Available CPUs | Nix jobs | Cores per job | Worker budget |
 |---:|---:|---:|---:|
 | 1 | 1 | 1 | 1 |
 | 4 | 2 | 2 | 4 |
@@ -127,95 +66,89 @@ workers. It chooses an approximately square jobs-by-cores allocation:
 | 16 | 4 | 4 | 16 |
 | 32 or more | 5 | 6 | 32 |
 
-This is portable to small and large systems: all values have a minimum of one,
-and unexpectedly large CPU counts cannot create unbounded Nix concurrency. The
-cgroup quota remains the actual usage limit; job counts only distribute the work.
-Individual build systems may still ignore Nix's requested core count or perform a
-single-threaded phase, so perfectly even utilization cannot be guaranteed.
+This lets independent builds and multithreaded build phases share the available
+CPUs instead of forcing all work through one builder. No Nix job setting can
+guarantee that an individual compiler thread never briefly uses a complete core.
 
-Candidate builds can download and retain additional store paths. Garbage
-collection is therefore recommended if background checks materially increase
-storage use. Configure it in the GUI; it never runs after a check, only after an
-applied rebuild.
+The service uses the direct local Nix store. This is intentional: work delegated
+to `nix-daemon.service` would leave the checker's cgroup and escape its CPU
+limit. CPU and I/O weights, nice level, and idle I/O scheduling further favor
+interactive work.
 
-Useful diagnostics:
+## Use
+
+Open **NixOS Update Checker** from the application launcher or system tray. The
+window contains only:
+
+- a flat table showing package name, new version or removal, and closure delta;
+- a vertically draggable text area with complete versions, closure sizes, and
+  store paths for the selected row;
+- a generation line describing a system that is ready for the next boot;
+- report time and configuration;
+- **Check now** and **Apply update** buttons that start their systemd services.
+
+Top-level flake inputs appear first, changed packages are sorted alphabetically,
+and unchanged-version rebuilds are represented by one aggregate row. Long
+version lists remain short in the table and are shown in full in the details
+area.
+
+The size column is the signed net closure change: paths added to the candidate
+minus paths no longer referenced by it. This is a comparison metric, not an
+exact prediction of freed or consumed disk space. Candidate paths may already
+exist in the Nix store, and old generations may continue to retain removed
+paths.
+
+The report is stored at `/var/lib/nixos-update-checker/report.json`.
+
+Service diagnostics remain in the system journal:
 
 ```console
 systemctl status nixos-update-checker.timer
-sudo systemctl start nixos-update-checker.service
+systemctl status nixos-update-checker.path
+systemctl status nixos-update-checker.service
 journalctl -u nixos-update-checker.service
+journalctl -u nixos-update-checker-apply.service
+sudo systemctl start nixos-update-checker.service
 ```
 
-The service atomically publishes its report at
-`/var/lib/nixos-update-checker/report.json`, which is readable by the desktop app.
+## Safety and scope
 
-## Run without installing the module
+- A check never modifies the working `flake.lock`.
+- A check builds but never activates the candidate system.
+- Applying requires confirmation, updates the real `flake.lock`, and runs
+  `nixos-rebuild switch` for the configuration recorded in the report.
+- When the default boot profile differs from the running system, both package
+  and input comparisons use that newer boot generation. This avoids reporting
+  work already present after `nixos-rebuild boot` or while manually running an
+  older generation.
+- The checker stores one system-bound lock snapshot in
+  `/var/lib/nixos-update-checker/system-lock.json`. If no complete lock can be
+  matched to the baseline system, it recovers only nixpkgs history from that
+  system and marks the report incomplete.
+- Apply is disabled for stale reports, incomplete input history, schema-1
+  reports, and reports with no remaining updates. The root apply helper repeats
+  the live profile check before modifying anything.
+- Only changed top-level flake inputs are reported.
+- The service currently requires `flake.nix` and `flake.lock`.
 
-The GUI can perform foreground checks and rebuilds by itself:
+Supporting arbitrary non-flake configurations would require a separate answer
+to “which nixpkgs source should be updated?” A plain configuration build alone
+cannot discover available updates reproducibly, so that ambiguity is kept out of
+the service rather than hidden behind more options.
 
-```console
-nix run . -- /path/to/nixos-flake
-```
+## Development
 
-The NixOS module is required only for installation, desktop autostart, and the
-limited background timer. The GUI remembers a chosen repository in Qt's per-user
-settings. A packaged module default, positional GUI argument, or the
-`NIXOS_UPDATE_CHECKER_REPOSITORY` environment variable can supply the initial
-path.
-
-A small terminal backend remains because it is useful for diagnostics and costs
-almost no additional code:
-
-```console
-check-nixos-updates /path/to/nixos-flake
-check-nixos-updates --json /path/to/nixos-flake
-nix run .#cli -- --json /path/to/nixos-flake
-```
-
-These foreground commands are unrestricted. `--background` is reserved for the
-root-owned system service because direct local-store access requires root.
-
-## Development environment
-
-All dependencies are supplied by the flake:
+The flake is the complete development and validation interface:
 
 ```console
 nix develop
-pytest
-ruff check src tests
-mypy src
-```
-
-For a checkout-specific default repository, create the ignored `.env.local`:
-
-```console
-NIXOS_UPDATE_CHECKER_REPOSITORY=/absolute/path/to/your/nixos-flake
-```
-
-The repository includes `.envrc`, VS Code settings, and extension
-recommendations. With `direnv` and `nix-direnv` installed, run `direnv allow`
-once. The recommended VS Code direnv extension then enters the development shell
-when this folder opens, and `.venv` plus `.nixd` symlinks let Python, PySide6, and
-Nix language tooling resolve automatically. Automatic direnv extension-host
-restarts and file watching are disabled in the workspace settings to avoid VS
-Code reload loops.
-
-Validation commands used for releases are:
-
-```console
-pytest
-ruff check src tests
-mypy src
-QT_QPA_PLATFORM=offscreen nixos-update-checker --self-test --no-tray
+shellcheck src/checker.sh src/apply.sh
+tests/checker-fixtures.sh ./src/checker.sh
+nix fmt
 nix flake check
-nix build .#default
+nix build
 ```
 
-## Safety boundaries
-
-- A check keeps the working `flake.lock` byte-for-byte unchanged.
-- A check builds but never activates the candidate system.
-- Rebuild is the only action that updates the real lock and switches NixOS.
-- Garbage collection is opt-in and follows only a successful applied rebuild.
-- Background limiting applies to builders because the service uses the direct
-  local store; foreground Refresh and Rebuild remain unrestricted.
+There is no Python environment, generated editor configuration, or unit-test
+framework. The package build compiles the C++ application, checks the Bash
+service with ShellCheck, and smoke-tests both installed command-line interfaces.

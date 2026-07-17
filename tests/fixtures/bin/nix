@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+arguments=" $* "
+last=${!#}
+fixtures=${NIXOS_UPDATE_CHECKER_FIXTURES:?}
+
+if [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
+  echo '[{"name":"desktop","hostName":"fixture"}]'
+elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
+  echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
+elif [[ "$arguments" == *" flake update "* ]]; then
+  while (($#)); do
+    if [[ "$1" == "--output-lock-file" ]]; then
+      install -m 0644 "$fixtures/flake.lock" "$2"
+      exit 0
+    fi
+    shift
+  done
+elif [[ "$arguments" == *" build "* ]]; then
+  echo "${FAKE_CANDIDATE_SYSTEM:?}"
+elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]; then
+  if [[ "$last" == "${FAKE_BOOT_SYSTEM:-}" ]]; then
+    echo "${FAKE_BOOT_DERIVER:-/nix/store/boot.drv}"
+  elif [[ "$last" == "${FAKE_RUNNING_SYSTEM:-}" ]]; then
+    echo "${FAKE_RUNNING_DERIVER:-/nix/store/running.drv}"
+  else
+    echo /nix/store/candidate.drv
+  fi
+elif [[ "$arguments" == *" path-info "* ]]; then
+  if [[ "$last" == "${FAKE_CANDIDATE_SYSTEM:?}" ]]; then
+    cat "$fixtures/candidate-closure.json"
+  else
+    cat "$fixtures/baseline-closure.json"
+  fi
+else
+  echo "Unexpected nix invocation: $*" >&2
+  exit 1
+fi
