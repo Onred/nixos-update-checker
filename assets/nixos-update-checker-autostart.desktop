@@ -2,7 +2,7 @@
 Type=Application
 Name=NixOS Update Checker
 Comment=Show NixOS update status in the system tray
-Exec=nixos-update-checker --background
+Exec=nixos-update-checker
 Icon=nixos-update-checker
 Terminal=false
 Categories=System;Utility;Qt;

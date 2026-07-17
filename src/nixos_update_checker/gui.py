@@ -3,23 +3,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDateTime, QProcess, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QIcon, QPainter, QPalette, QPen
+from PySide6.QtCore import QPoint, QProcess, QSettings, Qt, QTimer
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QMouseEvent,
+    QPalette,
+)
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,26 +39,16 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
-    QStyledItemDelegate,
-    QStyleOptionViewItem,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from . import SCHEMA_VERSION, display_version
-from .logic import (
-    OPTION_PATH,
-    JsonObject,
-    RepositorySettings,
-    SettingsError,
-    garbage_collection_arguments,
-    interactive_check_arguments,
-)
+from .logic import JsonObject, garbage_collection_arguments
 
 
 def environment(name: str, fallback: str = "") -> str:
@@ -60,355 +56,254 @@ def environment(name: str, fallback: str = "") -> str:
 
 
 def canonical_path(path: str) -> str:
-    return str(Path(path).expanduser().resolve())
+    return str(Path(path).expanduser().resolve()) if path else ""
 
 
 def initial_repository(explicit: str | None, saved: str, configured_default: str) -> str:
     return explicit or saved or configured_default
 
 
-def display_time(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    try:
-        return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    except ValueError:
-        return value
-
-
-def input_revision(value: Any) -> str:
-    if not isinstance(value, dict):
-        return "—"
-    for key in ("display", "revision", "narHash", "url"):
-        detail = value.get(key)
-        if detail:
-            text = str(detail)
-            return text[:12] if len(text) > 12 else text
-    return "—"
-
-
-def package_version(value: Any) -> str:
-    if not isinstance(value, dict):
-        return "unknown"
-    return str(value.get("version") or "unknown")
-
-
-def package_type_label(channel: str) -> str:
-    return "nixPkg" if not channel or channel == "unknown" else f"nixPkg {channel}"
-
-
 def color_contrast_ratio(first: QColor, second: QColor) -> float:
     def luminance(color: QColor) -> float:
-        channels = (color.redF(), color.greenF(), color.blueF())
-        linear = [
-            channel / 12.92
-            if channel <= 0.04045
-            else ((channel + 0.055) / 1.055) ** 2.4
-            for channel in channels
-        ]
-        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+        channels = []
+        for value in (color.redF(), color.greenF(), color.blueF()):
+            channels.append(value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
 
-    brighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
-    return (brighter + 0.05) / (darker + 0.05)
+    lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 def readable_muted_color(text: QColor, background: QColor) -> QColor:
-    result = QColor(text)
-    for background_percent in range(5, 80, 5):
-        text_percent = 100 - background_percent
+    for weight in (0.68, 0.76, 0.84, 0.92):
         candidate = QColor(
-            round((text.red() * text_percent + background.red() * background_percent) / 100),
-            round(
-                (text.green() * text_percent + background.green() * background_percent) / 100
-            ),
-            round((text.blue() * text_percent + background.blue() * background_percent) / 100),
+            round(text.red() * weight + background.red() * (1 - weight)),
+            round(text.green() * weight + background.green() * (1 - weight)),
+            round(text.blue() * weight + background.blue() * (1 - weight)),
         )
-        if color_contrast_ratio(candidate, background) < 4.5:
-            break
-        result = candidate
-    return result
+        if color_contrast_ratio(candidate, background) >= 4.5:
+            return candidate
+    return text
 
 
-def apply_readable_muted_palette(widget: QWidget) -> None:
-    palette = QPalette(widget.palette())
-    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
-        text = palette.color(group, QPalette.ColorRole.WindowText)
-        background = palette.color(group, QPalette.ColorRole.Window)
-        palette.setColor(
-            group,
-            QPalette.ColorRole.WindowText,
-            readable_muted_color(text, background),
-        )
-    widget.setPalette(palette)
+def display_time(value: Any) -> str:
+    try:
+        return datetime.fromisoformat(str(value)).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return str(value or "unknown")
 
 
-def hover_border_edges(column: int, column_count: int) -> set[str]:
-    edges = {"top", "bottom"}
-    if column == 0:
-        edges.add("left")
-    if column == column_count - 1:
-        edges.add("right")
-    return edges
+def update_sort_key(row: JsonObject) -> tuple[int, str]:
+    order = {"Flake": 0, "Package": 1, "Rebuild": 2}
+    return order.get(str(row.get("type", "")), 9), str(row.get("name", "")).casefold()
 
 
-def channel_sort_key(channel: str) -> tuple[int, int, int, str]:
-    labels = [label.strip() for label in channel.split("/") if label.strip()]
-    folded_labels = [label.casefold() for label in labels]
-    if any("unstable" in label for label in folded_labels):
-        return (0, 0, 0, channel.casefold())
-    releases = [
-        (int(match.group(1)), int(match.group(2)))
-        for label in labels
-        if (match := re.fullmatch(r"(\d+)\.(\d+)", label))
-    ]
-    if releases:
-        newest = max(releases)
-        return (1, -newest[0], -newest[1], channel.casefold())
-    if not labels or all(label == "unknown" for label in folded_labels):
-        return (3, 0, 0, channel.casefold())
-    return (2, 0, 0, channel.casefold())
-
-
-def update_sort_key(update: JsonObject) -> tuple[Any, ...]:
-    update_type = str(update.get("type", ""))
-    if update_type == "flake":
-        return (0, str(update.get("name", "")).casefold())
-    if update_type == "rebuild":
-        return (2, "")
-    return (
-        1,
-        *channel_sort_key(str(update.get("channel", "unknown"))),
-        str(update.get("name", "")).casefold(),
-    )
-
-
-PACKAGE_SET_PATTERNS = (
-    (re.compile(r"^python(?P<version>\d+(?:\.\d+)?)-"), "python", "Python"),
-    (re.compile(r"^perl(?P<version>\d+(?:\.\d+)*)-"), "perl", "Perl"),
-    (re.compile(r"^ruby(?P<version>\d+(?:\.\d+)*)-"), "ruby", "Ruby"),
-    (re.compile(r"^lua(?P<version>\d+(?:[._]\d+)*)-"), "lua", "Lua"),
-    (re.compile(r"^ghc(?P<version>\d+(?:\.\d+)*)-"), "ghc", "GHC"),
-    (re.compile(r"^emacs-"), "emacs", "Emacs"),
-)
-
-
-def package_set_identity(name: str) -> tuple[str, str] | None:
-    for pattern, key, label in PACKAGE_SET_PATTERNS:
-        match = pattern.match(name)
-        if match is None:
-            continue
-        version = str(match.groupdict().get("version") or "").replace("_", ".")
-        suffix = f" {version}" if version else ""
-        return (f"{key}:{version}", f"{label}{suffix} package set")
-    return None
-
-
-def group_package_update_rows(rows: list[JsonObject]) -> list[JsonObject]:
-    grouped: dict[tuple[str, str], list[JsonObject]] = {}
-    labels: dict[tuple[str, str], str] = {}
-    ungrouped: list[JsonObject] = []
-    for row in rows:
-        explicit_set = str(row.get("packageSet") or "")
-        identity = (
-            (f"explicit:{explicit_set}", explicit_set)
-            if explicit_set
-            else package_set_identity(str(row.get("name", "")))
-        )
-        if identity is None:
-            ungrouped.append(row)
-            continue
-        set_key, label = identity
-        key = (
-            "" if explicit_set else str(row.get("channel", "unknown")),
-            set_key,
-        )
-        grouped.setdefault(key, []).append(row)
-        labels[key] = label
-
-    result = list(ungrouped)
-    for key, members in grouped.items():
-        if len(members) == 1:
-            result.extend(members)
-            continue
-        keyed_channel, _set_key = key
-        member_channels = sorted(
-            {
-                str(member.get("channel", "unknown"))
-                for member in members
-                if str(member.get("channel", "unknown")) != "unknown"
-            },
-            key=lambda channel: channel_sort_key(channel),
-        )
-        channel = " / ".join(member_channels) or keyed_channel or "unknown"
-        count = len(members)
-        result.append(
-            {
-                "type": package_type_label(channel),
-                "channel": channel,
-                "name": labels[key],
-                "description": f"{count} package updates in this set",
-                "current": "Multiple versions",
-                "available": f"{count} updates",
-                "packageChanges": sorted(
-                    members, key=lambda member: str(member.get("name", "")).casefold()
-                ),
-                "updateCount": count,
-            }
-        )
-    return result
-
-
-def update_detail_lines(update: JsonObject) -> list[str]:
-    package_changes = update.get("packageChanges", [])
-    store_changes = update.get("storeChanges", [])
-    is_package = str(update.get("type", "")).startswith("nixPkg")
-    details = package_changes if package_changes else store_changes
-    if not details and is_package:
-        details = [update]
-    if not isinstance(details, list):
-        return []
-    lines: list[str] = []
-    for change in details:
+def report_rows(report: JsonObject) -> list[JsonObject]:
+    rows: list[JsonObject] = []
+    for change in report.get("inputs", []):
         if not isinstance(change, dict):
             continue
-        if package_changes or (is_package and not store_changes):
-            current = str(change.get("current", "unknown"))
-            available = str(change.get("available", "unknown"))
-            description = str(change.get("description") or "")
-        else:
-            before = change.get("before")
-            after = change.get("after")
-            current = package_version(before)
-            available = package_version(after)
-            description = str(
-                change.get("description")
-                or (after.get("description") if isinstance(after, dict) else "")
-                or (before.get("description") if isinstance(before, dict) else "")
-                or ""
+        rows.append(
+            {
+                "type": "Flake",
+                "name": str(change.get("name", "")),
+                "current": str((change.get("before") or {}).get("display", "missing")),
+                "available": str((change.get("after") or {}).get("display", "missing")),
+                "change": change,
+            }
+        )
+    packages = report.get("packages", {})
+    if not isinstance(packages, dict):
+        packages = {}
+    for change in packages.get("changes", []):
+        if not isinstance(change, dict):
+            continue
+        after = change.get("after") if isinstance(change.get("after"), dict) else None
+        before = change.get("before") if isinstance(change.get("before"), dict) else None
+        rows.append(
+            {
+                "type": "Package",
+                "name": str(change.get("name", "")),
+                "current": str((before or {}).get("version", "not installed")),
+                "available": (
+                    "removed" if after is None else str(after.get("version", "unversioned"))
+                ),
+                "change": change,
+            }
+        )
+    store_only = [
+        change for change in packages.get("storeOnlyChanges", []) if isinstance(change, dict)
+    ]
+    if store_only:
+        rows.append(
+            {
+                "type": "Rebuild",
+                "name": "Rebuilt dependencies",
+                "current": "",
+                "available": f"{len(store_only)} changes",
+                "changes": store_only,
+            }
+        )
+    rows.sort(key=update_sort_key)
+    return rows
+
+
+def update_detail_lines(row: JsonObject) -> list[str]:
+    if row.get("type") == "Rebuild":
+        lines = ["Rebuild-only dependency changes", ""]
+        for change in row.get("changes", []):
+            if not isinstance(change, dict):
+                continue
+            before_value = change.get("before")
+            after_value = change.get("after")
+            before = before_value if isinstance(before_value, dict) else {}
+            after = after_value if isinstance(after_value, dict) else {}
+            lines.extend(
+                [
+                    str(change.get("name", "")),
+                    "• "
+                    f"{before.get('version', 'unversioned')} → "
+                    f"{after.get('version', 'unversioned')}",
+                    "",
+                ]
             )
-        if lines:
-            lines.append("")
-        lines.append(str(change.get("name", "unknown")))
-        lines.append(f"• {current} → {available}")
-        if description:
-            lines.append(f"• {description}")
+        return lines[:-1]
+    lines = [str(row.get("name", ""))]
+    current = str(row.get("current", ""))
+    available = str(row.get("available", ""))
+    if current or available:
+        lines.append(f"• {current or 'missing'} → {available or 'missing'}")
+    change = row.get("change")
+    if isinstance(change, dict):
+        for side_name in ("before", "after"):
+            side = change.get(side_name)
+            if isinstance(side, dict) and side.get("url"):
+                lines.append(f"• {side_name.title()}: {side['url']}")
     return lines
 
 
-class UpdateItemDelegate(QStyledItemDelegate):
-    def item_option(self, option: QStyleOptionViewItem, index: Any) -> QStyleOptionViewItem:
-        item_option = QStyleOptionViewItem(option)
-        item_option.state &= ~QStyle.StateFlag.State_MouseOver
-        table = option.widget
-        if isinstance(table, UpdateTableWidget) and index.row() == table.hovered_row:
-            item_option.state &= ~QStyle.StateFlag.State_HasFocus
-        return item_option
+class HeaderBar(QWidget):
+    def __init__(self, window: QMainWindow, title: str) -> None:
+        super().__init__(window)
+        self.window = window
+        self.drag_origin: QPoint | None = None
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 8, 8)
+        self.menu_button = QPushButton("☰")
+        self.menu_button.setFixedWidth(34)
+        layout.addWidget(self.menu_button)
+        label = QLabel(title)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        layout.addWidget(label)
+        layout.addStretch()
+        minimize = QPushButton("—")
+        close = QPushButton("×")
+        for button in (minimize, close):
+            button.setFixedSize(34, 28)
+            layout.addWidget(button)
+        minimize.clicked.connect(window.showMinimized)
+        close.clicked.connect(window.close)
 
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
-        item_option = self.item_option(option, index)
-        super().paint(painter, item_option, index)
-        self.paint_hover_overlay(painter, item_option, index)
-
-    def paint_hover_overlay(
-        self, painter: QPainter, option: QStyleOptionViewItem, index: Any
-    ) -> None:
-        table = option.widget
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        if not isinstance(table, UpdateTableWidget) or index.row() != table.hovered_row or selected:
-            return
-        fill = option.palette.highlight().color()
-        fill.setAlpha(38)
-        border = option.palette.highlight().color()
-        border.setAlpha(180)
-        rect = option.rect
-        edges = hover_border_edges(index.column(), table.columnCount())
-        painter.save()
-        painter.fillRect(rect, fill)
-        painter.setPen(QPen(border, 1))
-        if "top" in edges:
-            painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
-        if "bottom" in edges:
-            painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
-        if "left" in edges:
-            painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
-        if "right" in edges:
-            painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
-        painter.restore()
-
-
-class PackageNameDelegate(UpdateItemDelegate):
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: Any) -> None:
-        item_option = self.item_option(option, index)
-        self.initStyleOption(item_option, index)
-        name, _, description = item_option.text.partition("\n")
-        item_option.text = ""
-        style = item_option.widget.style() if item_option.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, item_option, painter)
-        self.paint_hover_overlay(painter, item_option, index)
-
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        primary = (
-            option.palette.highlightedText().color() if selected else option.palette.text().color()
-        )
-        secondary = (
-            primary
-            if selected
-            else readable_muted_color(
-                option.palette.text().color(), option.palette.base().color()
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_origin = (
+                event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
             )
-        )
-        text_rect = option.rect.adjusted(12, 7, -8, -5)
-        painter.save()
-        painter.setPen(primary)
-        painter.setFont(option.font)
-        visible_name = painter.fontMetrics().elidedText(
-            name, Qt.TextElideMode.ElideRight, text_rect.width()
-        )
-        painter.drawText(
-            text_rect,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-            visible_name,
-        )
-        if description:
-            secondary_font = QFont(option.font)
-            secondary_font.setPointSizeF(max(7.0, option.font.pointSizeF() - 1.0))
-            painter.setFont(secondary_font)
-            painter.setPen(secondary)
-            description_rect = text_rect.adjusted(0, 21, 0, 0)
-            visible_description = painter.fontMetrics().elidedText(
-                description, Qt.TextElideMode.ElideRight, description_rect.width()
-            )
-            painter.drawText(
-                description_rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-                visible_description,
-            )
-        painter.restore()
+        super().mousePressEvent(event)
 
-    def sizeHint(self, option: QStyleOptionViewItem, index: Any) -> QSize:
-        size = super().sizeHint(option, index)
-        return QSize(size.width(), max(56, size.height()))
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.drag_origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window.move(event.globalPosition().toPoint() - self.drag_origin)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self.drag_origin = None
+        super().mouseReleaseEvent(event)
 
 
-class UpdateTableWidget(QTableWidget):
+class HoverTable(QTableWidget):
     def __init__(self) -> None:
         super().__init__(0, 3)
         self.hovered_row = -1
         self.setMouseTracking(True)
+        self.cellEntered.connect(self.set_hovered_row)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        self.set_hovered_row(self.rowAt(event.position().toPoint().y()))
-        super().mouseMoveEvent(event)
-
-    def leaveEvent(self, event: Any) -> None:
-        self.set_hovered_row(-1)
-        super().leaveEvent(event)
-
-    def set_hovered_row(self, row: int) -> None:
+    def set_hovered_row(self, row: int, _column: int = 0) -> None:
         if row == self.hovered_row:
             return
+        old_row = self.hovered_row
         self.hovered_row = row
-        self.viewport().update()
+        self._paint_hover(old_row, False)
+        self._paint_hover(row, True)
+
+    def _paint_hover(self, row: int, active: bool) -> None:
+        if not 0 <= row < self.rowCount():
+            return
+        color = self.palette().color(QPalette.ColorRole.Highlight)
+        color.setAlpha(38)
+        brush = QBrush(color) if active else QBrush()
+        for column in range(self.columnCount()):
+            item = self.item(row, column)
+            if item is not None:
+                item.setBackground(brush)
+
+    def leaveEvent(self, event: Any) -> None:
+        old_row = self.hovered_row
+        self.hovered_row = -1
+        self._paint_hover(old_row, False)
+        super().leaveEvent(event)
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent: QWidget, repository: str, settings: QSettings) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.resize(560, 220)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        repository_row = QWidget()
+        repository_layout = QHBoxLayout(repository_row)
+        repository_layout.setContentsMargins(0, 0, 0, 0)
+        self.repository = QLineEdit(repository)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self.browse)
+        repository_layout.addWidget(self.repository, 1)
+        repository_layout.addWidget(browse)
+        form.addRow("NixOS flake", repository_row)
+        self.garbage_collection = QCheckBox("Garbage collect after a successful rebuild")
+        self.garbage_collection.setChecked(
+            settings.value("garbageCollectionEnabled", False, type=bool)
+        )
+        form.addRow("Cleanup", self.garbage_collection)
+        self.retention = QSpinBox()
+        self.retention.setRange(1, 3650)
+        self.retention.setSuffix(" days")
+        self.retention.setValue(settings.value("garbageCollectionDays", 30, type=int))
+        form.addRow("Keep generations", self.retention)
+        layout.addLayout(form)
+        note = QLabel(
+            "Background checks always perform a thermally limited candidate build. "
+            "Candidate builds can increase Nix store usage, so periodic garbage collection "
+            "is recommended. Configured cleanup runs only after an applied rebuild. Refresh "
+            "and Rebuild are unrestricted because they are explicitly requested."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def browse(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "Choose NixOS flake", self.repository.text()
+        )
+        if selected:
+            self.repository.setText(selected)
 
 
 class UpdateCheckerWindow(QMainWindow):
@@ -416,628 +311,249 @@ class UpdateCheckerWindow(QMainWindow):
         super().__init__()
         self.repository = canonical_path(repository)
         self.report_path = Path(report_path)
-        self.use_tray = tray_enabled and QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray_enabled = tray_enabled and QSystemTrayIcon.isSystemTrayAvailable()
         self.settings = QSettings("nixos-update-checker", "nixos-update-checker")
-        self.report_timer = QTimer(self)
-        self.base_icon = self._load_icon()
-        self.tray: QSystemTrayIcon | None = None
-        self.process: QProcess | None = None
-        self.active_job = ""
-        self.job_interactive = False
-        self.stdout = bytearray()
-        self.stderr = bytearray()
         self.last_report: JsonObject = {}
         self.report_mtime_ns = 0
-        self.last_notified = ""
-        self.pending_settings_temp: Path | None = None
-        self.quitting = False
-        self.close_hint_shown = False
-        self.system_values: dict[str, QLabel] = {}
-        self.system_window: QDialog | None = None
-        self.pending_rebuild_configuration = ""
-
-        self.setWindowIcon(self.base_icon)
+        self.process: QProcess | None = None
+        self.active_job = ""
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.pending_configuration = ""
+        self.quit_requested = False
         self.setWindowTitle("NixOS Update Checker")
-        self.setMinimumSize(900, 640)
-        self.resize(1120, 780)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self.resize(1080, 720)
         self._build_ui()
-        self._build_menus()
+        self._build_menu()
         self._build_tray()
-
-        geometry = self.settings.value("windowGeometry")
-        if geometry:
-            self.restoreGeometry(geometry)
-        self.report_timer.setInterval(15_000)
+        self.report_timer = QTimer(self)
         self.report_timer.timeout.connect(self.load_cached_report)
-        self.report_timer.start()
+        self.report_timer.start(5000)
         self.load_cached_report()
-        QTimer.singleShot(750, self.start_automatic_check)
-
-    def _load_icon(self) -> QIcon:
-        icon_path = environment("NIXOS_UPDATE_CHECKER_ICON")
-        if icon_path and Path(icon_path).exists():
-            icon = QIcon(icon_path)
-            if not icon.isNull():
-                return icon
-        themed = QIcon.fromTheme("software-update-available")
-        if not themed.isNull():
-            return themed
-        return self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
-
-    def _status_icon(self, color: QColor | None = None) -> QIcon:
-        pixmap = self.base_icon.pixmap(64, 64)
-        if color is None or not color.isValid():
-            return QIcon(pixmap)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(Qt.GlobalColor.white, 2))
-        painter.setBrush(color)
-        painter.drawEllipse(42, 42, 19, 19)
-        painter.end()
-        return QIcon(pixmap)
 
     def _build_ui(self) -> None:
-        central = QWidget(self)
-        central.setObjectName("applicationSurface")
-        root = QVBoxLayout(central)
-        root.setContentsMargins(16, 14, 16, 10)
-        root.setSpacing(10)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(0)
+        self.header = HeaderBar(self, "NixOS Update Checker")
+        layout.addWidget(self.header)
 
-        command_bar = QFrame()
-        command_bar.setObjectName("commandBar")
-        command_layout = QHBoxLayout(command_bar)
-        command_layout.setContentsMargins(14, 10, 12, 10)
-        information = QHBoxLayout()
-        information.setSpacing(24)
-        self.package_count = self._summary_value("Package updates")
-        self.flake_count = self._summary_value("Flake updates")
-        self.rebuild_state = self._summary_value("Rebuild")
-        self.rebuild_state.setToolTip(
-            "Whether the saved NixOS configuration differs from the currently running system."
-        )
-        information.addWidget(self.package_count)
-        information.addWidget(self.flake_count)
-        information.addWidget(self.rebuild_state)
-        command_layout.addLayout(information)
-        command_layout.addStretch()
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(16, 12, 16, 16)
+        actions = QHBoxLayout()
+        self.package_summary = self._summary_widget("Packages")
+        self.flake_summary = self._summary_widget("Flakes")
+        self.rebuild_summary = self._summary_widget("Rebuild-only")
+        actions.addWidget(self.package_summary)
+        actions.addWidget(self.flake_summary)
+        actions.addWidget(self.rebuild_summary)
+        actions.addStretch()
+        self.refresh_button = QPushButton("Refresh")
+        self.rebuild_button = QPushButton("Rebuild")
+        self.refresh_button.clicked.connect(self.start_refresh)
+        self.rebuild_button.clicked.connect(self.confirm_rebuild)
+        actions.addWidget(self.refresh_button)
+        actions.addWidget(self.rebuild_button)
+        body_layout.addLayout(actions)
+
+        self.status = QLabel("No report loaded")
+        body_layout.addWidget(self.status)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setFixedSize(120, 5)
         self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
         self.progress.hide()
-        command_layout.addWidget(self.progress)
-        self.check_button = QPushButton("Refresh")
-        self.check_button.setObjectName("primaryAction")
-        self.check_button.setToolTip("Build the updated system closure without applying it")
-        self.check_button.clicked.connect(self.start_manual_check)
-        self.rebuild_button = QPushButton("Rebuild")
-        self.rebuild_button.clicked.connect(self.confirm_rebuild)
-        command_layout.addWidget(self.check_button)
-        command_layout.addWidget(self.rebuild_button)
-        root.addWidget(command_bar)
-
-        self.update_table = UpdateTableWidget()
-        self.update_table.setObjectName("updateTable")
-        self.update_table.setHorizontalHeaderLabels(["Type", "Package", "New version"])
-        self.update_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.update_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.update_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.update_table.setAlternatingRowColors(False)
-        self.update_table.setShowGrid(False)
-        self.update_table.setWordWrap(True)
-        self.update_table.verticalHeader().setVisible(False)
-        self.update_table.verticalHeader().setDefaultSectionSize(56)
-        header = self.update_table.horizontalHeader()
-        header.setHighlightSections(False)
-        header.setSectionsMovable(False)
-        header.setStretchLastSection(True)
-        header.setMinimumSectionSize(70)
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.update_table.setColumnWidth(0, 190)
-        self.update_table.setColumnWidth(1, 660)
-        self.update_table.setColumnWidth(2, 170)
-        self.update_table.setItemDelegate(UpdateItemDelegate(self.update_table))
-        self.update_table.setItemDelegateForColumn(1, PackageNameDelegate(self.update_table))
-        self.update_table.itemSelectionChanged.connect(self.update_selection_information)
-
-        self.information_tabs = QTabWidget()
-        self.information_tabs.setDocumentMode(True)
-        self.information_tabs.addTab(self._build_information_panel(), "Information")
-        self.information_tabs.addTab(self._build_activity_panel(), "Activity")
+        body_layout.addWidget(self.progress)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self.update_table)
-        splitter.addWidget(self.information_tabs)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([590, 145])
-        root.addWidget(splitter, 1)
-        self.setCentralWidget(central)
-        self.status_message = QLabel("Idle")
-        self.statusBar().addWidget(self.status_message, 1)
-        self.last_checked = QLabel("Last checked: never")
-        self.last_checked.setObjectName("mutedText")
-        apply_readable_muted_palette(self.last_checked)
-        self.statusBar().addPermanentWidget(self.last_checked)
-        self.setStyleSheet(
-            "QWidget#applicationSurface { background: palette(base); } "
-            "QFrame#commandBar { border: 1px solid palette(mid); border-radius: 7px; "
-            "background: palette(alternate-base); } "
-            "QLabel#summaryLabel { font-size: 12px; } "
-            "QLabel#summaryLabel::first-line { font-weight: 700; } "
-            "QLabel#informationTitle { font-size: 16px; font-weight: 650; } "
-            "QPushButton, QToolButton { min-height: 30px; padding: 2px 12px; } "
-            "QPushButton#primaryAction { background: #2673d9; color: white; border: none; "
-            "border-radius: 5px; font-weight: 650; padding: 4px 16px; } "
-            "QPushButton#primaryAction:hover { background: #3583eb; } "
-            "QHeaderView::section { padding: 10px 12px; border: none; "
-            "border-bottom: 1px solid palette(mid); "
-            "font-weight: 650; } "
-            "QTableWidget#updateTable { border: 1px solid palette(mid); "
-            "selection-background-color: palette(highlight); "
-            "selection-color: palette(highlighted-text); } "
-            "QTableWidget#updateTable::item { padding: 8px 12px; border: none; } "
-            "QProgressBar { border: none; background: palette(alternate-base); } "
-            "QProgressBar::chunk { background: #3daee9; }"
+        self.table = HoverTable()
+        self.table.setHorizontalHeaderLabels(["Type", "Package", "Available"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 150)
+        self.table.setColumnWidth(2, 190)
+        self.table.itemSelectionChanged.connect(self.update_information)
+        splitter.addWidget(self.table)
+
+        tabs = QTabWidget()
+        self.information = QPlainTextEdit()
+        self.information.setReadOnly(True)
+        self.information.setPlaceholderText(
+            "Select an update to see its current version and paths."
         )
-
-    def _summary_value(self, label: str) -> QLabel:
-        value = QLabel()
-        value.setObjectName("summaryLabel")
-        self.set_summary_value(value, "0", label)
-        return value
-
-    def set_summary_value(self, widget: QLabel, value: str, label: str) -> None:
-        widget.setProperty("summaryValue", value)
-        widget.setText(
-            f'<span style="font-size: 21px; font-weight: 700">{value}</span><br>'
-            f'<span style="font-size: 11px">{label}</span>'
-        )
-
-    def _build_information_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 8)
-        self.information_title = QLabel("Select an update")
-        self.information_title.setObjectName("informationTitle")
-        self.information_description = QLabel(
-            "Select a row above to see its current version and source details."
-        )
-        self.information_description.setObjectName("mutedText")
-        self.information_description.setWordWrap(True)
-        apply_readable_muted_palette(self.information_description)
-        details = QHBoxLayout()
-        self.information_type = QLabel("Type: —")
-        self.information_current = QLabel("Current: —")
-        self.information_available = QLabel("Available: —")
-        details.addWidget(self.information_type)
-        details.addWidget(self.information_current)
-        details.addWidget(self.information_available)
-        details.addStretch()
-        layout.addWidget(self.information_title)
-        layout.addWidget(self.information_description)
-        layout.addLayout(details)
-        self.information_list = QPlainTextEdit()
-        self.information_list.setReadOnly(True)
-        self.information_list.setVisible(False)
-        layout.addWidget(self.information_list, 1)
-        layout.addStretch()
-        return panel
-
-    def _build_activity_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(6, 6, 6, 6)
         self.activity = QPlainTextEdit()
         self.activity.setReadOnly(True)
-        self.activity.document().setMaximumBlockCount(3000)
-        header = QHBoxLayout()
-        heading = QLabel("Activity log")
-        heading.setObjectName("sectionTitle")
-        header.addWidget(heading)
-        header.addStretch()
-        clear = QPushButton("Clear")
-        clear.clicked.connect(self.activity.clear)
-        header.addWidget(clear)
-        layout.addLayout(header)
-        layout.addWidget(self.activity)
-        return panel
+        self.activity.document().setMaximumBlockCount(1000)
+        tabs.addTab(self.information, "Information")
+        tabs.addTab(self.activity, "Activity")
+        splitter.addWidget(tabs)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([560, 140])
+        body_layout.addWidget(splitter, 1)
+        layout.addWidget(body, 1)
 
-    def _add_action(self, menu: QMenu, text: str, callback: Any) -> QAction:
-        action = QAction(text, self)
-        action.triggered.connect(callback)
-        menu.addAction(action)
-        return action
+    def _summary_widget(self, label: str) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 20, 4)
+        number = QLabel("0")
+        font = number.font()
+        font.setPointSize(font.pointSize() + 6)
+        font.setBold(True)
+        number.setFont(font)
+        number.setObjectName("number")
+        layout.addWidget(number)
+        layout.addWidget(QLabel(label))
+        return widget
 
-    def _build_menus(self) -> None:
-        file_menu = self.menuBar().addMenu("&File")
-        self._add_action(file_menu, "Settings…", self.edit_settings)
-        self._add_action(file_menu, "System state…", self.show_system_state)
-        file_menu.addSeparator()
-        self._add_action(file_menu, "Hide to tray", self.hide)
-        file_menu.addSeparator()
-        self._add_action(file_menu, "Quit", self.request_quit)
-        actions = self.menuBar().addMenu("&Actions")
-        self._add_action(actions, "Refresh", self.start_manual_check)
-        self._add_action(actions, "Rebuild", self.confirm_rebuild)
-        help_menu = self.menuBar().addMenu("&Help")
-        self._add_action(
-            help_menu,
-            "About",
-            lambda: QMessageBox.about(
-                self,
-                "About NixOS Update Checker",
-                f"<b>NixOS Update Checker {display_version()}</b><br><br>"
-                "Official Qt for Python interface for the currently running NixOS system.",
-            ),
+    def _set_summary(self, widget: QWidget, value: int) -> None:
+        number = widget.findChild(QLabel, "number")
+        if number is not None:
+            number.setText(str(value))
+
+    def _build_menu(self) -> None:
+        menu = QMenu(self)
+        settings_action = QAction("Settings…", self)
+        settings_action.triggered.connect(self.edit_settings)
+        state_action = QAction("System state…", self)
+        state_action.triggered.connect(self.show_system_state)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.request_quit)
+        menu.addAction(settings_action)
+        menu.addAction(state_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.header.menu_button.setMenu(menu)
+
+    def _icon(self) -> QIcon:
+        path = environment("NIXOS_UPDATE_CHECKER_ICON")
+        return (
+            QIcon(path)
+            if path and Path(path).is_file()
+            else self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         )
 
     def _build_tray(self) -> None:
-        if not self.use_tray:
+        self.tray: QSystemTrayIcon | None = None
+        if not self.tray_enabled:
             return
-        self.tray = QSystemTrayIcon(self.base_icon, self)
-        menu = QMenu(self)
-        self._add_action(menu, "Open NixOS Update Checker", self.show_and_raise)
-        menu.addSeparator()
-        self._add_action(menu, "Refresh", self.start_manual_check)
-        self._add_action(menu, "Rebuild…", self.confirm_rebuild)
-        menu.addSeparator()
-        self._add_action(menu, "Quit", self.request_quit)
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self._tray_activated)
-        self.tray.show()
+        tray = QSystemTrayIcon(self._icon(), self)
+        menu = QMenu()
+        show = menu.addAction("Show")
+        refresh = menu.addAction("Refresh")
+        quit_action = menu.addAction("Quit")
+        show.triggered.connect(self.show_and_raise)
+        refresh.triggered.connect(self.start_refresh)
+        quit_action.triggered.connect(self.request_quit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(lambda _reason: self.show_and_raise())
+        tray.show()
+        self.tray = tray
 
-    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason in (
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        ):
-            self.show_and_raise()
-
-    def set_repository(self, repository: str) -> None:
-        repository = canonical_path(repository)
-        if repository == self.repository:
-            return
-        self.repository = repository
-        self.settings.setValue("repository", repository)
-        self.report_mtime_ns = 0
-        self.last_report = {}
-        self.update_table.setRowCount(0)
-        self.set_summary_value(self.package_count, "0", "Package updates")
-        self.set_summary_value(self.flake_count, "0", "Flake updates")
-        self.set_summary_value(self.rebuild_state, "Unknown", "Rebuild")
-        self.clear_selection_information()
-        self.status_message.setText("Configuration source changed; refresh to check it")
-
-    def show_system_state(self) -> None:
-        if self.system_window is None:
-            window = QDialog(self)
-            window.setWindowTitle("NixOS system state")
-            window.resize(650, 420)
-            layout = QVBoxLayout(window)
-            form = QFormLayout()
-            fields = [
-                ("runningGeneration", "Running generation"),
-                ("nextBootGeneration", "Next-boot generation"),
-                ("configurationState", "Working configuration"),
-                ("nextBootState", "Next boot"),
-                ("rebootPending", "Reboot pending"),
-                ("reportSource", "Package report source"),
-                ("resourcePolicy", "Check resource policy"),
-            ]
-            for key, label in fields:
-                value = QLabel("Unknown")
-                value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                value.setWordWrap(True)
-                self.system_values[key] = value
-                form.addRow(f"{label}:", value)
-            layout.addLayout(form)
-            explanation = QLabel(
-                "The checker selects the NixOS configuration matching this machine and "
-                "compares it with the currently running system."
+    def validate_repository(self) -> bool:
+        if not (Path(self.repository) / "flake.nix").is_file():
+            QMessageBox.warning(
+                self, "Invalid NixOS flake", f"No flake.nix exists in:\n{self.repository}"
             )
-            explanation.setWordWrap(True)
-            layout.addWidget(explanation)
-            layout.addStretch()
-            close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-            close.rejected.connect(window.close)
-            layout.addWidget(close)
-            self.system_window = window
-        self.populate_system(self.last_report)
-        self.system_window.show()
-        self.system_window.raise_()
-        self.system_window.activateWindow()
-
-    def validate_target(self, interactive: bool = True) -> bool:
-        path = Path(self.repository)
-        if (path / "flake.nix").exists() and (path / "flake.lock").exists():
-            return True
-        detail = f"{self.repository} must contain both flake.nix and flake.lock."
-        self.status_message.setText("Invalid current-system configuration")
-        self.append_log(detail)
-        self.set_tray_state("error")
-        if interactive:
-            QMessageBox.critical(self, "Invalid current-system configuration", detail)
-        return False
-
-    @property
-    def settings_path(self) -> Path:
-        return Path(self.repository) / ".nixos-update-checker.json"
-
-    def read_repository_settings(self) -> RepositorySettings:
-        if not self.settings_path.exists():
-            return RepositorySettings()
-        try:
-            value = json.loads(self.settings_path.read_text())
-            if not isinstance(value, dict):
-                raise SettingsError("The settings file must contain a JSON object.")
-            return RepositorySettings.from_json(value)
-        except (OSError, json.JSONDecodeError, SettingsError) as error:
-            raise SettingsError(str(error)) from error
+            return False
+        return True
 
     def edit_settings(self) -> None:
-        if self.process is not None:
-            return
-        try:
-            current = self.read_repository_settings()
-        except SettingsError as error:
-            QMessageBox.critical(self, "Could not read settings", str(error))
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("NixOS Update Checker settings")
-        dialog.resize(680, 590)
-        layout = QVBoxLayout(dialog)
-        source_label = QLabel("NixOS configuration source")
-        source_label.setObjectName("informationTitle")
-        layout.addWidget(source_label)
-        source_layout = QHBoxLayout()
-        repository_edit = QLineEdit(self.repository)
-        source_layout.addWidget(repository_edit, 1)
-        browse = QToolButton()
-        browse.setText("Browse…")
-
-        def choose_source() -> None:
-            selected = QFileDialog.getExistingDirectory(
-                dialog, "Choose NixOS flake", repository_edit.text()
-            )
-            if selected:
-                repository_edit.setText(selected)
-
-        browse.clicked.connect(choose_source)
-        source_layout.addWidget(browse)
-        layout.addLayout(source_layout)
-        source_help = QLabel(
-            "This per-user choice is used by the GUI. The NixOS module separately "
-            "configures the source used by its background service."
-        )
-        source_help.setWordWrap(True)
-        apply_readable_muted_palette(source_help)
-        layout.addWidget(source_help)
-
-        package_label = QLabel(
-            "Additional package-valued NixOS options (one per line). Enabled module "
-            "options are discovered automatically; use this for exceptional choices "
-            "such as hardware.nvidia.package."
-        )
-        package_label.setWordWrap(True)
-        layout.addWidget(package_label)
-        package_options = QPlainTextEdit("\n".join(current.package_options))
-        package_options.setMaximumHeight(140)
-        layout.addWidget(package_options)
-
-        background_build = QCheckBox("Build the candidate system during background checks")
-        background_build.setChecked(current.background_build)
-        layout.addWidget(background_build)
-        build_warning = QLabel(
-            "Real builds produce the most accurate closure report, but may run for a long "
-            "time and increase Nix store usage. Periodic garbage collection is recommended."
-        )
-        build_warning.setWordWrap(True)
-        apply_readable_muted_palette(build_warning)
-        layout.addWidget(build_warning)
-
-        garbage_collection = QCheckBox(
-            "Garbage collect old generations after a successful system rebuild"
-        )
-        garbage_collection.setChecked(current.garbage_collection_enabled)
-        layout.addWidget(garbage_collection)
-        retention_layout = QHBoxLayout()
-        retention_layout.addWidget(QLabel("Delete generations older than:"))
-        retention_days = QSpinBox()
-        retention_days.setRange(1, 3650)
-        retention_days.setValue(current.garbage_collection_older_than_days)
-        retention_days.setSuffix(" days")
-        retention_days.setEnabled(current.garbage_collection_enabled)
-        garbage_collection.toggled.connect(retention_days.setEnabled)
-        retention_layout.addWidget(retention_days)
-        retention_layout.addStretch()
-        layout.addLayout(retention_layout)
-        gc_warning = QLabel(
-            "Garbage collection runs only after Rebuild succeeds. It removes old "
-            "generations and unreferenced store paths, so older rollbacks beyond the "
-            "retention period will no longer be available."
-        )
-        gc_warning.setWordWrap(True)
-        apply_readable_muted_palette(gc_warning)
-        layout.addWidget(gc_warning)
-        layout.addStretch()
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
+        dialog = SettingsDialog(self, self.repository, self.settings)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-
-        repository = canonical_path(repository_edit.text().strip())
-        repository_path = Path(repository)
-        if (
-            not (repository_path / "flake.nix").exists()
-            or not (repository_path / "flake.lock").exists()
-        ):
-            QMessageBox.critical(
-                self,
-                "Invalid NixOS configuration source",
-                f"{repository} must contain both flake.nix and flake.lock.",
-            )
-            return
-        self.set_repository(repository)
-
-        options = [
-            line.strip() for line in package_options.toPlainText().splitlines() if line.strip()
-        ]
-        invalid = next(
-            (option for option in options if OPTION_PATH.fullmatch(option) is None), None
-        )
-        if invalid:
-            QMessageBox.critical(
-                self, "Invalid package option", f"{invalid} is not a NixOS option path."
-            )
-            return
-        updated = RepositorySettings(
-            package_options=sorted(set(options)),
-            background_build=background_build.isChecked(),
-            garbage_collection_enabled=garbage_collection.isChecked(),
-            garbage_collection_older_than_days=retention_days.value(),
-        )
-        data = json.dumps(updated.to_json(), indent=2) + "\n"
-        try:
-            self.settings_path.write_text(data)
-        except OSError:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                prefix="nixos-update-checker-settings-",
-                suffix=".json",
-                delete=False,
-            ) as stream:
-                stream.write(data)
-                self.pending_settings_temp = Path(stream.name)
-            self.start_process(
-                "settings",
-                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
-                [
-                    environment("NIXOS_UPDATE_CHECKER_INSTALL", "install"),
-                    "-m",
-                    "0644",
-                    str(self.pending_settings_temp),
-                    str(self.settings_path),
-                ],
-                "Saving settings…",
-                True,
-            )
-            return
-        self.append_log(f"Saved settings to {self.settings_path}")
-        self.start_automatic_check()
+        repository = canonical_path(dialog.repository.text())
+        self.settings.setValue("repository", repository)
+        self.settings.setValue("garbageCollectionEnabled", dialog.garbage_collection.isChecked())
+        self.settings.setValue("garbageCollectionDays", dialog.retention.value())
+        if repository != self.repository:
+            self.repository = repository
+            self.last_report = {}
+            self.report_mtime_ns = 0
+            self.populate_report({})
+            self.load_cached_report()
 
     def load_cached_report(self) -> bool:
         try:
             stat = self.report_path.stat()
         except OSError:
             return False
-        if self.report_mtime_ns and stat.st_mtime_ns == self.report_mtime_ns:
+        if stat.st_mtime_ns == self.report_mtime_ns:
             return bool(self.last_report)
         try:
             report = json.loads(self.report_path.read_text())
         except (OSError, json.JSONDecodeError) as error:
-            self.append_log(f"Could not parse background report: {error}")
+            self.append_log(f"Could not read background report: {error}")
             return False
         if not isinstance(report, dict):
             return False
-        report_repository = report.get("repository")
-        if report_repository and canonical_path(str(report_repository)) != self.repository:
-            self.status_message.setText("Background report belongs to a different repository")
-            self.report_mtime_ns = stat.st_mtime_ns
+        if canonical_path(str(report.get("repository", ""))) != self.repository:
             return False
         self.report_mtime_ns = stat.st_mtime_ns
-        self.apply_report(report, "background service", bool(self.last_report))
+        self.apply_report(report, "background service")
         return True
 
-    def start_check(self, interactive: bool, real_build: bool) -> None:
-        if self.process is not None or not self.validate_target(interactive):
+    def start_refresh(self) -> None:
+        if self.process is not None or not self.validate_repository():
             return
         self.start_process(
-            "check",
+            "refresh",
             environment("NIXOS_UPDATE_CHECKER_BACKEND", "check-nixos-updates"),
-            interactive_check_arguments(self.repository, real_build=real_build),
-            "Building and checking the candidate system…"
-            if real_build
-            else "Checking for updates…",
-            interactive,
+            ["--json", self.repository],
+            "Building and comparing the candidate system…",
         )
 
-    def start_automatic_check(self) -> None:
-        self.start_check(False, False)
-
-    def start_manual_check(self) -> None:
-        self.start_check(True, True)
-
-    def start_post_rebuild_check(self) -> None:
-        self.start_check(False, True)
-
     def confirm_rebuild(self) -> None:
-        self.show_and_raise()
-        if self.process is not None or not self.validate_target():
+        if self.process is not None or not self.validate_repository():
             return
         configuration = str(self.last_report.get("configuration", ""))
         if not configuration:
             QMessageBox.information(
-                self,
-                "Check required",
-                "Run a successful update check before rebuilding so the current NixOS "
-                "configuration can be discovered.",
+                self, "Refresh required", "Refresh successfully before rebuilding."
             )
             return
-        garbage_collection_note = ""
-        try:
-            settings = self.read_repository_settings()
-            if settings.garbage_collection_enabled:
-                garbage_collection_note = (
-                    f"\n\nAfter a successful rebuild, generations older than "
-                    f"{settings.garbage_collection_older_than_days} days will be garbage collected."
-                )
-        except SettingsError:
-            pass
+        note = ""
+        if self.settings.value("garbageCollectionEnabled", False, type=bool):
+            days = self.settings.value("garbageCollectionDays", 30, type=int)
+            note = f"\n\nGenerations older than {days} days will then be garbage collected."
         answer = QMessageBox.question(
             self,
             "Update and rebuild NixOS?",
-            "This will update the flake lock file, then request administrator "
-            "authorization to rebuild and switch the running system."
-            f"{garbage_collection_note}\n\nContinue?",
+            "This updates the real flake.lock, rebuilds, and switches the running system."
+            f"{note}\n\nContinue?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.pending_rebuild_configuration = configuration
-        lock_path = Path(self.repository) / "flake.lock"
-        authorization = not os.access(lock_path, os.W_OK) or not os.access(self.repository, os.W_OK)
+        self.pending_configuration = configuration
         nix = environment("NIXOS_UPDATE_CHECKER_NIX", "nix")
         arguments = ["flake", "update", "--flake", f"path:{self.repository}"]
-        if authorization:
-            self.start_process(
-                "update-for-rebuild",
-                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
-                [nix, *arguments],
-                "Updating the lock file before rebuilding…",
-                True,
-            )
+        lock_path = Path(self.repository) / "flake.lock"
+        if os.access(lock_path, os.W_OK) and os.access(self.repository, os.W_OK):
+            self.start_process("update-lock", nix, arguments, "Updating flake.lock…")
         else:
             self.start_process(
-                "update-for-rebuild",
-                nix,
-                arguments,
-                "Updating the lock file before rebuilding…",
-                True,
+                "update-lock",
+                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
+                [nix, *arguments],
+                "Updating flake.lock…",
             )
 
     def start_rebuild(self) -> None:
-        configuration = self.pending_rebuild_configuration
-        self.pending_rebuild_configuration = ""
-        if not configuration:
-            self.set_busy(False, "Rebuild configuration was lost")
-            return
+        configuration = self.pending_configuration
+        self.pending_configuration = ""
         target = f"path:{self.repository}#{configuration}"
         self.start_process(
             "rebuild",
@@ -1049,19 +565,10 @@ class UpdateCheckerWindow(QMainWindow):
                 target,
             ],
             "Rebuilding and switching NixOS…",
-            True,
         )
 
-    def start_process(
-        self,
-        job: str,
-        program: str,
-        arguments: list[str],
-        message: str,
-        interactive: bool,
-    ) -> None:
+    def start_process(self, job: str, program: str, arguments: list[str], message: str) -> None:
         self.active_job = job
-        self.job_interactive = interactive
         self.stdout.clear()
         self.stderr.clear()
         self.set_busy(True, message)
@@ -1071,7 +578,6 @@ class UpdateCheckerWindow(QMainWindow):
         process.setWorkingDirectory(self.repository)
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
-        process.errorOccurred.connect(self._process_error)
         process.finished.connect(self.process_finished)
         process.start(program, arguments)
 
@@ -1080,7 +586,7 @@ class UpdateCheckerWindow(QMainWindow):
             return
         chunk = bytes(self.process.readAllStandardOutput())
         self.stdout.extend(chunk)
-        if self.active_job != "check" and chunk.strip():
+        if self.active_job != "refresh" and chunk.strip():
             self.activity.appendPlainText(chunk.decode(errors="replace").strip())
 
     def _read_stderr(self) -> None:
@@ -1091,550 +597,220 @@ class UpdateCheckerWindow(QMainWindow):
         if chunk.strip():
             self.activity.appendPlainText(chunk.decode(errors="replace").strip())
 
-    def _process_error(self, error: QProcess.ProcessError) -> None:
-        if error != QProcess.ProcessError.FailedToStart or self.process is None:
-            return
-        detail = self.process.errorString()
-        job = self.active_job
-        self.process.deleteLater()
-        self.process = None
-        self.active_job = ""
-        self.cleanup_pending_settings()
-        self.set_busy(False, f"{job} could not start")
-        if self.job_interactive:
-            QMessageBox.critical(self, f"Could not start {job}", detail)
-
     def process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         if self.process is None:
             return
         self._read_stdout()
         self._read_stderr()
         job = self.active_job
-        interactive = self.job_interactive
         self.process.deleteLater()
         self.process = None
         self.active_job = ""
         if exit_code != 0:
             detail = bytes(self.stderr or self.stdout).decode(errors="replace").strip()
-            self.cleanup_pending_settings()
-            if job == "update-for-rebuild":
-                self.pending_rebuild_configuration = ""
+            self.pending_configuration = ""
             self.set_busy(False, f"{job} failed")
-            self.set_tray_state("error")
-            if interactive:
-                QMessageBox.critical(self, f"{job} failed", detail[-4000:])
+            QMessageBox.critical(self, f"{job} failed", detail[-5000:])
             return
-        if job == "check":
+        if job == "refresh":
             try:
                 report = json.loads(self.stdout)
                 if not isinstance(report, dict):
-                    raise ValueError("Checker report is not an object")
+                    raise ValueError("Report is not an object")
             except (json.JSONDecodeError, ValueError) as error:
-                self.set_busy(False, "Checker returned an invalid report")
-                self.set_tray_state("error")
-                if interactive:
-                    QMessageBox.critical(self, "Invalid checker report", str(error))
+                self.set_busy(False, "Invalid checker report")
+                QMessageBox.critical(self, "Invalid checker report", str(error))
                 return
-            self.apply_report(report, "interactive check", True)
-            self.set_busy(False, "Check complete")
+            self.apply_report(report, "Refresh")
+            self.set_busy(False, "Refresh complete")
             return
-        if job == "settings":
-            self.cleanup_pending_settings()
-            self.set_busy(False, "Settings saved")
-            QTimer.singleShot(0, self.start_automatic_check)
-            return
-        if job == "update-for-rebuild":
+        if job == "update-lock":
             self.start_rebuild()
             return
-        if job == "rebuild":
-            try:
-                settings = self.read_repository_settings()
-            except SettingsError as error:
-                self.append_log(f"Could not read garbage-collection settings: {error}")
-            else:
-                if settings.garbage_collection_enabled:
-                    self.start_process(
-                        "garbage-collect",
-                        environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
-                        [
-                            environment("NIXOS_UPDATE_CHECKER_GC", "nix-collect-garbage"),
-                            *garbage_collection_arguments(
-                                settings.garbage_collection_older_than_days
-                            ),
-                        ],
-                        "System rebuilt; garbage collecting old generations…",
-                        True,
-                    )
-                    return
-        if job == "garbage-collect":
-            label = "System rebuild and garbage collection complete"
-        else:
-            label = "System rebuild complete"
-        self.set_busy(False, label)
-        QTimer.singleShot(0, self.start_post_rebuild_check)
-
-    def cleanup_pending_settings(self) -> None:
-        if self.pending_settings_temp is not None:
-            self.pending_settings_temp.unlink(missing_ok=True)
-            self.pending_settings_temp = None
+        if job == "rebuild" and self.settings.value("garbageCollectionEnabled", False, type=bool):
+            days = self.settings.value("garbageCollectionDays", 30, type=int)
+            self.start_process(
+                "garbage-collect",
+                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
+                [
+                    environment("NIXOS_UPDATE_CHECKER_GC", "nix-collect-garbage"),
+                    *garbage_collection_arguments(days),
+                ],
+                "Garbage collecting old generations…",
+            )
+            return
+        self.set_busy(False, "Rebuild complete")
+        QTimer.singleShot(0, self.start_refresh)
 
     def set_busy(self, busy: bool, message: str) -> None:
-        for widget in (self.check_button, self.rebuild_button):
-            widget.setEnabled(not busy)
+        self.refresh_button.setEnabled(not busy)
+        self.rebuild_button.setEnabled(not busy)
         self.progress.setVisible(busy)
-        self.status_message.setText(message)
-        if busy:
-            self.set_tray_state("busy")
+        self.status.setText(message)
 
-    def apply_report(self, report: JsonObject, source: str, notify: bool) -> None:
+    def apply_report(self, report: JsonObject, source: str) -> None:
         if report.get("schemaVersion") != SCHEMA_VERSION:
-            self.status_message.setText("Unsupported checker report; upgrade GUI and backend")
-            self.set_tray_state("error")
-            return
-        if report.get("status") != "success":
-            error = report.get("error", {})
-            self.status_message.setText(str(error.get("message", "The background checker failed.")))
-            self.last_checked.setText(f"Last attempt: {display_time(report.get('generatedAt'))}")
-            diagnostics = str(error.get("diagnostics", "")).strip()
-            if diagnostics:
-                self.activity.appendPlainText(diagnostics)
-            self.set_tray_state("error")
+            self.status.setText("Unsupported report version")
             return
         self.last_report = report
-        inputs = report.get("inputs", [])
-        packages_object = report.get("packages", {})
-        reported_packages = packages_object.get("changes", [])
-        packages = [change for change in reported_packages if change.get("kind") != "store"]
-        reported_dependencies = packages_object.get("dependencyChanges", [])
-        dependencies = [change for change in reported_dependencies if change.get("kind") != "store"]
-        package_updates = [*packages, *dependencies]
-        store_only = [
-            change
-            for change in [*reported_packages, *reported_dependencies]
-            if change.get("kind") == "store"
+        if report.get("status") != "success":
+            error = report.get("error", {})
+            self.status.setText(str((error or {}).get("message", "Background check failed")))
+            return
+        self.populate_report(report)
+        generated = display_time(report.get("generatedAt"))
+        build = report.get("build", {})
+        elapsed = float((build or {}).get("elapsedSeconds", 0))
+        mode = "background" if (build or {}).get("background") else "interactive"
+        self.status.setText(f"{source} · {generated} · {mode} build {elapsed:.1f}s")
+        if self.tray is not None:
+            count = len(report.get("inputs", [])) + len(
+                (report.get("packages", {}) or {}).get("changes", [])
+            )
+            self.tray.setToolTip(f"NixOS Update Checker · {count} updates")
+
+    def populate_report(self, report: JsonObject) -> None:
+        rows = report_rows(report)
+        self.table.setRowCount(len(rows))
+        for row_number, row in enumerate(rows):
+            values = [str(row.get(key, "")) for key in ("type", "name", "available")]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, row)
+                self.table.setItem(row_number, column, item)
+        packages = report.get("packages", {}) if isinstance(report, dict) else {}
+        package_changes = packages.get("changes", []) if isinstance(packages, dict) else []
+        store_only = packages.get("storeOnlyChanges", []) if isinstance(packages, dict) else []
+        self._set_summary(self.package_summary, len(package_changes))
+        self._set_summary(self.flake_summary, len(report.get("inputs", [])))
+        self._set_summary(self.rebuild_summary, len(store_only))
+        self.information.clear()
+
+    def update_information(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            self.information.clear()
+            return
+        item = self.table.item(selected[0].row(), 0)
+        row = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        self.information.setPlainText("\n".join(update_detail_lines(row or {})))
+
+    def show_system_state(self) -> None:
+        report = self.last_report
+        system = report.get("system", {}) if isinstance(report, dict) else {}
+        build = report.get("build", {}) if isinstance(report, dict) else {}
+        parallel = (build or {}).get("parallelism") or {}
+        lines = [
+            f"Repository: {self.repository}",
+            f"Configuration: {report.get('configuration', 'unknown')}",
+            f"Running generation: {(system or {}).get('runningGeneration', 'unknown')}",
+            f"Saved configuration: {(system or {}).get('configurationState', 'unknown')}",
+            f"Reboot pending: {'yes' if (system or {}).get('rebootPending') else 'no'}",
+            f"Candidate closure: {(build or {}).get('candidateSystem', 'unknown')}",
         ]
-        store_only.extend(packages_object.get("storeOnlyChanges", []))
-        system = report.get("system", {})
-        build = report.get("build", {})
-        updates = bool(report.get("updatesAvailable"))
-        rebuild = system.get("configurationState") == "differs"
-        self.set_summary_value(self.package_count, str(len(package_updates)), "Package updates")
-        self.set_summary_value(self.flake_count, str(len(inputs)), "Flake updates")
-        self.set_summary_value(
-            self.rebuild_state,
-            "Needed" if rebuild else "Not needed",
-            "Rebuild",
-        )
-        self.populate_updates(package_updates, inputs, store_only)
-        if updates:
-            source_label = "full build" if build.get("performed") else "fast evaluation"
-            notification_text = (
-                f"{len(package_updates)} package and {len(inputs)} flake updates "
-                f"from {source_label}"
+        if parallel:
+            lines.extend(
+                [
+                    "",
+                    "Background parallelism:",
+                    f"  Logical CPUs: {parallel.get('logical_cpus')}",
+                    f"  Worker budget: {parallel.get('worker_budget')}",
+                    "  Nix jobs × cores: "
+                    f"{parallel.get('max_jobs')} × {parallel.get('cores_per_job')}",
+                ]
             )
-            self.status_message.setText(notification_text)
-            self.set_tray_state("updates", len(package_updates) or len(inputs))
-        elif rebuild:
-            notification_text = "Configuration changes are ready to rebuild"
-            self.status_message.setText(notification_text)
-            self.set_tray_state("rebuild")
-        else:
-            notification_text = "The running system is up to date"
-            self.status_message.setText(notification_text)
-            self.set_tray_state("current")
-        generated = str(report.get("generatedAt", ""))
-        self.last_checked.setText(f"Last checked: {display_time(generated)}")
-        self.populate_system(report)
-        for option in packages_object.get("unresolvedOptions", []):
-            self.append_log(f"Configured package option was not found: {option}")
-        if notify and self.tray is not None and generated != self.last_notified:
-            self.last_notified = generated
-            if updates:
-                self.tray.showMessage(
-                    "NixOS updates available",
-                    notification_text,
-                    QSystemTrayIcon.MessageIcon.Information,
-                    9000,
-                )
-            elif rebuild:
-                self.tray.showMessage(
-                    "NixOS rebuild available",
-                    notification_text,
-                    QSystemTrayIcon.MessageIcon.Information,
-                    9000,
-                )
-
-    def populate_updates(
-        self,
-        packages: list[JsonObject],
-        inputs: list[JsonObject],
-        store_changes: list[JsonObject],
-    ) -> None:
-        package_rows: list[JsonObject] = []
-        for change in packages:
-            after = change.get("after")
-            before = change.get("before")
-            description = str(
-                change.get("description")
-                or (after or {}).get("description")
-                or (before or {}).get("description")
-                or ""
-            )
-            available = "removed" if change.get("kind") == "removed" else package_version(after)
-            channel = str(
-                change.get("channel")
-                or (after or {}).get("channel")
-                or (before or {}).get("channel")
-                or "unknown"
-            )
-            package_rows.append(
-                {
-                    "type": package_type_label(channel),
-                    "channel": channel,
-                    "name": str(change.get("name", "")),
-                    "description": description,
-                    "current": package_version(before),
-                    "available": available,
-                    "packageSet": change.get("packageSet"),
-                }
-            )
-        rows = group_package_update_rows(package_rows)
-        for change in inputs:
-            after = input_revision(change.get("after"))
-            rows.append(
-                {
-                    "type": "flake",
-                    "name": str(change.get("name", "")),
-                    "description": "Flake input",
-                    "current": input_revision(change.get("before")),
-                    "available": "removed" if after == "missing" else after,
-                }
-            )
-        if store_changes:
-            rows.append(
-                {
-                    "type": "rebuild",
-                    "name": "Rebuild-only package changes",
-                    "description": (
-                        f"{len(store_changes)} packages changed store paths without "
-                        "changing versions"
-                    ),
-                    "current": f"{len(store_changes)} current store paths",
-                    "available": f"{len(store_changes)} packages",
-                    "storeChanges": store_changes,
-                }
-            )
-        rows.sort(key=update_sort_key)
-        self.update_table.set_hovered_row(-1)
-        self.update_table.clearSelection()
-        self.update_table.setRowCount(len(rows))
-        for row, update in enumerate(rows):
-            type_item = QTableWidgetItem(str(update["type"]))
-            name_text = str(update["name"])
-            if update["description"]:
-                name_text += f"\n{update['description']}"
-            name_item = QTableWidgetItem(name_text)
-            available_item = QTableWidgetItem(str(update["available"]))
-            type_item.setData(Qt.ItemDataRole.UserRole, update)
-            self.update_table.setItem(row, 0, type_item)
-            self.update_table.setItem(row, 1, name_item)
-            self.update_table.setItem(row, 2, available_item)
-        self.clear_selection_information()
-
-    def clear_selection_information(self) -> None:
-        self.information_title.setText("Select an update")
-        self.information_description.setText(
-            "Select a row above to see its current version and source details."
-        )
-        self.information_type.setText("Type: —")
-        self.information_current.setText("Current: —")
-        self.information_available.setText("Available: —")
-        self.information_current.setVisible(True)
-        self.information_available.setVisible(True)
-        self.information_list.clear()
-        self.information_list.setVisible(False)
-
-    def update_selection_information(self) -> None:
-        rows = self.update_table.selectionModel().selectedRows()
-        if not rows:
-            self.clear_selection_information()
-            return
-        item = self.update_table.item(rows[0].row(), 0)
-        update = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(update, dict):
-            self.clear_selection_information()
-            return
-        self.information_title.setText(str(update.get("name", "")))
-        update_type = str(update.get("type", "—"))
-        is_package_details = update_type.startswith("nixPkg") or update_type == "rebuild"
-        self.information_description.setText(
-            "Update details"
-            if is_package_details
-            else str(update.get("description") or "No description is available.")
-        )
-        self.information_type.setText(f"Type: {update_type}")
-        self.information_current.setText(f"Current: {update.get('current', '—')}")
-        self.information_available.setText(f"Available: {update.get('available', '—')}")
-        self.information_current.setVisible(not is_package_details)
-        self.information_available.setVisible(not is_package_details)
-        lines = update_detail_lines(update)
-        if lines:
-            self.information_list.setPlainText("\n".join(lines))
-            self.information_list.setVisible(True)
-        else:
-            self.information_list.clear()
-            self.information_list.setVisible(False)
-
-    def populate_system(self, report: JsonObject) -> None:
-        if not self.system_values:
-            return
-        system = report.get("system", {})
-        policy = report.get("resourcePolicy", {})
-        packages = report.get("packages", {})
-        build = report.get("build", {})
-        self.system_values["runningGeneration"].setText(
-            str(system.get("runningGeneration", "Unknown"))
-        )
-        self.system_values["nextBootGeneration"].setText(
-            str(system.get("nextBootGeneration", "Unknown"))
-        )
-        configuration_labels = {
-            "applied": "Matches the running system",
-            "differs": "Differs from the running system",
-            "unavailable": "Unavailable",
-        }
-        boot_labels = {
-            "matches": "Matches the working configuration",
-            "differs": "Differs from the working configuration",
-            "unavailable": "Unavailable",
-        }
-        configuration_state = str(system.get("configurationState", "unavailable"))
-        boot_state = str(system.get("nextBootState", "unavailable"))
-        self.system_values["configurationState"].setText(
-            configuration_labels.get(configuration_state, configuration_state)
-        )
-        self.system_values["nextBootState"].setText(boot_labels.get(boot_state, boot_state))
-        self.system_values["rebootPending"].setText("Yes" if system.get("rebootPending") else "No")
-        if build.get("performed"):
-            report_source = (
-                f"Realized closure ({build.get('addedStorePaths', 0)} added, "
-                f"{build.get('removedStorePaths', 0)} removed store paths)"
-            )
-        elif packages.get("source") == "evaluatedManifestAgainstRunningClosure":
-            report_source = "Evaluated packages compared with running system"
-        else:
-            report_source = "Input changes only"
-        self.system_values["reportSource"].setText(report_source)
-        if policy.get("limited"):
-            resource_policy = (
-                f"CPU {policy.get('cpuQuota', 'limited')}, nice {policy.get('nice', 19)}, "
-                f"{policy.get('ioClass', 'idle')} I/O"
-            )
-        else:
-            resource_policy = "Unrestricted interactive operation"
-        self.system_values["resourcePolicy"].setText(resource_policy)
-
-    def set_tray_state(self, state: str, count: int = 0) -> None:
-        colors = {
-            "busy": QColor("#3498db"),
-            "updates": QColor("#f39c12"),
-            "rebuild": QColor("#8e44ad"),
-            "current": QColor("#27ae60"),
-            "error": QColor("#c0392b"),
-        }
-        icon = self._status_icon(colors.get(state))
-        if self.tray is None:
-            return
-        self.tray.setIcon(icon)
-        if state == "updates":
-            tooltip = f"NixOS Update Checker — {count} updates available"
-        elif state == "rebuild":
-            tooltip = "NixOS Update Checker — rebuild available"
-        elif state == "current":
-            tooltip = "NixOS Update Checker — up to date"
-        elif state == "error":
-            tooltip = "NixOS Update Checker — last check failed"
-        else:
-            tooltip = "NixOS Update Checker — working…"
-        self.tray.setToolTip(tooltip)
+        QMessageBox.information(self, "System state", "\n".join(lines))
 
     def append_log(self, message: str) -> None:
-        self.activity.appendPlainText(
-            f"[{QDateTime.currentDateTime().toString('HH:mm:ss')}] {message}"
-        )
+        self.activity.appendPlainText(message)
 
     def show_and_raise(self) -> None:
         self.show()
-        if self.isMinimized():
-            self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def request_quit(self) -> None:
-        if self.process is not None:
-            self.show_and_raise()
-            QMessageBox.information(
-                self, "Operation in progress", "Wait for the current operation to finish."
-            )
-            return
-        self.quitting = True
-        self.settings.setValue("windowGeometry", self.saveGeometry())
+        self.quit_requested = True
         if self.tray is not None:
             self.tray.hide()
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.settings.setValue("windowGeometry", self.saveGeometry())
-        if self.use_tray and not self.quitting:
-            self.hide()
+        if self.tray_enabled and not self.quit_requested:
             event.ignore()
-            if self.tray is not None and not self.close_hint_shown:
-                self.close_hint_shown = True
-                self.tray.showMessage(
-                    "NixOS Update Checker",
-                    "The application is still available from the system tray.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    5000,
-                )
-            return
-        event.accept()
+            self.hide()
+        else:
+            event.accept()
 
     def run_self_test(self) -> None:
-        report: JsonObject = {
+        sample = {
             "schemaVersion": SCHEMA_VERSION,
-            "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
             "status": "success",
             "repository": self.repository,
-            "configuration": "workstation",
-            "resourcePolicy": {
-                "limited": True,
-                "cpuQuota": "25%",
-                "nice": 19,
-                "ioClass": "idle",
-            },
-            "system": {
-                "runningGeneration": "system-1-link",
-                "nextBootGeneration": "system-1-link",
-                "configurationState": "applied",
-                "nextBootState": "matches",
-                "rebootPending": False,
-            },
+            "configuration": "test",
+            "generatedAt": datetime.now().astimezone().isoformat(),
             "inputs": [
                 {
                     "name": "nixpkgs",
-                    "before": {"display": "11111111"},
-                    "after": {"display": "22222222"},
+                    "before": {"display": "old"},
+                    "after": {"display": "new"},
                 }
             ],
             "packages": {
-                "source": "realizedClosure",
                 "changes": [
                     {
-                        "name": "example",
+                        "name": "hello",
                         "kind": "version",
-                        "before": {"version": "1.0"},
-                        "after": {
-                            "version": "2.0",
-                            "description": "Example package description",
-                        },
+                        "before": {"version": "1"},
+                        "after": {"version": "2"},
                     }
                 ],
-                "dependencyChanges": [
-                    {
-                        "name": "library-example",
-                        "kind": "version",
-                        "before": {"version": "3.0"},
-                        "after": {"version": "4.0"},
-                    }
-                ],
-                "storeOnlyChanges": [
-                    {
-                        "name": "rebuilt-example",
-                        "kind": "store",
-                        "before": {"version": "1.0"},
-                        "after": {"version": "1.0"},
-                    }
-                ],
-                "selectedOptions": [],
-                "unresolvedOptions": [],
+                "storeOnlyChanges": [{"name": "glibc", "kind": "store"}],
             },
-            "build": {"performed": True, "addedStorePaths": 4, "removedStorePaths": 2},
-            "updatesAvailable": True,
+            "system": {"configurationState": "applied", "rebootPending": False},
+            "build": {"elapsedSeconds": 1.2, "background": True},
         }
-        self.apply_report(report, "self-test", False)
-        self.update_table.selectRow(1)
-        selected_current = self.information_current.text()
-        self.update_table.selectRow(3)
-        store_information_rendered = (
-            not self.information_list.isHidden()
-            and "rebuilt-example" in self.information_list.toPlainText()
-        )
-        self.show_system_state()
-        system_state_rendered = self.system_values["runningGeneration"].text() == "system-1-link"
-        if self.system_window is not None:
-            self.system_window.close()
+        self.apply_report(sample, "self-test")
         if (
-            self.update_table.rowCount() != 4
-            or self.update_table.columnCount() != 3
-            or self.update_table.item(0, 0).text() != "flake"
-            or self.update_table.item(1, 0).text() != "nixPkg"
-            or self.update_table.item(3, 0).text() != "rebuild"
-            or "\n•" in self.update_table.item(1, 1).text()
-            or self.update_table.columnWidth(0) < 190
-            or self.package_count.property("summaryValue") != "2"
-            or self.flake_count.property("summaryValue") != "1"
-            or self.rebuild_state.property("summaryValue") != "Not needed"
-            or selected_current != "Current: 1.0"
-            or not store_information_rendered
-            or self.update_table.selectionBehavior() != QTableWidget.SelectionBehavior.SelectRows
-            or self.update_table.horizontalHeader().sectionResizeMode(0)
-            != QHeaderView.ResizeMode.Interactive
-            or not isinstance(self.update_table.itemDelegate(), UpdateItemDelegate)
-            or not isinstance(self.update_table.itemDelegateForColumn(1), PackageNameDelegate)
-            or not system_state_rendered
+            self.table.rowCount() != 3
+            or self.package_summary.findChild(QLabel, "number").text() != "1"
         ):
             raise RuntimeError("GUI report rendering self-test failed")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Qt for Python NixOS update checker for the running system"
-    )
+    parser = argparse.ArgumentParser(description="Open the NixOS Update Checker")
     parser.add_argument("repository", nargs="?")
-    parser.add_argument("--background", action="store_true")
-    parser.add_argument("--no-tray", action="store_true")
-    parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--report",
         default=environment(
             "NIXOS_UPDATE_CHECKER_REPORT", "/var/lib/nixos-update-checker/report.json"
         ),
     )
+    parser.add_argument("--no-tray", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {display_version()}")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    namespace = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
-    app = QApplication([sys.argv[0]])
+    namespace = build_parser().parse_args(argv)
+    app = QApplication(sys.argv[:1])
     app.setApplicationName("NixOS Update Checker")
-    app.setApplicationDisplayName("NixOS Update Checker")
     app.setOrganizationName("nixos-update-checker")
-    app.setApplicationVersion(display_version())
-    application_settings = QSettings("nixos-update-checker", "nixos-update-checker")
-    saved_repository = str(application_settings.value("repository", "") or "")
+    app.setQuitOnLastWindowClosed(namespace.no_tray)
+    settings = QSettings("nixos-update-checker", "nixos-update-checker")
     repository = initial_repository(
         namespace.repository,
-        saved_repository,
-        environment("NIXOS_UPDATE_CHECKER_REPOSITORY", "/etc/nixos"),
+        str(settings.value("repository", "")),
+        environment("NIXOS_UPDATE_CHECKER_REPOSITORY", "."),
     )
     window = UpdateCheckerWindow(repository, namespace.report, not namespace.no_tray)
-    app.setQuitOnLastWindowClosed(not window.use_tray)
     if namespace.self_test:
         window.run_self_test()
-        QTimer.singleShot(0, app.quit)
-    elif not namespace.background or not window.use_tray:
-        window.show()
+        return 0
+    window.show()
     return app.exec()
 
 

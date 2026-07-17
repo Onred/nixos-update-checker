@@ -6,340 +6,136 @@ from nixos_update_checker.logic import (
     ClosureInformation,
     ConfigurationCandidate,
     ConfigurationSelectionError,
-    RepositorySettings,
-    SettingsError,
+    choose_parallelism,
     compare_closures,
     compare_inputs,
-    compare_packages_to_closure,
-    enrich_package_changes,
     garbage_collection_arguments,
-    interactive_check_arguments,
     package_summary,
-    package_version_identity,
-    packages_matching_closure,
     parse_store_path,
-    partition_priority_changes,
     select_current_configuration,
     split_package_changes,
 )
 
 
-@pytest.mark.parametrize(
-    ("candidates", "hostname", "selected"),
-    [
-        ([ConfigurationCandidate("desktop-output", "different")], "running", "desktop-output"),
-        (
-            [
-                ConfigurationCandidate("workstation", "nixos"),
-                ConfigurationCandidate("server", "server-host"),
-            ],
-            "nixos",
-            "workstation",
-        ),
-        (
-            [
-                ConfigurationCandidate("one", "host-one"),
-                ConfigurationCandidate("two", "host-two"),
-                ConfigurationCandidate("three", "host-three"),
-            ],
-            "host-two",
-            "two",
-        ),
-        (
-            [ConfigurationCandidate("unknown"), ConfigurationCandidate("local", "nixos")],
-            "nixos",
-            "local",
-        ),
-        (
-            [
-                ConfigurationCandidate("laptop.prod", "laptop"),
-                ConfigurationCandidate("other", "other"),
-            ],
-            "laptop",
-            "laptop.prod",
-        ),
-    ],
-)
-def test_configuration_selection_success(
-    candidates: list[ConfigurationCandidate], hostname: str, selected: str
-) -> None:
-    assert select_current_configuration(candidates, hostname) == selected
+def path_info(*paths: tuple[str, int]) -> ClosureInformation:
+    return ClosureInformation.from_path_info(
+        {f"/nix/store/{size:032d}-{name}": {"narSize": size} for name, size in paths}
+    )
+
+
+def test_single_configuration_does_not_require_a_hostname_convention() -> None:
+    assert (
+        select_current_configuration([ConfigurationCandidate("desktop")], "unrelated") == "desktop"
+    )
+
+
+def test_multiple_configurations_select_the_running_hostname() -> None:
+    candidates = [
+        ConfigurationCandidate("workstation", "nixos"),
+        ConfigurationCandidate("server", "server"),
+    ]
+    assert select_current_configuration(candidates, "nixos") == "workstation"
 
 
 @pytest.mark.parametrize(
-    ("candidates", "hostname", "message"),
+    ("candidates", "message"),
     [
-        ([], "nixos", "exports no nixosConfigurations"),
+        ([], "exports no nixosConfigurations"),
+        ([ConfigurationCandidate("a", "other"), ConfigurationCandidate("b", "server")], "No NixOS"),
         (
-            [ConfigurationCandidate("one", "host-one"), ConfigurationCandidate("two", "host-two")],
-            "nixos",
-            "No NixOS configuration matches",
-        ),
-        (
-            [ConfigurationCandidate("one", "nixos"), ConfigurationCandidate("two", "nixos")],
-            "nixos",
-            "More than one NixOS configuration matches",
+            [ConfigurationCandidate("a", "host"), ConfigurationCandidate("b", "host")],
+            "More than one",
         ),
     ],
 )
-def test_configuration_selection_errors(
-    candidates: list[ConfigurationCandidate], hostname: str, message: str
+def test_ambiguous_configuration_cases_are_actionable(
+    candidates: list[ConfigurationCandidate], message: str
 ) -> None:
     with pytest.raises(ConfigurationSelectionError, match=message):
-        select_current_configuration(candidates, hostname)
+        select_current_configuration(candidates, "host")
+
+
+@pytest.mark.parametrize(
+    ("logical_cpus", "expected"),
+    [
+        (None, (1, 1, 1)),
+        (1, (1, 1, 1)),
+        (2, (2, 1, 2)),
+        (4, (4, 2, 2)),
+        (8, (8, 2, 4)),
+        (16, (16, 4, 4)),
+        (32, (32, 5, 6)),
+        (128, (32, 5, 6)),
+    ],
+)
+def test_parallelism_adapts_and_is_bounded(
+    logical_cpus: int | None, expected: tuple[int, int, int]
+) -> None:
+    selected = choose_parallelism(logical_cpus)
+    assert (selected.worker_budget, selected.max_jobs, selected.cores_per_job) == expected
+    assert 1 <= selected.max_jobs * selected.cores_per_job <= selected.worker_budget
+    assert 1 <= selected.substitution_jobs <= 4
 
 
 @pytest.mark.parametrize(
     ("path", "name", "version"),
     [
-        ("/nix/store/aaaaaaaa-qtbase-6.8.3", "qtbase", "6.8.3"),
-        ("/nix/store/bbbbbbbb-nvidia-x11-570.153.02", "nvidia-x11", "570.153.02"),
-        ("/nix/store/cccccccc-linux-6.12.40-modules", "linux", "6.12.40-modules"),
-        ("/nix/store/dddddddd-system-path", "system-path", ""),
+        ("/nix/store/hash-firefox-141.0", "firefox", "141.0"),
+        ("/nix/store/hash-nvidia-x11-610.1", "nvidia-x11", "610.1"),
+        ("/nix/store/hash-steam-1.0.0.85-shell-env", "steam", "1.0.0.85-shell-env"),
+        ("/nix/store/hash-unversioned", "unversioned", ""),
     ],
 )
-def test_store_path_parsing(path: str, name: str, version: str) -> None:
-    identity = parse_store_path(path)
-    assert identity.path == path
-    assert identity.name == name
-    assert identity.version == version
+def test_store_path_identity(path: str, name: str, version: str) -> None:
+    assert parse_store_path(path).name == name
+    assert parse_store_path(path).version == version
 
 
-def test_wrapper_package_without_version_uses_store_path_identity() -> None:
-    package = {
-        "name": "steam-1.0.0.85-shell-env",
-        "pname": None,
-        "version": None,
-        "path": "/nix/store/aaaaaaaa-steam-1.0.0.85-shell-env",
-    }
-    assert package_version_identity(package) == "1.0.0.85-shell-env"
-
-
-def test_fast_comparison_treats_unchanged_wrapper_version_as_store_only() -> None:
-    running = ClosureInformation.from_path_info(
-        {
-            "/nix/store/aaaaaaaa-steam-1.0.0.85": {"narSize": 10},
-            "/nix/store/bbbbbbbb-steam-1.0.0.85-shell-env": {"narSize": 20},
-        }
-    )
-    rebuilt_wrapper = {
-        "name": "steam-1.0.0.85-shell-env",
-        "pname": None,
-        "version": None,
-        "path": "/nix/store/cccccccc-steam-1.0.0.85-shell-env",
-    }
-    changes = compare_packages_to_closure(
-        running,
-        {"steam": rebuilt_wrapper},
-        {"steam": rebuilt_wrapper},
-    )
-    assert [(change["name"], change["kind"]) for change in changes] == [("steam", "store")]
-    assert changes[0]["after"]["version"] == "1.0.0.85-shell-env"
-
-
-def test_legacy_settings_defaults() -> None:
-    settings = RepositorySettings.from_json({"schemaVersion": 1, "packageOptions": []})
-    assert not settings.background_build
-    assert not settings.garbage_collection_enabled
-    assert settings.garbage_collection_older_than_days == 30
-
-
-def test_settings_round_trip() -> None:
-    expected = RepositorySettings(
-        package_options=["hardware.nvidia.package", "hardware.graphics.package"],
-        background_build=True,
-        garbage_collection_enabled=True,
-        garbage_collection_older_than_days=45,
-    )
-    actual = RepositorySettings.from_json(expected.to_json())
-    assert actual == RepositorySettings(
-        package_options=["hardware.graphics.package", "hardware.nvidia.package"],
-        background_build=True,
-        garbage_collection_enabled=True,
-        garbage_collection_older_than_days=45,
-    )
-
-
-@pytest.mark.parametrize("days", [0, 3651, 1.5, True])
-def test_settings_reject_invalid_retention(days: object) -> None:
-    with pytest.raises(SettingsError, match="between 1 and 3650"):
-        RepositorySettings.from_json(
-            {
-                "schemaVersion": 1,
-                "packageOptions": [],
-                "garbageCollection": {"enabled": True, "olderThanDays": days},
-            }
-        )
-
-
-def test_interactive_checks_are_unrestricted() -> None:
-    assert interactive_check_arguments("/etc/nixos", real_build=False) == [
-        "--json",
-        "--no-limit",
-        "/etc/nixos",
-    ]
-    assert interactive_check_arguments("/etc/nixos", real_build=True) == [
-        "--json",
-        "--no-limit",
-        "--build",
-        "/etc/nixos",
-    ]
-
-
-def test_garbage_collection_retention_argument() -> None:
-    assert garbage_collection_arguments(30) == ["--delete-older-than", "30d"]
-
-
-def test_input_comparison_detects_changed_and_added_nodes() -> None:
-    current = {"nodes": {"nixpkgs": {"locked": {"rev": "old"}}}}
-    candidate = {
-        "nodes": {
-            "nixpkgs": {"locked": {"rev": "new"}},
-            "extra": {"locked": {"narHash": "sha256-new"}},
-        }
-    }
-    changes = compare_inputs(current, candidate)
-    assert [change["name"] for change in changes] == ["extra", "nixpkgs"]
-
-
-def test_realized_closure_comparison_uses_actual_store_paths() -> None:
-    current = ClosureInformation.from_path_info(
-        {
-            "/nix/store/aaaaaaaa-example-1.0": {"narSize": 10},
-            "/nix/store/bbbbbbbb-stable-2.0": {"narSize": 20},
-        }
-    )
-    candidate = ClosureInformation.from_path_info(
-        {
-            "/nix/store/cccccccc-example-2.0": {"narSize": 15},
-            "/nix/store/bbbbbbbb-stable-2.0": {"narSize": 20},
-            "/nix/store/dddddddd-added-1.0": {"narSize": 30},
-        }
-    )
+def test_closure_diff_separates_updates_from_rebuild_only_paths() -> None:
+    current = path_info(("firefox-140", 100), ("glibc-2.40", 20), ("removed-1", 2))
+    candidate = path_info(("firefox-141", 110), ("glibc-2.40", 21), ("added-1", 3))
     changes = compare_closures(current, candidate)
-    assert [(change["name"], change["kind"]) for change in changes] == [
-        ("added", "added"),
-        ("example", "version"),
-    ]
-    assert candidate.nar_size == 65
-
-
-def test_store_only_package_changes_do_not_count_as_updates() -> None:
-    changes = [
-        {"name": "updated", "kind": "version"},
-        {"name": "rebuilt", "kind": "store"},
-    ]
     meaningful, store_only = split_package_changes(changes)
-    assert [change["name"] for change in meaningful] == ["updated"]
-    assert [change["name"] for change in store_only] == ["rebuilt"]
+    assert {(item["name"], item["kind"]) for item in meaningful} == {
+        ("added", "added"),
+        ("firefox", "version"),
+        ("removed", "removed"),
+    }
+    assert [(item["name"], item["kind"]) for item in store_only] == [("glibc", "store")]
     assert package_summary(changes) == {
-        "total": 1,
+        "total": 3,
         "versions": 1,
-        "additions": 0,
-        "removals": 0,
+        "additions": 1,
+        "removals": 1,
         "storeOnly": 1,
     }
 
 
-def test_fast_package_comparison_uses_running_closure_after_lock_was_updated() -> None:
-    running = ClosureInformation.from_path_info(
-        {"/nix/store/aaaaaaaa-nvidia-x11-570.1": {"narSize": 10}}
-    )
-    updated_package = {
-        "name": "nvidia-x11-575.2",
-        "pname": "nvidia-x11",
-        "version": "575.2",
-        "path": "/nix/store/bbbbbbbb-nvidia-x11-575.2",
-    }
-    changes = compare_packages_to_closure(
-        running,
-        {"nvidia-x11": updated_package},
-        {"nvidia-x11": updated_package},
-    )
-    assert [(change["name"], change["kind"]) for change in changes] == [("nvidia-x11", "version")]
-    assert changes[0]["before"]["version"] == "570.1"
-    assert changes[0]["after"]["version"] == "575.2"
-
-
-def test_realized_nixos_package_option_promotes_build_change() -> None:
-    nvidia_path = "/nix/store/bbbbbbbb-nvidia-x11-575.2"
-    nvidia_open_path = "/nix/store/dddddddd-nvidia-open-575.2-6.18.1"
-    changes = [
+def test_flake_input_diff_uses_locked_identity() -> None:
+    before = {"nodes": {"nixpkgs": {"locked": {"rev": "old"}}, "root": {}}}
+    after = {"nodes": {"nixpkgs": {"locked": {"rev": "new"}}, "root": {}}}
+    assert compare_inputs(before, after) == [
         {
-            "name": "nvidia-x11",
-            "kind": "version",
-            "after": {"path": nvidia_path, "paths": [nvidia_path]},
-        },
-        {
-            "name": "nvidia-open",
-            "kind": "version",
-            "after": {"path": nvidia_open_path, "paths": [nvidia_open_path]},
-        },
-        {
-            "name": "libdrm",
-            "kind": "version",
-            "after": {"path": "/nix/store/cccccccc-libdrm-2.4"},
-        },
-    ]
-    option_packages = [
-        {
-            "name": "nvidia-x11-575.2",
-            "pname": "nvidia-x11",
-            "version": "575.2",
-            "path": nvidia_path,
-            "option": "hardware.nvidia.package",
-        },
-        {
-            "name": "nvidia-open-575.2-6.18.1",
-            "pname": "nvidia-open",
-            "version": "575.2-6.18.1",
-            "path": nvidia_open_path,
-            "option": "hardware.nvidia.package",
-            "component": "open",
-        },
-    ]
-    primary, dependencies = partition_priority_changes(changes, option_packages)
-    assert [change["name"] for change in primary] == ["nvidia-x11", "nvidia-open"]
-    assert [change["name"] for change in dependencies] == ["libdrm"]
-
-
-def test_realized_build_change_receives_available_package_description() -> None:
-    changes = [{"name": "example", "kind": "version"}]
-    packages = [
-        {
-            "pname": "example",
-            "path": "/nix/store/aaaaaaaa-example-2.0",
-            "description": "An example package",
-        }
-    ]
-    assert enrich_package_changes(changes, packages) == [
-        {
-            "name": "example",
-            "kind": "version",
-            "description": "An example package",
+            "name": "nixpkgs",
+            "before": {
+                "revision": "old",
+                "narHash": None,
+                "url": None,
+                "lastModified": None,
+                "display": "old",
+            },
+            "after": {
+                "revision": "new",
+                "narHash": None,
+                "url": None,
+                "lastModified": None,
+                "display": "new",
+            },
         }
     ]
 
 
-def test_nixos_package_option_is_relevant_when_identity_is_in_running_closure() -> None:
-    running = ClosureInformation.from_path_info(
-        {"/nix/store/aaaaaaaa-nvidia-x11-570.1": {"narSize": 10}}
-    )
-    options = [
-        {
-            "name": "nvidia-x11-575.2",
-            "pname": "nvidia-x11",
-            "version": "575.2",
-            "path": "/nix/store/bbbbbbbb-nvidia-x11-575.2",
-            "option": "hardware.nvidia.package",
-        },
-        {
-            "name": "nagios-4.5",
-            "pname": "nagios",
-            "version": "4.5",
-            "path": "/nix/store/cccccccc-nagios-4.5",
-            "option": "services.nagios.package",
-        },
-    ]
-    relevant = packages_matching_closure(options, running)
-    assert [package["option"] for package in relevant] == ["hardware.nvidia.package"]
+def test_garbage_collection_retention_is_safely_bounded() -> None:
+    assert garbage_collection_arguments(30) == ["--delete-older-than", "30d"]
+    assert garbage_collection_arguments(0)[1] == "1d"
+    assert garbage_collection_arguments(9999)[1] == "3650d"

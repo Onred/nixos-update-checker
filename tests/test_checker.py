@@ -5,424 +5,148 @@ from pathlib import Path
 
 import pytest
 
-from nixos_update_checker import checker, display_version
+from nixos_update_checker import checker
+from nixos_update_checker.checker import CheckerError, CommandResult
+from nixos_update_checker.logic import choose_parallelism
 
 
-def test_display_version_includes_packaged_flake_revision(
+def test_available_cpu_count_respects_the_process_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_REVISION", "72ffd10-dirty")
-    assert display_version() == "1.0.0 (72ffd10-dirty)"
+    monkeypatch.setattr(checker.os, "sched_getaffinity", lambda _pid: {2, 4, 6})
+    assert checker.available_cpu_count() == 3
 
 
-def test_display_version_omits_unknown_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_REVISION", "unknown")
-    assert display_version() == "1.0.0"
+def test_background_nix_uses_the_direct_local_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    call: list[object] = []
+
+    def fake_run(program: str, arguments: list[str], *, cwd: Path | None = None) -> CommandResult:
+        call.extend([program, arguments, cwd])
+        return CommandResult(0, "", "")
+
+    monkeypatch.setattr(checker, "run_command", fake_run)
+    checker.run_nix(["build", ".#system"], background=True)
+    assert call[1] == ["--store", "local", "build", ".#system"]
 
 
-def test_discovery_selects_output_name_that_differs_from_hostname(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result = checker.CommandResult(
-        0,
-        json.dumps(
-            [
-                {"name": "workstation", "hostName": "nixos"},
-                {"name": "server", "hostName": "server-host"},
-            ]
-        ),
-        "",
+def test_interactive_nix_keeps_the_configured_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    arguments_seen: list[str] = []
+
+    def fake_run(program: str, arguments: list[str], *, cwd: Path | None = None) -> CommandResult:
+        arguments_seen.extend(arguments)
+        return CommandResult(0, "", "")
+
+    monkeypatch.setattr(checker, "run_command", fake_run)
+    checker.run_nix(["build", ".#system"], background=False)
+    assert arguments_seen == ["build", ".#system"]
+
+
+def test_only_background_builds_receive_adaptive_job_limits(tmp_path: Path) -> None:
+    parallelism = choose_parallelism(16)
+    background = checker.build_arguments(
+        ".#system", tmp_path / "flake.lock", background=True, parallelism=parallelism
     )
-    monkeypatch.setattr(checker, "run_command", lambda *_args, **_kwargs: result)
-    assert checker.discover_configuration("path:/config", "nixos") == "workstation"
-
-
-def test_flake_input_sources_are_labeled_by_nixpkgs_branch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    archive = {
-        "inputs": {
-            "stable": {"path": "/nix/store/stable-source"},
-            "unstable": {"path": "/nix/store/unstable-source"},
-        }
-    }
-    monkeypatch.setattr(
-        checker,
-        "run_command",
-        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(archive), ""),
+    interactive = checker.build_arguments(
+        ".#system", tmp_path / "flake.lock", background=False, parallelism=parallelism
     )
-    lock = {
-        "root": "root",
-        "nodes": {
-            "root": {"inputs": {"stable": "stable-node", "unstable": "unstable-node"}},
-            "stable-node": {"original": {"ref": "nixos-26.05"}},
-            "unstable-node": {"original": {"ref": "nixos-unstable"}},
-        },
-    }
-    sources = checker.flake_input_source_channels("path:/config", tmp_path / "lock", lock)
-    assert sources == {
-        "/nix/store/stable-source": "26.05",
-        "/nix/store/unstable-source": "unstable",
-    }
-
-    packages = [
-        {"position": "/nix/store/stable-source/pkgs/example.nix:1"},
-        {"position": "/nix/store/unstable-source/pkgs/example.nix:1"},
-        {"position": "/nix/store/other-source/package.nix:1"},
-    ]
-    checker.annotate_package_channels(packages, sources)
-    assert [package.get("channel") for package in packages] == [
-        "26.05",
-        "unstable",
-        None,
-    ]
+    assert background[background.index("--max-jobs") + 1] == "4"
+    assert background[background.index("--cores") + 1] == "4"
+    assert "--max-jobs" not in interactive
+    assert "--cores" not in interactive
+    assert "max-substitution-jobs" not in interactive
+    assert "--reference-lock-file" in background
+    assert "--no-write-lock-file" in background
 
 
-def test_closure_package_channel_requires_exact_output_match(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    values = [
-        {"name": "hello", "path": "/nix/store/aaaaaaaa-hello-2.12"},
-        {"name": "other", "path": "/nix/store/unrelated-other-1.0"},
-    ]
-    monkeypatch.setattr(
-        checker,
-        "run_command",
-        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(values), ""),
-    )
-    changes = [
-        {
-            "name": "hello",
-            "after": {
-                "path": "/nix/store/aaaaaaaa-hello-2.12",
-                "paths": ["/nix/store/aaaaaaaa-hello-2.12"],
-            },
-        },
-        {"name": "other", "after": {"path": "/nix/store/bbbbbbbb-other-1.0"}},
-    ]
-    checker.annotate_closure_change_channels(
-        changes,
-        {"/nix/store/nixpkgs-source": "unstable"},
-        "x86_64-linux",
-        debug=False,
-    )
-    assert changes[0]["channel"] == "unstable"
-    assert "channel" not in changes[1]
-
-
-def test_package_set_annotation_requires_an_exact_candidate_output_match(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    values = [
-        {
-            "packageSet": "kdePackages",
-            "attribute": "dolphin",
-            "paths": ["/nix/store/aaaaaaaa-dolphin-26.05"],
-            "description": "KDE file manager",
-            "position": "/nix/store/nixpkgs-source/kde/dolphin.nix:1",
-        },
-        {
-            "packageSet": "kdePackages",
-            "attribute": "okular",
-            "paths": ["/nix/store/unrelated-okular-26.05"],
-            "description": "Document viewer",
-        },
-    ]
+def test_closure_query_falls_back_for_older_nix(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
 
-    def run_command(
-        _program: str, arguments: list[str], **_kwargs: object
-    ) -> checker.CommandResult:
-        calls.append(arguments)
-        return checker.CommandResult(0, json.dumps(values), "")
+    def run(args: list[str], *, background: bool) -> CommandResult:
+        calls.append(args)
+        if "--json-format" in args:
+            return CommandResult(1, "", "unknown flag")
+        return CommandResult(0, '{"/nix/store/hash-hello-1":{"narSize":12}}', "")
 
-    monkeypatch.setattr(checker, "run_command", run_command)
-    changes = [
-        {"name": "dolphin", "after": {"path": "/nix/store/aaaaaaaa-dolphin-26.05"}},
-        {"name": "okular", "after": {"path": "/nix/store/bbbbbbbb-okular-26.05"}},
-    ]
-    candidate_lock = tmp_path / "flake.lock"
-    checker.annotate_package_sets(
-        changes,
-        'path:/config#nixosConfigurations."workstation"',
-        candidate_lock,
-        ("kdePackages",),
-        {"/nix/store/nixpkgs-source": "unstable"},
-        "/nix/store/candidate-system.drv",
-        False,
-        debug=False,
-    )
-    assert changes[0]["packageSet"] == "kdePackages"
-    assert changes[0]["description"] == "KDE file manager"
-    assert changes[0]["channel"] == "unstable"
-    assert "packageSet" not in changes[1]
-    assert calls[0][-1].endswith('nixosConfigurations."workstation"')
-    assert calls[0][calls[0].index("--reference-lock-file") + 1] == str(candidate_lock)
-    apply = calls[0][calls[0].index("--apply") + 1]
-    assert "builtins.hasAttr attribute packageSet.value" in apply
-    assert '"dolphin"' in apply
+    monkeypatch.setattr(checker, "run_nix", run)
+    closure = checker.query_closure("/nix/store/system", background=False)
+    assert closure.nar_size == 12
+    assert len(calls) == 2
+    assert "--json-format" not in calls[1]
 
 
-def test_full_package_set_results_are_cached_and_reused(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_configuration_discovery_accepts_single_arbitrarily_named_host(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    values = [
-        {
-            "packageSet": "kdePackages",
-            "attribute": "dolphin",
-            "paths": ["/nix/store/aaaaaaaa-dolphin-26.05"],
-            "description": None,
-            "position": None,
-        }
-    ]
-    calls = 0
+    arguments_seen: list[str] = []
 
-    def run_command(*_args: object, **_kwargs: object) -> checker.CommandResult:
-        nonlocal calls
-        calls += 1
-        return checker.CommandResult(0, json.dumps(values), "")
+    def discover(args: list[str], *, background: bool) -> CommandResult:
+        arguments_seen.extend(args)
+        return CommandResult(0, '[{"name":"my-machine","hostName":"something-else"}]', "")
 
-    monkeypatch.setattr(checker, "run_command", run_command)
-    arguments = (
-        'path:/config#nixosConfigurations."workstation"',
-        tmp_path / "flake.lock",
-        ("kdePackages",),
-        {},
-        "/nix/store/candidate-system.drv",
+    monkeypatch.setattr(checker, "run_nix", discover)
+    assert (
+        checker.discover_configuration("path:/config", "running", background=False) == "my-machine"
     )
-    first = [{"name": "dolphin", "after": {"path": values[0]["paths"][0]}}]
-    checker.annotate_package_sets(first, *arguments, full=True, debug=False)
-    assert first[0]["packageSet"] == "kdePackages"
-    assert calls == 1
-
-    second = [{"name": "dolphin", "after": {"path": values[0]["paths"][0]}}]
-    checker.annotate_package_sets(second, *arguments, full=False, debug=False)
-    assert second[0]["packageSet"] == "kdePackages"
-    assert calls == 1
-    assert checker.package_set_cache_path(arguments[-1]).is_file()
+    assert "--no-write-lock-file" in arguments_seen
 
 
-def test_full_check_warms_cache_when_rebuilt_system_has_no_changes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    values = [
-        {
-            "packageSet": "kdePackages",
-            "attribute": "dolphin",
-            "paths": ["/nix/store/dolphin"],
-        }
-    ]
+def test_configuration_discovery_reports_invalid_flakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         checker,
-        "run_command",
-        lambda *_args, **_kwargs: checker.CommandResult(0, json.dumps(values), ""),
+        "run_nix",
+        lambda _args, *, background: CommandResult(1, "", "evaluation failed"),
     )
-    identity = "/nix/store/rebuilt-system.drv"
-    checker.annotate_package_sets(
-        [],
-        'path:/config#nixosConfigurations."workstation"',
-        tmp_path / "flake.lock",
-        ("kdePackages",),
-        {},
-        identity,
-        True,
-        debug=False,
-    )
-    assert checker.read_package_set_cache(identity, ("kdePackages",)) == values
-    memberships, _checked_names = checker.read_package_set_memberships(("kdePackages",))
-    assert memberships["dolphin"] == ("kdePackages",)
+    with pytest.raises(CheckerError, match="enumerate") as raised:
+        checker.discover_configuration("path:/config", "running", background=False)
+    assert raised.value.diagnostics == "evaluation failed"
 
 
-def test_selective_package_set_names_include_ecosystem_aliases() -> None:
-    aliases = checker.package_set_candidate_names(
-        [
-            {"name": "python3.13-pyside6"},
-            {"name": "ghc9.10-aeson"},
-            {"name": "r-ggplot2"},
-        ]
-    )
-    assert {"pyside6", "aeson", "ggplot2"} <= aliases
+def test_report_writes_atomically_and_is_world_readable(tmp_path: Path) -> None:
+    destination = tmp_path / "state" / "report.json"
+    checker.write_report(destination, {"status": "success", "value": 2})
+    assert json.loads(destination.read_text()) == {"status": "success", "value": 2}
+    assert destination.stat().st_mode & 0o777 == 0o644
+    assert list(destination.parent.glob(".report.json.*")) == []
 
 
-def test_package_set_cache_keeps_all_evaluated_configuration_generations(
+def test_background_mode_rejects_non_root_before_touching_the_repository(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    for index in range(5):
-        identity = f"/nix/store/system-{index}.drv"
-        checker.write_package_set_cache(
-            identity,
-            ("kdePackages",),
-            [{"packageSet": "kdePackages", "paths": [f"/nix/store/package-{index}"]}],
-            debug=False,
-        )
-    assert len(list(checker.package_set_cache_directory().glob("*.json.gz"))) == 5
-    for index in range(5):
-        identity = f"/nix/store/system-{index}.drv"
-        assert checker.read_package_set_cache(identity, ("kdePackages",)) is not None
-    assert checker.read_package_set_cache(identity, ("gnome",)) is None
+    monkeypatch.setattr(checker.os, "geteuid", lambda: 1000)
+    with pytest.raises(CheckerError, match="must run as root"):
+        checker.run_check(str(tmp_path), background=True)
 
 
-def test_membership_cache_targets_a_new_lock_without_reenumerating_sets(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    old_value = {
-        "packageSet": "kdePackages",
-        "attribute": "dolphin",
-        "paths": ["/nix/store/old-dolphin"],
-    }
-    checker.merge_package_set_memberships(
-        ("kdePackages", "gnome"), [old_value], debug=False
-    )
-    new_value = {**old_value, "paths": ["/nix/store/new-dolphin"]}
-    calls: list[list[str]] = []
-
-    def run_command(
-        _program: str, arguments: list[str], **_kwargs: object
-    ) -> checker.CommandResult:
-        calls.append(arguments)
-        return checker.CommandResult(0, json.dumps([new_value]), "")
-
-    monkeypatch.setattr(checker, "run_command", run_command)
-    changes = [{"name": "dolphin", "after": {"path": "/nix/store/new-dolphin"}}]
-    checker.annotate_package_sets(
-        changes,
-        'path:/config#nixosConfigurations."workstation"',
-        tmp_path / "new-flake.lock",
-        ("kdePackages", "gnome"),
-        {},
-        "/nix/store/new-system.drv",
-        False,
-        debug=False,
-    )
-
-    assert changes[0]["packageSet"] == "kdePackages"
-    assert len(calls) == 1
-    apply = calls[0][calls[0].index("--apply") + 1]
-    assert '"kdePackages" = [ "dolphin" ];' in apply
-    assert '"gnome" = [  ];' in apply
-
-
-def test_membership_cache_skips_known_nonmembers_on_new_locks(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    checker.merge_package_set_memberships(
-        ("kdePackages",), [], {"hello"}, debug=False
-    )
-    monkeypatch.setattr(
-        checker,
-        "run_command",
-        lambda *_args, **_kwargs: pytest.fail("known nonmember should not be re-evaluated"),
-    )
-    changes = [{"name": "hello", "after": {"path": "/nix/store/new-hello"}}]
-    checker.annotate_package_sets(
-        changes,
-        'path:/config#nixosConfigurations."workstation"',
-        tmp_path / "new-flake.lock",
-        ("kdePackages",),
-        {},
-        "/nix/store/new-system.drv",
-        False,
-        debug=False,
-    )
-    assert "packageSet" not in changes[0]
-
-
-def test_stale_membership_falls_back_when_a_package_moves_sets(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_CACHE", str(tmp_path))
-    checker.merge_package_set_memberships(
-        ("kdePackages", "qt6Packages"),
-        [{"packageSet": "kdePackages", "attribute": "dolphin"}],
-        debug=False,
-    )
-    moved = {
-        "packageSet": "qt6Packages",
-        "attribute": "dolphin",
-        "paths": ["/nix/store/new-dolphin"],
-    }
-    calls = 0
-
-    def run_command(*_args: object, **_kwargs: object) -> checker.CommandResult:
-        nonlocal calls
-        calls += 1
-        return checker.CommandResult(0, json.dumps([] if calls == 1 else [moved]), "")
-
-    monkeypatch.setattr(checker, "run_command", run_command)
-    changes = [{"name": "dolphin", "after": {"path": "/nix/store/new-dolphin"}}]
-    checker.annotate_package_sets(
-        changes,
-        'path:/config#nixosConfigurations."workstation"',
-        tmp_path / "new-flake.lock",
-        ("kdePackages", "qt6Packages"),
-        {},
-        "/nix/store/new-system.drv",
-        False,
-        debug=False,
-    )
-    assert calls == 2
-    assert changes[0]["packageSet"] == "qt6Packages"
-
-
-def test_service_report_is_atomically_replaced(tmp_path: Path) -> None:
-    path = tmp_path / "state" / "report.json"
-    checker.write_report(path, {"schemaVersion": 1, "status": "success"})
-    assert json.loads(path.read_text()) == {"schemaVersion": 1, "status": "success"}
-    assert path.stat().st_mode & 0o777 == 0o644
-    assert list(path.parent.iterdir()) == [path]
-
-
-def test_cli_accepts_json_and_build_together(
+def test_cli_can_still_emit_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
         checker,
         "run_check",
-        lambda options: {
-            "schemaVersion": 1,
+        lambda repository, *, background: {
             "status": "success",
-            "build": {"performed": options.build},
+            "repository": repository,
+            "background": background,
         },
     )
-    assert checker.main(["--json", "--build", "--no-limit", "/config"]) == 0
-    assert json.loads(capsys.readouterr().out)["build"]["performed"] is True
-
-
-@pytest.mark.parametrize("candidate", [False, True])
-def test_manifest_is_evaluated_from_the_selected_configuration_without_module_import(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, candidate: bool
-) -> None:
-    evaluator = tmp_path / "manifest.nix"
-    evaluator.write_text("{ config, options }: { inherit config options; }\n")
-    monkeypatch.setenv("NIXOS_UPDATE_CHECKER_MANIFEST", str(evaluator))
-    calls: list[list[str]] = []
-
-    def run_command(
-        _program: str, arguments: list[str], **_kwargs: object
-    ) -> checker.CommandResult:
-        calls.append(arguments)
-        return checker.CommandResult(0, '{"toplevelDeriver":"/nix/store/example.drv"}', "")
-
-    monkeypatch.setattr(checker, "run_command", run_command)
-    candidate_lock = tmp_path / "flake.lock"
-    configuration = 'path:/config#nixosConfigurations."workstation"'
-
-    assert checker.evaluate_manifest(configuration, candidate_lock, candidate=candidate) == {
-        "toplevelDeriver": "/nix/store/example.drv"
+    assert checker.main(["--json", "/config"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "success",
+        "repository": "/config",
+        "background": False,
     }
 
-    arguments = calls[0]
-    assert arguments[-1] == configuration
-    assert "--apply" in arguments
-    apply = arguments[arguments.index("--apply") + 1]
-    assert "{ config, options }:" in apply
-    assert "inherit (configuration) config options" in apply
-    assert "import" not in apply
-    assert "programs.nixos-update-checker.manifest" not in " ".join(arguments)
-    assert ("--reference-lock-file" in arguments) is candidate
+
+def test_cli_publishes_error_report_for_the_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.json"
+
+    def fail(_repository: str, *, background: bool) -> dict[str, object]:
+        raise CheckerError("failed", "details")
+
+    monkeypatch.setattr(checker, "run_check", fail)
+    assert checker.main(["--background", "--report", str(report), "/config"]) == 1
+    value = json.loads(report.read_text())
+    assert value["status"] == "error"
+    assert value["error"] == {"message": "failed", "diagnostics": "details"}

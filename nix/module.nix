@@ -12,7 +12,6 @@
 let
   cfg = config.programs.nixos-update-checker;
   reportPath = "/var/lib/nixos-update-checker/report.json";
-
 in
 {
   options.programs.nixos-update-checker = {
@@ -22,49 +21,46 @@ in
       type = lib.types.strMatching "/.*";
       default = "/etc/nixos";
       example = "/home/alice/nixos-config";
-      description = "Absolute path to the NixOS flake checked by the GUI and background service.";
+      description = "Absolute path to the NixOS flake checked by the application.";
     };
 
     cpuQuota = lib.mkOption {
       type = lib.types.strMatching "[1-9][0-9]*%";
-      default = "25%";
-      description = "CPU quota used by limited terminal checks and the background service.";
+      default = "100%";
+      description = ''
+        Aggregate CPU quota for background builds. The default permits one CPU's
+        total throughput while spreading work over several cores.
+      '';
     };
 
     tray.enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Start the Qt tray application for graphical desktop sessions.";
+      description = "Start the graphical application in desktop sessions.";
     };
 
     service = {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Run periodic update checks as a low-priority system service.";
-      };
-
-      user = lib.mkOption {
-        type = lib.types.str;
-        default = "root";
-        description = "User account used by the background checker service.";
+        description = "Build and compare the candidate system periodically.";
       };
 
       onBootSec = lib.mkOption {
         type = lib.types.str;
-        default = "10m";
-        description = "Delay after boot before the first background check.";
+        default = "20m";
+        description = "Delay after boot before the first background build.";
       };
 
       interval = lib.mkOption {
         type = lib.types.str;
-        default = "6h";
-        description = "Interval between background update checks.";
+        default = "24h";
+        description = "Interval between background builds.";
       };
 
       randomizedDelaySec = lib.mkOption {
         type = lib.types.str;
-        default = "30m";
+        default = "1h";
         description = "Maximum random delay added to timer activations.";
       };
     };
@@ -72,14 +68,11 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = import ./package.nix {
-        inherit pkgs;
-        defaultCpuQuota = cfg.cpuQuota;
+        inherit pkgs revision;
         defaultRepository = cfg.repository;
-        inherit revision;
       };
-      description = "Packaged Qt application and native checker backend.";
+      description = "Packaged Qt application and checker backend.";
     };
-
   };
 
   config = lib.mkIf cfg.enable {
@@ -92,32 +85,35 @@ in
 
     systemd.services = lib.mkIf cfg.service.enable {
       nixos-update-checker = {
-        description = "Check the NixOS flake for available updates";
+        description = "Build a candidate NixOS system and report available updates";
         documentation = [ "https://github.com/Onred/nixos-update-checker" ];
-        after = [
-          "network-online.target"
-          "nix-daemon.socket"
-        ];
+        after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
 
         environment = {
           HOME = "/var/lib/nixos-update-checker";
+          NIX_REMOTE = "local";
         };
 
         script = ''
           exec ${cfg.package}/bin/check-nixos-updates \
-            --service \
+            --background \
             --report ${reportPath} \
             ${lib.escapeShellArg cfg.repository}
         '';
 
         serviceConfig = {
           Type = "oneshot";
-          User = cfg.service.user;
+          User = "root";
           StateDirectory = "nixos-update-checker";
           StateDirectoryMode = "0755";
           UMask = "0022";
+
+          # Short periods distribute the quota smoothly instead of creating
+          # long one-core bursts. Nix's adaptive job/core counts are additional
+          # concurrency controls, not the thermal limit itself.
           CPUQuota = cfg.cpuQuota;
+          CPUQuotaPeriodSec = "10ms";
           CPUWeight = 1;
           IOWeight = 1;
           Nice = 19;
@@ -125,6 +121,15 @@ in
           IOSchedulingPriority = 7;
           OOMScoreAdjust = 500;
           TimeoutStartSec = "infinity";
+
+          # A direct local store is intentional: daemon builders would escape
+          # this service's cgroup and therefore its CPU quota.
+          ReadWritePaths = [
+            "/nix/store"
+            "/nix/var/nix"
+            "/nix/var/log/nix"
+          ];
+
           PrivateTmp = true;
           ProtectSystem = "strict";
           ProtectHome = "read-only";
@@ -137,12 +142,13 @@ in
 
     systemd.timers = lib.mkIf cfg.service.enable {
       nixos-update-checker = {
-        description = "Periodically check the NixOS flake for updates";
+        description = "Periodically build a candidate NixOS system";
         wantedBy = [ "timers.target" ];
         timerConfig = {
           OnBootSec = cfg.service.onBootSec;
           OnUnitActiveSec = cfg.service.interval;
           RandomizedDelaySec = cfg.service.randomizedDelaySec;
+          Persistent = true;
           Unit = "nixos-update-checker.service";
         };
       };

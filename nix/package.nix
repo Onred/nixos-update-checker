@@ -1,12 +1,11 @@
 {
   pkgs,
-  defaultCpuQuota ? "25%",
   defaultRepository ? "/etc/nixos",
   revision ? "unknown",
 }:
 
 let
-  version = "1.0.0";
+  version = "2.0.0";
   output = builtins.placeholder "out";
 in
 pkgs.python3Packages.buildPythonApplication {
@@ -33,7 +32,6 @@ pkgs.python3Packages.buildPythonApplication {
   build-system = [ pkgs.python3Packages.setuptools ];
   dependencies = [ pkgs.python3Packages.pyside6 ];
   buildInputs = [ pkgs.qt6.qtbase ];
-
   nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
   nativeCheckInputs = [ pkgs.python3Packages.pytest ];
 
@@ -51,23 +49,8 @@ pkgs.python3Packages.buildPythonApplication {
     "NIXOS_UPDATE_CHECKER_NIX"
     "${pkgs.nix}/bin/nix"
     "--set"
-    "NIXOS_UPDATE_CHECKER_MANIFEST"
-    "${output}/share/nixos-update-checker/manifest.nix"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_SYSTEMD_RUN"
-    "${pkgs.systemd}/bin/systemd-run"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_IONICE"
-    "${pkgs.util-linux}/bin/ionice"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_NICE"
-    "${pkgs.coreutils}/bin/nice"
-    "--set"
     "NIXOS_UPDATE_CHECKER_PKEXEC"
     "${pkgs.polkit}/bin/pkexec"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_INSTALL"
-    "${pkgs.coreutils}/bin/install"
     "--set"
     "NIXOS_UPDATE_CHECKER_REBUILD"
     "${pkgs.nixos-rebuild}/bin/nixos-rebuild"
@@ -83,9 +66,6 @@ pkgs.python3Packages.buildPythonApplication {
     "--set"
     "NIXOS_UPDATE_CHECKER_REPORT"
     "/var/lib/nixos-update-checker/report.json"
-    "--set"
-    "NIXOS_UPDATE_CHECKER_DEFAULT_CPU_QUOTA"
-    defaultCpuQuota
   ];
 
   postInstall = ''
@@ -98,28 +78,22 @@ pkgs.python3Packages.buildPythonApplication {
       "$out/share/applications/nixos-update-checker.desktop"
     install -m644 "$src/assets/nixos-update-checker-autostart.desktop" \
       "$out/share/nixos-update-checker/autostart.desktop"
-    install -m644 "$src/nix/manifest.nix" \
-      "$out/share/nixos-update-checker/manifest.nix"
-
   '';
 
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
     pytest -p no:cacheprovider "$src/tests"
-    "$out/bin/nixos-update-checker" --version | grep -F "nixos-update-checker 1.0.0"
+    "$out/bin/nixos-update-checker" --version | grep -F "nixos-update-checker 2.0.0"
     QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" \
       --self-test --no-tray --report /nonexistent /etc/nixos
-    "$out/bin/check-nixos-updates" --version | grep -F "check-nixos-updates 1.0.0"
-    ${pkgs.lib.optionalString (revision != "unknown") ''
-      env -u PYTHONPATH "$out/bin/check-nixos-updates" --version | grep -F ${pkgs.lib.escapeShellArg revision}
-    ''}
+    "$out/bin/check-nixos-updates" --version | grep -F "check-nixos-updates 2.0.0"
     "$out/bin/check-nixos-updates" --help >/dev/null
     runHook postInstallCheck
   '';
 
   meta = {
-    description = "PySide6 NixOS flake update checker with tray integration";
+    description = "Graphical NixOS update checker based on realized system builds";
     homepage = "https://github.com/Onred/nixos-update-checker";
     mainProgram = "nixos-update-checker";
     platforms = pkgs.lib.platforms.linux;

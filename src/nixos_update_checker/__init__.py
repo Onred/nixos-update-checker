@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 
-__version__ = "1.0.0"
-SCHEMA_VERSION = 1
+__version__ = "2.0.0"
+SCHEMA_VERSION = 2
 
 
 def build_revision() -> str | None:

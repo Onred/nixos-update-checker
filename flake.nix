@@ -1,5 +1,5 @@
 {
-  description = "Qt NixOS flake update checker with tray and background service integration";
+  description = "Graphical NixOS update checker using realized system builds";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -35,17 +35,17 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/nixos-update-checker";
-          meta.description = "Open the NixOS Update Checker Qt application";
+          meta.description = "Open the NixOS Update Checker";
         };
         gui = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/nixos-update-checker";
-          meta.description = "Open the NixOS Update Checker Qt application";
+          meta.description = "Open the NixOS Update Checker";
         };
         cli = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/check-nixos-updates";
-          meta.description = "Run the NixOS update checker backend in a terminal";
+          meta.description = "Build and compare a candidate system in a terminal";
         };
       });
 
@@ -53,128 +53,30 @@
         system:
         let
           pkgs = pkgsFor system;
-          componentFixture =
-            if pkgs.stdenv.hostPlatform.isx86_64 then
-              {
-                package = pkgs.linuxPackages.nvidia_x11;
-                component = "open";
-                pname = "nvidia-open";
-              }
-            else
-              {
-                package = pkgs.hello // {
-                  passthru = (pkgs.hello.passthru or { }) // {
-                    driver = pkgs.jq;
-                  };
-                };
-                component = "driver";
-                pname = "jq";
-              };
-          fixtureModule =
-            { lib, pkgs, ... }:
-            {
-              options.services.update-checker-enabled = {
-                enable = lib.mkEnableOption "update checker manifest fixture";
-                package = lib.mkOption {
-                  type = lib.types.package;
-                  default = pkgs.hello;
-                };
-                packages = lib.mkOption {
-                  type = lib.types.listOf lib.types.package;
-                  default = [ pkgs.jq ];
-                };
-              };
-              options.services.update-checker-disabled = {
-                enable = lib.mkEnableOption "disabled update checker manifest fixture";
-                package = lib.mkOption {
-                  type = lib.types.package;
-                  default = pkgs.curl;
-                };
-              };
-              options.hardware.update-checker-manual.package = lib.mkOption {
-                type = lib.types.package;
-                default = pkgs.git;
-              };
-              options.hardware.update-checker-component.package = lib.mkOption {
-                type = lib.types.package;
-                default = componentFixture.package;
-              };
-
-              config = {
-                services.update-checker-enabled.enable = true;
-                services.update-checker-disabled.enable = false;
-              };
-            };
-          hostModule =
-            { pkgs, ... }:
-            {
-              hardware.graphics = {
-                enable = true;
-                extraPackages = [ pkgs.libglvnd ];
-              };
-              system.stateVersion = "26.05";
-            };
-          moduleEvaluation = nixpkgs.lib.nixosSystem {
+          evaluation = nixpkgs.lib.nixosSystem {
             inherit system;
             modules = [
               self.nixosModules.default
-              fixtureModule
-              hostModule
-              { programs.nixos-update-checker.enable = true; }
+              {
+                programs.nixos-update-checker.enable = true;
+                system.stateVersion = "26.05";
+              }
             ];
           };
-          moduleConfig = moduleEvaluation.config;
-          standaloneEvaluation = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              fixtureModule
-              hostModule
-            ];
-          };
-          standaloneManifest = import ./nix/manifest.nix {
-            inherit (standaloneEvaluation) config options;
-          };
-          standalonePriorityOptionManifest = import ./nix/manifest.nix {
-            inherit (standaloneEvaluation) config options;
-            includePriorityOptionPackages = true;
-          };
+          cfg = evaluation.config;
+          service = cfg.systemd.services.nixos-update-checker.serviceConfig;
+          timer = cfg.systemd.timers.nixos-update-checker.timerConfig;
         in
         {
           package = self.packages.${system}.default;
           module =
-            assert moduleConfig.systemd.services.nixos-update-checker.serviceConfig.CPUQuota == "25%";
-            assert moduleConfig.systemd.timers.nixos-update-checker.timerConfig.OnUnitActiveSec == "6h";
-            assert moduleConfig.environment.etc ? "xdg/autostart/nixos-update-checker.desktop";
-            assert builtins.length standaloneManifest.corePackages == 2;
-            assert builtins.any (
-              package: package.option == "hardware.graphics.package"
-            ) standaloneManifest.activeOptionPackages;
-            assert builtins.any (
-              package: package.option == "hardware.graphics.extraPackages"
-            ) standaloneManifest.activeOptionPackages;
-            assert builtins.any (
-              package: package.option == "services.update-checker-enabled.package"
-            ) standaloneManifest.activeOptionPackages;
-            assert builtins.any (
-              package: package.option == "services.update-checker-enabled.packages"
-            ) standaloneManifest.activeOptionPackages;
-            assert
-              !(builtins.any (
-                package: package.option == "services.update-checker-disabled.package"
-              ) standaloneManifest.activeOptionPackages);
-            assert
-              !(builtins.any (
-                package: package.option == "hardware.update-checker-manual.package"
-              ) standaloneManifest.activeOptionPackages);
-            assert builtins.any (
-              package: package.option == "hardware.update-checker-manual.package"
-            ) standalonePriorityOptionManifest.priorityOptionPackages;
-            assert builtins.any (
-              package:
-              package.option == "hardware.update-checker-component.package"
-              && (package.component or null) == componentFixture.component
-              && (package.pname or null) == componentFixture.pname
-            ) standalonePriorityOptionManifest.priorityOptionPackages;
+            assert service.User == "root";
+            assert service.CPUQuota == "100%";
+            assert service.CPUQuotaPeriodSec == "10ms";
+            assert builtins.elem "/nix/store" service.ReadWritePaths;
+            assert timer.OnUnitActiveSec == "24h";
+            assert timer.Persistent;
+            assert cfg.environment.etc ? "xdg/autostart/nixos-update-checker.desktop";
             pkgs.runCommand "nixos-update-checker-module-check" { } ''
               touch "$out"
             '';
@@ -205,7 +107,6 @@
               (pkgs.lib.getBin pkgs.nix)
               (pkgs.lib.getBin pkgs.nixd)
               (pkgs.lib.getBin pkgs.systemd)
-              (pkgs.lib.getBin pkgs.util-linux)
             ];
 
             shellHook = ''

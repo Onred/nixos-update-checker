@@ -1,36 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from . import SCHEMA_VERSION, __version__, build_revision, display_version
 from .logic import (
+    BuildParallelism,
     ClosureInformation,
     ConfigurationCandidate,
     ConfigurationSelectionError,
     JsonObject,
-    RepositorySettings,
-    SettingsError,
-    collect_packages,
+    choose_parallelism,
     compare_closures,
     compare_inputs,
-    compare_packages_to_closure,
-    enrich_package_changes,
     nix_quote,
     package_summary,
-    packages_matching_closure,
-    partition_priority_changes,
     select_current_configuration,
     split_package_changes,
 )
@@ -54,25 +48,6 @@ class CommandResult:
         return self.returncode == 0
 
 
-@dataclass
-class CheckOptions:
-    repository: str
-    cpu_quota: str = "25%"
-    report_path: str = "/var/lib/nixos-update-checker/report.json"
-    build: bool = False
-    inspect_packages: bool = True
-    json_output: bool = False
-    debug: bool = False
-    limit_resources: bool = True
-    service: bool = False
-
-
-@dataclass
-class SelectedPackages:
-    packages: list[JsonObject]
-    resolved_options: set[str]
-
-
 def environment(name: str, fallback: str = "") -> str:
     return os.environ.get(name) or fallback
 
@@ -81,15 +56,12 @@ def nix_executable() -> str:
     return environment("NIXOS_UPDATE_CHECKER_NIX", "nix")
 
 
-def manifest_evaluator_path() -> Path:
-    configured = environment("NIXOS_UPDATE_CHECKER_MANIFEST")
-    if configured:
-        path = Path(configured)
-    else:
-        path = Path(__file__).resolve().parents[2] / "nix" / "manifest.nix"
-    if not path.is_file():
-        raise CheckerError(f"Could not find the bundled package manifest evaluator: {path}")
-    return path
+def available_cpu_count() -> int:
+    """Return CPUs available to this process, respecting a systemd CPU affinity mask."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
 
 
 def run_command(program: str, arguments: list[str], *, cwd: Path | None = None) -> CommandResult:
@@ -106,10 +78,14 @@ def run_command(program: str, arguments: list[str], *, cwd: Path | None = None) 
     return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 
+def run_nix(arguments: list[str], *, background: bool) -> CommandResult:
+    prefix = ["--store", "local"] if background else []
+    return run_command(nix_executable(), [*prefix, *arguments])
+
+
 def require_success(result: CommandResult, message: str) -> None:
-    if result.succeeded:
-        return
-    raise CheckerError(message, (result.stderr or result.stdout).strip())
+    if not result.succeeded:
+        raise CheckerError(message, result.stderr.strip() or result.stdout.strip())
 
 
 def parse_json(data: str, context: str) -> Any:
@@ -144,11 +120,9 @@ def current_hostname() -> str:
     try:
         hostname = Path("/proc/sys/kernel/hostname").read_text().strip()
     except OSError as error:
-        raise CheckerError(
-            "Could not determine the running system hostname.", str(error)
-        ) from error
+        raise CheckerError("Could not determine the running hostname.", str(error)) from error
     if not hostname:
-        raise CheckerError("The running system hostname is empty.")
+        raise CheckerError("The running hostname is empty.")
     return hostname
 
 
@@ -156,27 +130,23 @@ DISCOVERY_APPLY = r"""
 configs:
 map
   (name:
-    let
-      result = builtins.tryEval configs.${name}.config.networking.hostName;
-    in
-    {
-      inherit name;
-      hostName = if result.success then result.value else "";
-    })
+    let result = builtins.tryEval configs.${name}.config.networking.hostName;
+    in { inherit name; hostName = if result.success then result.value else ""; })
   (builtins.attrNames configs)
 """
 
 
-def discover_configuration(flake_reference: str, hostname: str) -> str:
-    result = run_command(
-        nix_executable(),
+def discover_configuration(flake_reference: str, hostname: str, *, background: bool) -> str:
+    result = run_nix(
         [
             "eval",
             "--json",
+            "--no-write-lock-file",
             "--apply",
             DISCOVERY_APPLY,
             f"{flake_reference}#nixosConfigurations",
         ],
+        background=background,
     )
     require_success(result, "Could not enumerate this flake's NixOS configurations.")
     value = parse_json(result.stdout, "Invalid configuration discovery result.")
@@ -204,9 +174,8 @@ def resolved_path(path: Path) -> str:
 def generation_name(target: str) -> str:
     if not target:
         return "unknown"
-    profiles = Path("/nix/var/nix/profiles")
     try:
-        for entry in profiles.glob("system-*-link"):
+        for entry in Path("/nix/var/nix/profiles").glob("system-*-link"):
             if resolved_path(entry) == target:
                 return entry.name
     except OSError:
@@ -214,792 +183,107 @@ def generation_name(target: str) -> str:
     return "unknown"
 
 
-def deriver_for(path: str, *, debug: bool) -> str:
+def deriver_for(path: str, *, background: bool) -> str:
     if not path:
         return ""
-    result = run_command(nix_executable(), ["path-info", "--derivation", path])
-    if result.succeeded:
-        return result.stdout.strip()
-    if debug:
-        print(f"Could not query deriver for {path}:\n{result.stderr}", file=sys.stderr)
-    return ""
+    result = run_nix(["path-info", "--derivation", path], background=background)
+    return result.stdout.strip() if result.succeeded else ""
 
 
-def read_repository_settings(repository: Path) -> RepositorySettings:
-    path = repository / ".nixos-update-checker.json"
-    if not path.exists():
-        return RepositorySettings()
-    value = read_json_object(path, f"Invalid settings file: {path}")
-    try:
-        return RepositorySettings.from_json(value)
-    except SettingsError as error:
-        raise CheckerError(f"Invalid settings file: {path}", str(error)) from error
-
-
-def input_channel_label(input_name: str, node: JsonObject) -> str:
-    original = node.get("original", {})
-    reference = str(original.get("ref") or "")
-    if reference.startswith("nixos-"):
-        return reference.removeprefix("nixos-")
-    if reference.startswith("nixpkgs-"):
-        return reference.removeprefix("nixpkgs-")
-    return reference or input_name
-
-
-def flake_input_source_channels(
-    flake_reference: str, lock_path: Path, lock: JsonObject
-) -> dict[str, str]:
-    result = run_command(
-        nix_executable(),
-        [
-            "flake",
-            "archive",
-            "--json",
-            "--dry-run",
-            "--reference-lock-file",
-            str(lock_path),
-            flake_reference,
-        ],
-    )
-    require_success(result, "Could not inspect flake input source paths.")
-    archive = parse_json(result.stdout, "Invalid flake archive metadata.")
-    if not isinstance(archive, dict):
-        return {}
-    nodes = lock.get("nodes", {})
-    root_name = lock.get("root")
-    root = nodes.get(root_name, {}) if isinstance(nodes, dict) else {}
-    root_inputs = root.get("inputs", {}) if isinstance(root, dict) else {}
-    archive_inputs = archive.get("inputs", {})
-    if not isinstance(root_inputs, dict) or not isinstance(archive_inputs, dict):
-        return {}
-    sources: dict[str, str] = {}
-    for input_name, archived_input in archive_inputs.items():
-        node_name = root_inputs.get(input_name)
-        node = nodes.get(node_name, {}) if isinstance(node_name, str) else {}
-        original = node.get("original", {}) if isinstance(node, dict) else {}
-        locked = node.get("locked", {}) if isinstance(node, dict) else {}
-        repository_name = str(original.get("repo") or locked.get("repo") or "")
-        reference = str(original.get("ref") or "")
-        is_nixpkgs = (
-            repository_name == "nixpkgs"
-            or reference.startswith("nixos-")
-            or "nixpkgs" in str(input_name).lower()
-        )
-        if not is_nixpkgs:
-            continue
-        source_path = (
-            str(archived_input.get("path") or "") if isinstance(archived_input, dict) else ""
-        )
-        if source_path:
-            sources[source_path] = input_channel_label(str(input_name), node)
-    return sources
-
-
-def annotate_package_channels(packages: list[JsonObject], source_channels: dict[str, str]) -> None:
-    ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
-    for package in packages:
-        position = str(package.get("position") or "")
-        channel = next(
-            (label for source, label in ordered_sources if position.startswith(f"{source}/")),
-            "",
-        )
-        if channel:
-            package["channel"] = channel
-
-
-def annotate_manifest_channels(manifest: JsonObject, source_channels: dict[str, str]) -> None:
-    for key in (
-        "activeOptionPackages",
-        "priorityOptionPackages",
-        "systemPackages",
-        "corePackages",
-    ):
-        values = manifest.get(key, [])
-        if isinstance(values, list):
-            annotate_package_channels(values, source_channels)
-    users = manifest.get("userPackages", {})
-    if isinstance(users, dict):
-        for values in users.values():
-            if isinstance(values, list):
-                annotate_package_channels(values, source_channels)
-
-
-def configuration_platform(configuration: str, candidate_lock: Path) -> str:
-    result = run_command(
-        nix_executable(),
-        [
-            "eval",
-            "--raw",
-            "--reference-lock-file",
-            str(candidate_lock),
-            f"{configuration}.pkgs.stdenv.hostPlatform.system",
-        ],
-    )
-    require_success(result, "Could not determine the candidate NixOS platform.")
-    return result.stdout.strip()
-
-
-def annotate_closure_change_channels(
-    changes: list[JsonObject],
-    source_channels: dict[str, str],
-    system: str,
-    *,
-    debug: bool,
-) -> None:
-    unresolved_names = sorted(
-        {
-            str(change.get("name", ""))
-            for change in changes
-            if change.get("after") and not change.get("channel") and change.get("name")
-        }
-    )
-    if not unresolved_names:
-        return
-    names = " ".join(nix_quote(name) for name in unresolved_names)
-    apply = f"""
-pkgs:
-let
-  names = [ {names} ];
-  packagePath = name:
-    let result = builtins.tryEval (
-      if builtins.hasAttr name pkgs && builtins.isAttrs pkgs.${{name}}
-      then pkgs.${{name}}.outPath or null
-      else null
-    );
-    in {{ inherit name; path = if result.success then result.value else null; }};
-in builtins.filter (item: item.path != null) (map packagePath names)
-"""
-    change_paths: dict[str, list[JsonObject]] = {}
-    for change in changes:
-        after = change.get("after")
-        if not isinstance(after, dict):
-            continue
-        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
-        for path in paths:
-            if path:
-                change_paths.setdefault(path, []).append(change)
-    for source, channel in source_channels.items():
-        result = run_command(
-            nix_executable(),
-            ["eval", "--json", "--apply", apply, f"path:{source}#legacyPackages.{system}"],
-        )
-        if not result.succeeded:
-            if debug:
-                print(
-                    f"Could not resolve package provenance from {channel}:\n{result.stderr}",
-                    file=sys.stderr,
-                )
-            continue
-        values = parse_json(result.stdout, f"Invalid package provenance result for {channel}")
-        if not isinstance(values, list):
-            continue
-        for value in values:
-            if not isinstance(value, dict):
-                continue
-            for change in change_paths.get(str(value.get("path") or ""), []):
-                change["channel"] = channel
-
-
-PACKAGE_SET_CACHE_SCHEMA = 2
-PACKAGE_SET_SPECS = (
-    "kdePackages",
-    "gnome",
-    "xfce",
-    "mate",
-    "cinnamon",
-    "lxqt",
-    "pantheon",
-    "qt6Packages",
-    "qt5",
-    "gst_all_1",
-    "xorg",
-    "llvmPackages",
-    "cudaPackages",
-    "rocmPackages",
-    "beamPackages",
-    "haskellPackages",
-    "rPackages",
-    "emacsPackages",
-    "perlPackages",
-    "python3Packages",
-    "rustPackages",
-    "kernelPackages",
-)
-
-
-def package_set_cache_directory() -> Path:
-    configured = environment("NIXOS_UPDATE_CHECKER_CACHE")
-    if configured:
-        root = Path(configured).expanduser()
-    else:
-        cache_home = environment("XDG_CACHE_HOME")
-        root = (
-            Path(cache_home).expanduser()
-            if cache_home
-            else Path.home() / ".cache"
-        ) / "nixos-update-checker"
-    return root / "package-sets"
-
-
-def package_set_cache_path(configuration_identity: str) -> Path:
-    key = hashlib.sha256(configuration_identity.encode()).hexdigest()
-    return package_set_cache_directory() / f"{key}.json.gz"
-
-
-def package_set_membership_cache_path() -> Path:
-    return package_set_cache_directory() / "membership.json.gz"
-
-
-def read_package_set_cache(
-    configuration_identity: str, package_sets: tuple[str, ...]
-) -> list[JsonObject] | None:
-    path = package_set_cache_path(configuration_identity)
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as stream:
-            value = json.load(stream)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if (
-        not isinstance(value, dict)
-        or value.get("schemaVersion") != PACKAGE_SET_CACHE_SCHEMA
-        or value.get("configurationIdentity") != configuration_identity
-        or value.get("packageSets") != list(package_sets)
-        or not isinstance(value.get("packages"), list)
-    ):
-        return None
-    return [package for package in value["packages"] if isinstance(package, dict)]
-
-
-def write_package_set_cache(
-    configuration_identity: str,
-    package_sets: tuple[str, ...],
-    packages: list[JsonObject],
-    *,
-    debug: bool,
-) -> None:
-    directory = package_set_cache_directory()
-    path = package_set_cache_path(configuration_identity)
-    temporary_path: Path | None = None
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
-        os.close(descriptor)
-        temporary_path = Path(temporary_name)
-        with gzip.open(temporary_path, "wt", encoding="utf-8", compresslevel=6) as stream:
-            json.dump(
-                {
-                    "schemaVersion": PACKAGE_SET_CACHE_SCHEMA,
-                    "configurationIdentity": configuration_identity,
-                    "packageSets": list(package_sets),
-                    "packages": packages,
-                },
-                stream,
-                separators=(",", ":"),
-            )
-        os.replace(temporary_path, path)
-    except OSError as error:
-        if debug:
-            print(f"Could not save package-set cache {path}: {error}", file=sys.stderr)
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-def read_package_set_memberships(
-    package_sets: tuple[str, ...],
-) -> tuple[dict[str, tuple[str, ...]], set[str]]:
-    try:
-        with gzip.open(package_set_membership_cache_path(), "rt", encoding="utf-8") as stream:
-            value = json.load(stream)
-    except (OSError, json.JSONDecodeError):
-        return {}, set()
-    if (
-        not isinstance(value, dict)
-        or value.get("schemaVersion") != PACKAGE_SET_CACHE_SCHEMA
-        or value.get("packageSets") != list(package_sets)
-        or not isinstance(value.get("memberships"), dict)
-        or not isinstance(value.get("checkedNames"), list)
-    ):
-        return {}, set()
-    allowed = set(package_sets)
-    memberships: dict[str, tuple[str, ...]] = {}
-    for attribute, sets in value["memberships"].items():
-        if not isinstance(attribute, str) or not isinstance(sets, list):
-            continue
-        valid_sets = tuple(
-            package_set
-            for package_set in package_sets
-            if package_set in sets and package_set in allowed
-        )
-        if valid_sets:
-            memberships[attribute] = valid_sets
-    checked_names = {name for name in value["checkedNames"] if isinstance(name, str)}
-    return memberships, checked_names
-
-
-def merge_package_set_memberships(
-    package_sets: tuple[str, ...],
-    packages: list[JsonObject],
-    checked_names: set[str] | None = None,
-    *,
-    debug: bool,
-) -> None:
-    existing_memberships, existing_checked_names = read_package_set_memberships(package_sets)
-    memberships = {
-        attribute: set(sets)
-        for attribute, sets in existing_memberships.items()
-    }
-    allowed = set(package_sets)
-    for package in packages:
-        attribute = str(package.get("attribute") or "")
-        package_set = str(package.get("packageSet") or "")
-        if attribute and package_set in allowed:
-            memberships.setdefault(attribute, set()).add(package_set)
-            existing_checked_names.add(attribute)
-    existing_checked_names.update(checked_names or set())
-    serialized = {
-        attribute: [package_set for package_set in package_sets if package_set in sets]
-        for attribute, sets in sorted(memberships.items())
-        if sets
-    }
-    directory = package_set_cache_directory()
-    path = package_set_membership_cache_path()
-    temporary_path: Path | None = None
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
-        os.close(descriptor)
-        temporary_path = Path(temporary_name)
-        with gzip.open(temporary_path, "wt", encoding="utf-8", compresslevel=6) as stream:
-            json.dump(
-                {
-                    "schemaVersion": PACKAGE_SET_CACHE_SCHEMA,
-                    "packageSets": list(package_sets),
-                    "memberships": serialized,
-                    "checkedNames": sorted(existing_checked_names),
-                },
-                stream,
-                separators=(",", ":"),
-            )
-        os.replace(temporary_path, path)
-    except OSError as error:
-        if debug:
-            print(f"Could not save package-set memberships {path}: {error}", file=sys.stderr)
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-def package_set_candidate_names(changes: list[JsonObject]) -> set[str]:
-    names = {str(change.get("name") or "") for change in changes}
-    aliases = {name for name in names if name}
-    prefix = re.compile(
-        r"^(?:python\d+(?:\.\d+)?|perl\d+(?:\.\d+)*|ruby\d+(?:\.\d+)*|"
-        r"lua\d+(?:[._]\d+)*|ghc\d+(?:\.\d+)*|emacs|r)-(.+)$",
-        re.IGNORECASE,
-    )
-    for name in names:
-        match = prefix.match(name)
-        if match:
-            aliases.add(match.group(1))
-        aliases.add(name.replace("-", "_"))
-        aliases.add(name.replace("_", "-"))
-    return {name for name in aliases if name}
-
-
-def package_set_apply(
-    package_sets: tuple[str, ...], names_by_set: dict[str, set[str]] | None
-) -> str:
-    sets = "\n".join(
-        (
-            f"    {{ name = {nix_quote(package_set)}; value = "
-            "configuration.config.boot.kernelPackages; }"
-            if package_set == "kernelPackages"
-            else (
-                f"    {{ name = {nix_quote(package_set)}; value = "
-                f"if builtins.hasAttr {nix_quote(package_set)} configuration.pkgs "
-                f"then builtins.getAttr {nix_quote(package_set)} configuration.pkgs "
-                "else { }; }"
-            )
-        )
-        for package_set in package_sets
-    )
-    if names_by_set is None:
-        attributes = "builtins.attrNames packageSet.value"
-    else:
-        attributes_by_set = "\n".join(
-            f"    {nix_quote(package_set)} = [ "
-            + " ".join(
-                nix_quote(name) for name in sorted(names_by_set.get(package_set, set()))
-            )
-            + " ];"
-            for package_set in package_sets
-        )
-        attributes = (
-            "builtins.filter (attribute: builtins.hasAttr attribute packageSet.value) "
-            "(builtins.getAttr packageSet.name attributesBySet)"
-        )
-    return f"""
-configuration:
-let
-  packageSets = [
-{sets}
-  ];
-  attributesBySet = {{
-{attributes_by_set if names_by_set is not None else ''}
-  }};
-  package = packageSet: attribute:
-    let
-      value = builtins.getAttr attribute packageSet.value;
-      outputNames =
-        if builtins.isAttrs value && value ? outputs && builtins.isList value.outputs
-        then value.outputs
-        else [ ];
-      outputPath = output:
-        if output == "out" && value ? outPath && !(value ? out) then
-          value.outPath
-        else if builtins.hasAttr output value && (builtins.getAttr output value) ? outPath then
-          (builtins.getAttr output value).outPath
-        else
-          null;
-      paths = builtins.filter (path: path != null) (map outputPath outputNames);
-      description =
-        if builtins.isAttrs value && builtins.isString (value.meta.description or null)
-        then value.meta.description
-        else null;
-      position =
-        if builtins.isAttrs value && builtins.isString (value.meta.position or null)
-        then value.meta.position
-        else null;
-      record = {{ inherit attribute paths description position; packageSet = packageSet.name; }};
-      evaluated = builtins.tryEval (builtins.deepSeq record record);
-    in
-      if evaluated.success && evaluated.value.paths != [ ]
-      then [ (evaluated.value) ]
-      else [ ];
-  packagesFromSet = packageSet:
-    builtins.concatMap (package packageSet) ({attributes});
-in builtins.concatMap packagesFromSet packageSets
-"""
-
-
-def evaluate_package_sets(
-    configuration: str,
-    candidate_lock: Path,
-    package_sets: tuple[str, ...],
-    names_by_set: dict[str, set[str]] | None,
-    *,
-    debug: bool,
-) -> list[JsonObject] | None:
-    result = run_command(
-        nix_executable(),
-        [
-            "eval",
-            "--quiet",
-            "--reference-lock-file",
-            str(candidate_lock),
-            "--json",
-            "--apply",
-            package_set_apply(package_sets, names_by_set),
-            configuration,
-        ],
-    )
+def query_closure(path: str, *, background: bool) -> ClosureInformation:
+    common = ["path-info", "--json", "--recursive", "--size", path]
+    result = run_nix([*common[:2], "--json-format", "1", *common[2:]], background=background)
     if not result.succeeded:
-        if debug:
-            print(f"Could not inspect package sets:\n{result.stderr}", file=sys.stderr)
-        return None
-    values = parse_json(result.stdout, "Invalid package-set evaluation result")
-    if not isinstance(values, list):
-        return None
-    return [value for value in values if isinstance(value, dict)]
-
-
-def package_set_name_selection(
-    changes: list[JsonObject],
-    package_sets: tuple[str, ...],
-    memberships: dict[str, tuple[str, ...]],
-    checked_names: set[str],
-) -> dict[str, set[str]]:
-    names = package_set_candidate_names(changes)
-    selection: dict[str, set[str]] = {package_set: set() for package_set in package_sets}
-    for name in names:
-        matching_sets = memberships.get(name)
-        if matching_sets:
-            for package_set in matching_sets:
-                selection[package_set].add(name)
-        elif name not in checked_names:
-            for package_set in package_sets:
-                selection[package_set].add(name)
-    return selection
-
-
-def apply_package_set_values(
-    changes_by_path: dict[str, list[JsonObject]],
-    values: list[JsonObject],
-    source_channels: dict[str, str],
-) -> None:
-    ordered_sources = sorted(source_channels.items(), key=lambda item: len(item[0]), reverse=True)
-    for value in values:
-        matching_changes = {
-            id(change): change
-            for path in value.get("paths", [])
-            for change in changes_by_path.get(str(path), [])
-        }
-        for change in matching_changes.values():
-            if not change.get("packageSet"):
-                change["packageSet"] = str(value.get("packageSet") or "")
-            description = value.get("description")
-            if description and not change.get("description"):
-                change["description"] = description
-            position = str(value.get("position") or "")
-            channel = next(
-                (
-                    label
-                    for source, label in ordered_sources
-                    if position.startswith(f"{source}/")
-                ),
-                "",
-            )
-            if channel and not change.get("channel"):
-                change["channel"] = channel
-
-
-def annotate_package_sets(
-    changes: list[JsonObject],
-    configuration: str,
-    candidate_lock: Path,
-    package_sets: tuple[str, ...],
-    source_channels: dict[str, str],
-    configuration_identity: str,
-    full: bool,
-    *,
-    debug: bool,
-) -> None:
-    if not changes and not full:
-        return
-    changes_by_path: dict[str, list[JsonObject]] = {}
-    for change in changes:
-        after = change.get("after")
-        if not isinstance(after, dict):
-            continue
-        paths = [str(after.get("path") or ""), *map(str, after.get("paths", []))]
-        for path in paths:
-            if path:
-                changes_by_path.setdefault(path, []).append(change)
-    if not changes_by_path and not full:
-        return
-    values = (
-        read_package_set_cache(configuration_identity, package_sets)
-        if configuration_identity
-        else None
-    )
-    if values is None:
-        memberships, checked_names = read_package_set_memberships(package_sets)
-        selection = None if full else package_set_name_selection(
-            changes, package_sets, memberships, checked_names
-        )
-        if selection is not None and not any(selection.values()):
-            values = []
-        else:
-            values = evaluate_package_sets(
-                configuration, candidate_lock, package_sets, selection, debug=debug
-            )
-        if values is None:
-            return
-        if full and configuration_identity:
-            write_package_set_cache(
-                configuration_identity, package_sets, values, debug=debug
-            )
-        elif not full:
-            evaluated_names = set().union(*selection.values()) if selection else set()
-            merge_package_set_memberships(
-                package_sets, values, evaluated_names, debug=debug
-            )
-            apply_package_set_values(changes_by_path, values, source_channels)
-            unresolved = [
-                change
-                for change in changes
-                if not change.get("packageSet")
-                and package_set_candidate_names([change]) & memberships.keys()
-            ]
-            if unresolved:
-                names = package_set_candidate_names(unresolved)
-                fallback = evaluate_package_sets(
-                    configuration,
-                    candidate_lock,
-                    package_sets,
-                    {package_set: names for package_set in package_sets},
-                    debug=debug,
-                )
-                if fallback is not None:
-                    values.extend(fallback)
-                    merge_package_set_memberships(
-                        package_sets, fallback, names, debug=debug
-                    )
-    if full:
-        merge_package_set_memberships(package_sets, values, debug=debug)
-    apply_package_set_values(changes_by_path, values, source_channels)
-
-
-PACKAGE_APPLY = r"""
-value:
-let
-  package = packageValue: {
-    name = packageValue.name;
-    pname = packageValue.pname or null;
-    version = packageValue.version or null;
-    description =
-      if builtins.isString (packageValue.meta.description or null) then
-        packageValue.meta.description
-      else
-        null;
-    position =
-      if builtins.isString (packageValue.meta.position or null) then
-        packageValue.meta.position
-      else
-        null;
-    path = packageValue.outPath;
-  };
-  values = if builtins.isList value then value else [ value ];
-in
-map package values
-"""
-
-
-def evaluate_selected_packages(
-    configuration: str,
-    options: list[str],
-    candidate_lock: Path,
-    *,
-    candidate: bool,
-    debug: bool,
-) -> SelectedPackages:
-    packages: list[JsonObject] = []
-    resolved_options: set[str] = set()
-    for option in options:
-        arguments = ["eval"]
-        if candidate:
-            arguments.extend(["--reference-lock-file", str(candidate_lock)])
-        arguments.extend(["--json", "--apply", PACKAGE_APPLY, f"{configuration}.config.{option}"])
-        result = run_command(nix_executable(), arguments)
-        if not result.succeeded:
-            if debug:
-                print(
-                    f"Could not evaluate selected package option {option}:\n{result.stderr}",
-                    file=sys.stderr,
-                )
-            continue
-        value = parse_json(result.stdout, f"Invalid package option result for {option}")
-        if not isinstance(value, list):
-            continue
-        resolved_options.add(option)
-        for package in value:
-            if isinstance(package, dict):
-                packages.append({**package, "option": option})
-    return SelectedPackages(packages, resolved_options)
-
-
-def evaluate_manifest(
-    configuration: str,
-    candidate_lock: Path,
-    *,
-    candidate: bool,
-    include_priority_options: bool = False,
-) -> JsonObject:
-    evaluator = manifest_evaluator_path()
-    try:
-        evaluator_source = evaluator.read_text()
-    except OSError as error:
-        raise CheckerError(
-            f"Could not read the bundled package manifest evaluator: {evaluator}", str(error)
-        ) from error
-    apply = (
-        f"configuration: (({evaluator_source}) "
-        "{ inherit (configuration) config options; "
-        "includePriorityOptionPackages = "
-        f"{'true' if include_priority_options else 'false'}; }})"
-    )
-    arguments = ["eval"]
-    if candidate:
-        arguments.extend(["--reference-lock-file", str(candidate_lock)])
-    arguments.extend(["--json", "--apply", apply, configuration])
-    result = run_command(nix_executable(), arguments)
-    require_success(
-        result,
-        f"Could not evaluate the {'candidate' if candidate else 'current'} NixOS package manifest.",
-    )
-    value = parse_json(result.stdout, "Invalid package manifest JSON.")
+        # Nix releases before --json-format used format 1 as their only JSON shape.
+        result = run_nix(common, background=background)
+    require_success(result, f"Could not inspect the realized closure: {path}")
+    value = parse_json(result.stdout, "Invalid closure information returned by Nix.")
     if not isinstance(value, dict):
-        raise CheckerError("The evaluated package manifest is not an object.")
-    return value
-
-
-def query_closure(path: str) -> ClosureInformation:
-    result = run_command(
-        nix_executable(),
-        ["path-info", "--json", "--json-format", "1", "--recursive", "--size", path],
-    )
-    require_success(result, "Could not inspect the realized system closure.")
-    value = parse_json(result.stdout, "Invalid system closure JSON.")
-    if not isinstance(value, dict):
-        raise CheckerError("The system closure query did not return an object.")
+        raise CheckerError("The closure query did not return an object.")
     return ClosureInformation.from_path_info(value)
 
 
-def run_check(options: CheckOptions) -> JsonObject:
-    repository = Path(options.repository).expanduser().resolve()
-    if not (repository / "flake.nix").exists():
+def build_arguments(
+    installable: str,
+    candidate_lock: Path,
+    *,
+    background: bool,
+    parallelism: BuildParallelism,
+) -> list[str]:
+    arguments = [
+        "build",
+        "--no-link",
+        "--print-out-paths",
+        "--no-write-lock-file",
+        "--reference-lock-file",
+        str(candidate_lock),
+    ]
+    if background:
+        arguments[0:0] = [
+            "--option",
+            "max-substitution-jobs",
+            str(parallelism.substitution_jobs),
+        ]
+        arguments.extend(
+            ["--max-jobs", str(parallelism.max_jobs), "--cores", str(parallelism.cores_per_job)]
+        )
+    arguments.append(installable)
+    return arguments
+
+
+def current_cgroup() -> str:
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                return line[3:]
+    except OSError:
+        pass
+    return ""
+
+
+def run_check(repository_value: str, *, background: bool) -> JsonObject:
+    repository = Path(repository_value).expanduser().resolve()
+    if background and os.geteuid() != 0:
+        raise CheckerError("Background builds must run as root so Nix can use the local store.")
+    if not (repository / "flake.nix").is_file():
         raise CheckerError(f"Not a flake directory: {repository}")
     lock_path = repository / "flake.lock"
-    if not lock_path.exists():
+    if not lock_path.is_file():
         raise CheckerError("flake.lock is required as the current baseline.")
 
-    hostname = current_hostname()
+    lock_before = file_hash(lock_path)
     flake_reference = f"path:{repository}"
-    configuration_name = discover_configuration(flake_reference, hostname)
-    configuration = f"{flake_reference}#nixosConfigurations.{nix_quote(configuration_name)}"
+    configuration_name = discover_configuration(
+        flake_reference, current_hostname(), background=background
+    )
+    quoted_name = nix_quote(configuration_name)
+    configuration = f"{flake_reference}#nixosConfigurations.{quoted_name}"
     installable = f"{configuration}.config.system.build.toplevel"
-    settings = read_repository_settings(repository)
-    selected_options = settings.package_options
-    real_build = options.build or (options.service and settings.background_build)
-    if not real_build:
-        build_requester: str | None = None
-    elif not options.service:
-        build_requester = "interactive"
-    elif settings.background_build and not options.build:
-        build_requester = "backgroundSetting"
-    else:
-        build_requester = "serviceArgument"
 
     running_system = resolved_path(Path("/run/current-system"))
     boot_system = resolved_path(Path("/nix/var/nix/profiles/system"))
-    running_deriver = deriver_for(running_system, debug=options.debug)
-    boot_deriver = deriver_for(boot_system, debug=options.debug)
+    baseline_system = running_system or boot_system
+    if not baseline_system:
+        raise CheckerError("No running or next-boot NixOS system closure is available.")
 
+    declared = run_nix(
+        ["eval", "--raw", "--no-write-lock-file", f"{installable}.drvPath"],
+        background=background,
+    )
+    require_success(declared, "Could not evaluate the configured NixOS system.")
+    if lock_before != file_hash(lock_path):
+        raise CheckerError("flake.lock changed unexpectedly during current-system evaluation.")
+    declared_deriver = declared.stdout.strip()
+    running_deriver = deriver_for(running_system, background=background)
+    configuration_state = "unavailable"
+    if declared_deriver and running_deriver:
+        configuration_state = "applied" if declared_deriver == running_deriver else "differs"
+
+    parallelism = choose_parallelism(available_cpu_count())
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="nixos-update-checker-") as temporary_directory:
         candidate_lock = Path(temporary_directory) / "flake.lock"
-
-        result = run_command(nix_executable(), ["eval", "--raw", f"{installable}.drvPath"])
-        require_success(result, "Could not evaluate the current NixOS toplevel derivation.")
-        declared_deriver = result.stdout.strip()
-
-        current_manifest: JsonObject = {}
-        if options.inspect_packages and not real_build:
-            current_manifest = evaluate_manifest(
-                configuration,
-                candidate_lock,
-                candidate=False,
-                include_priority_options=True,
-            )
-
-        configuration_state = "unavailable"
-        if declared_deriver and running_deriver:
-            configuration_state = "applied" if declared_deriver == running_deriver else "differs"
-        next_boot_state = "unavailable"
-        if declared_deriver and boot_deriver:
-            next_boot_state = "matches" if declared_deriver == boot_deriver else "differs"
-
-        lock_before = file_hash(lock_path)
-        update = run_command(
-            nix_executable(),
+        update = run_nix(
             [
                 "flake",
                 "update",
@@ -1008,7 +292,7 @@ def run_check(options: CheckOptions) -> JsonObject:
                 "--output-lock-file",
                 str(candidate_lock),
             ],
-            cwd=repository,
+            background=background,
         )
         require_success(update, "Could not resolve updated flake inputs.")
         if lock_before != file_hash(lock_path):
@@ -1017,196 +301,32 @@ def run_check(options: CheckOptions) -> JsonObject:
         current_lock = read_json_object(lock_path, "Invalid current flake.lock.")
         candidate_lock_value = read_json_object(candidate_lock, "Invalid candidate flake.lock.")
         input_changes = compare_inputs(current_lock, candidate_lock_value)
-        candidate_source_channels: dict[str, str] = {}
-        current_source_channels: dict[str, str] = {}
-        if options.inspect_packages or real_build:
-            candidate_source_channels = flake_input_source_channels(
-                flake_reference, candidate_lock, candidate_lock_value
-            )
-            if not real_build:
-                current_source_channels = flake_input_source_channels(
-                    flake_reference, lock_path, current_lock
-                )
 
-        package_changes: list[JsonObject] = []
-        dependency_changes: list[JsonObject] = []
-        resolved_options: set[str] = set()
-        package_source = "none"
-        baseline_system = ""
-        candidate_system = ""
-        baseline_closure = ClosureInformation()
-        candidate_closure = ClosureInformation()
+        build = run_nix(
+            build_arguments(
+                installable,
+                candidate_lock,
+                background=background,
+                parallelism=parallelism,
+            ),
+            background=background,
+        )
+        require_success(build, "Could not build the candidate NixOS system.")
+        candidate_paths = build.stdout.split()
+        if len(candidate_paths) != 1:
+            raise CheckerError("The candidate build did not return exactly one system closure.")
+        candidate_system = candidate_paths[0]
 
-        if real_build:
-            baseline_system = running_system or boot_system
-            if not baseline_system:
-                raise CheckerError("No running or next-boot system closure is available.")
-            build_arguments = [
-                "build",
-                "--no-link",
-                "--print-out-paths",
-                "--no-write-lock-file",
-                "--reference-lock-file",
-                str(candidate_lock),
-            ]
-            if options.service:
-                build_arguments.extend(["--max-jobs", "1", "--cores", "1"])
-            build_arguments.append(installable)
-            build = run_command(nix_executable(), build_arguments)
-            require_success(build, "Could not build the candidate system closure.")
-            candidate_paths = build.stdout.split()
-            if len(candidate_paths) != 1:
-                raise CheckerError("The candidate build did not return exactly one system closure.")
-            candidate_system = candidate_paths[0]
-            baseline_closure = query_closure(baseline_system)
-            candidate_closure = query_closure(candidate_system)
-            closure_changes = compare_closures(baseline_closure, candidate_closure)
-            if candidate_source_channels:
-                annotate_closure_change_channels(
-                    closure_changes,
-                    candidate_source_channels,
-                    configuration_platform(configuration, candidate_lock),
-                    debug=options.debug,
-                )
-            candidate_manifest = evaluate_manifest(
-                configuration,
-                candidate_lock,
-                candidate=True,
-                include_priority_options=True,
-            )
-            annotate_package_sets(
-                closure_changes,
-                configuration,
-                candidate_lock,
-                PACKAGE_SET_SPECS,
-                candidate_source_channels,
-                str(candidate_manifest.get("toplevelDeriver") or candidate_system),
-                full=True,
-                debug=options.debug,
-            )
-            candidate_selected = evaluate_selected_packages(
-                configuration,
-                selected_options,
-                candidate_lock,
-                candidate=True,
-                debug=options.debug,
-            )
-            annotate_manifest_channels(candidate_manifest, candidate_source_channels)
-            annotate_package_channels(candidate_selected.packages, candidate_source_channels)
-            resolved_options = candidate_selected.resolved_options
-            direct_packages = collect_packages(candidate_manifest, candidate_selected.packages)
-            realized_option_packages = [
-                package
-                for package in candidate_manifest.get("priorityOptionPackages", [])
-                if isinstance(package, dict)
-                and str(package.get("path", "")) in candidate_closure.paths
-            ]
-            package_changes, dependency_changes = partition_priority_changes(
-                closure_changes,
-                [*direct_packages.values(), *realized_option_packages],
-            )
-            enrich_package_changes(
-                [*package_changes, *dependency_changes],
-                [*direct_packages.values(), *realized_option_packages],
-            )
-            package_source = "realizedClosure"
-        elif options.inspect_packages:
-            candidate_manifest = evaluate_manifest(
-                configuration,
-                candidate_lock,
-                candidate=True,
-                include_priority_options=True,
-            )
-            current_selected = evaluate_selected_packages(
-                configuration,
-                selected_options,
-                candidate_lock,
-                candidate=False,
-                debug=options.debug,
-            )
-            candidate_selected = evaluate_selected_packages(
-                configuration,
-                selected_options,
-                candidate_lock,
-                candidate=True,
-                debug=options.debug,
-            )
-            annotate_manifest_channels(current_manifest, current_source_channels)
-            annotate_manifest_channels(candidate_manifest, candidate_source_channels)
-            annotate_package_channels(current_selected.packages, current_source_channels)
-            annotate_package_channels(candidate_selected.packages, candidate_source_channels)
-            resolved_options = (
-                current_selected.resolved_options | candidate_selected.resolved_options
-            )
-            baseline_system = running_system or boot_system
-            if not baseline_system:
-                raise CheckerError("No running or next-boot system closure is available.")
-            baseline_closure = query_closure(baseline_system)
-            current_option_packages = packages_matching_closure(
-                (
-                    package
-                    for package in current_manifest.get("priorityOptionPackages", [])
-                    if isinstance(package, dict)
-                ),
-                baseline_closure,
-            )
-            candidate_option_packages = packages_matching_closure(
-                (
-                    package
-                    for package in candidate_manifest.get("priorityOptionPackages", [])
-                    if isinstance(package, dict)
-                ),
-                baseline_closure,
-            )
-            package_changes = compare_packages_to_closure(
-                baseline_closure,
-                collect_packages(
-                    current_manifest,
-                    [*current_selected.packages, *current_option_packages],
-                ),
-                collect_packages(
-                    candidate_manifest,
-                    [*candidate_selected.packages, *candidate_option_packages],
-                ),
-            )
-            if candidate_source_channels:
-                annotate_closure_change_channels(
-                    package_changes,
-                    candidate_source_channels,
-                    configuration_platform(configuration, candidate_lock),
-                    debug=options.debug,
-                )
-            annotate_package_sets(
-                package_changes,
-                configuration,
-                candidate_lock,
-                PACKAGE_SET_SPECS,
-                candidate_source_channels,
-                str(candidate_manifest.get("toplevelDeriver") or ""),
-                full=False,
-                debug=options.debug,
-            )
-            package_source = "evaluatedManifestAgainstRunningClosure"
+        current_closure = query_closure(baseline_system, background=background)
+        candidate_closure = query_closure(candidate_system, background=background)
 
-        if lock_before != file_hash(lock_path):
-            raise CheckerError("flake.lock changed unexpectedly during the candidate check.")
+    if lock_before != file_hash(lock_path):
+        raise CheckerError("flake.lock changed unexpectedly during the candidate build.")
 
-    limited = options.service or environment("NIXOS_UPDATE_CHECKER_IN_SCOPE") == "1"
-    meaningful_package_changes, primary_store_changes = split_package_changes(package_changes)
-    meaningful_dependency_changes, dependency_store_changes = split_package_changes(
-        dependency_changes
-    )
-    store_only_changes = [*primary_store_changes, *dependency_store_changes]
-    summary = package_summary(
-        [*meaningful_package_changes, *meaningful_dependency_changes, *store_only_changes]
-    )
-    summary.update(
-        {
-            "primary": len(meaningful_package_changes),
-            "dependencies": len(meaningful_dependency_changes),
-        }
-    )
-    report: JsonObject = {
+    all_package_changes = compare_closures(current_closure, candidate_closure)
+    package_changes, store_only_changes = split_package_changes(all_package_changes)
+    elapsed = round(time.monotonic() - started, 3)
+    return {
         "schemaVersion": SCHEMA_VERSION,
         "backendVersion": environment("NIXOS_UPDATE_CHECKER_VERSION", __version__),
         "buildRevision": build_revision(),
@@ -1214,104 +334,37 @@ def run_check(options: CheckOptions) -> JsonObject:
         "status": "success",
         "repository": str(repository),
         "configuration": configuration_name,
-        "resourcePolicy": {
-            "limited": limited,
-            "mode": "background" if options.service else "interactive",
-            "cpuQuota": options.cpu_quota if limited else None,
-            "nice": 19 if limited else None,
-            "ioClass": "idle" if limited else None,
-        },
-        "system": {
-            "runningPath": running_system or None,
-            "nextBootPath": boot_system or None,
-            "runningGeneration": generation_name(running_system),
-            "nextBootGeneration": generation_name(boot_system),
-            "rebootPending": bool(running_system and boot_system and running_system != boot_system),
-            "configurationState": configuration_state,
-            "nextBootState": next_boot_state,
-            "declaredDeriver": declared_deriver or None,
-            "runningDeriver": running_deriver or None,
-            "nextBootDeriver": boot_deriver or None,
-        },
         "inputs": input_changes,
         "packages": {
-            "inspected": options.inspect_packages or real_build,
-            "source": package_source,
-            "changes": meaningful_package_changes,
-            "dependencyChanges": meaningful_dependency_changes,
+            "changes": package_changes,
             "storeOnlyChanges": store_only_changes,
-            "summary": summary,
-            "selectedOptions": selected_options,
-            "unresolvedOptions": [
-                option
-                for option in selected_options
-                if options.inspect_packages and option not in resolved_options
-            ],
+            "summary": package_summary(all_package_changes),
+        },
+        "system": {
+            "runningSystem": running_system or None,
+            "bootSystem": boot_system or None,
+            "runningGeneration": generation_name(running_system),
+            "configurationState": configuration_state,
+            "rebootPending": bool(running_system and boot_system and running_system != boot_system),
         },
         "build": {
-            "performed": real_build,
-            "requestedBy": build_requester,
-            "baselineSystem": baseline_system or None,
-            "candidateSystem": candidate_system or None,
-            "baselineClosureBytes": baseline_closure.nar_size if real_build else 0,
-            "candidateClosureBytes": candidate_closure.nar_size if real_build else 0,
-            "closureSizeDeltaBytes": (
-                candidate_closure.nar_size - baseline_closure.nar_size if real_build else 0
-            ),
-            "addedStorePaths": (
-                len(candidate_closure.paths - baseline_closure.paths) if real_build else 0
-            ),
-            "removedStorePaths": (
-                len(baseline_closure.paths - candidate_closure.paths) if real_build else 0
-            ),
-            "buildLimits": {"maxJobs": 1, "cores": 1} if options.service and real_build else None,
+            "performed": True,
+            "background": background,
+            "candidateSystem": candidate_system,
+            "elapsedSeconds": elapsed,
+            "storeMode": "local" if background else "auto",
+            "cgroup": current_cgroup(),
+            "parallelism": asdict(parallelism) if background else None,
+            "baselineClosureBytes": current_closure.nar_size,
+            "candidateClosureBytes": candidate_closure.nar_size,
+            "closureSizeDeltaBytes": candidate_closure.nar_size - current_closure.nar_size,
+            "addedStorePaths": len(candidate_closure.paths - current_closure.paths),
+            "removedStorePaths": len(current_closure.paths - candidate_closure.paths),
         },
-        "updatesAvailable": bool(
-            input_changes or meaningful_package_changes or meaningful_dependency_changes
-        ),
+        "updatesAvailable": bool(input_changes or package_changes),
+        "rebuildRequired": bool(store_only_changes),
         "lockFile": {"path": str(lock_path), "modified": False},
     }
-    if options.debug:
-        print(
-            f"Selected current-system configuration: {configuration_name}"
-            f"\nRepository: {repository}",
-            file=sys.stderr,
-        )
-    return report
-
-
-def print_human_report(report: JsonObject) -> None:
-    system = report["system"]
-    inputs = report["inputs"]
-    packages_object = report["packages"]
-    packages = packages_object["changes"]
-    dependencies = packages_object.get("dependencyChanges", [])
-    store_only = packages_object.get("storeOnlyChanges", [])
-    build = report["build"]
-    print(f"NixOS update check ({report['configuration']})")
-    print(f"  repository:    {report['repository']}")
-    print(f"  generation:    {system['runningGeneration']}")
-    print(f"  configuration: {system['configurationState']}")
-    print(f"  reboot pending: {'yes' if system['rebootPending'] else 'no'}")
-    print(f"\nInputs: {len(inputs)} change(s)")
-    for change in inputs:
-        print(f"  {change['name']}: {change['before']['display']} -> {change['after']['display']}")
-    source = "realized closure" if build["performed"] else "evaluated manifest"
-    print(f"\nPackages: {len(packages)} change(s) ({source})")
-    for change in packages:
-        print(f"  {change['name']} ({change['kind']})")
-    if dependencies:
-        print(f"\nDependency changes: {len(dependencies)}")
-        for change in dependencies:
-            print(f"  {change['name']} ({change['kind']})")
-    if store_only:
-        print(f"\nStore-only package changes: {len(store_only)}")
-        for change in store_only:
-            print(f"  {change['name']}")
-    if build["performed"]:
-        print(f"\nCandidate system: {build['candidateSystem']}")
-        print(f"Store paths: +{build['addedStorePaths']} / -{build['removedStorePaths']}")
-    print("\nflake.lock unchanged")
 
 
 def write_report(path: Path, report: JsonObject) -> None:
@@ -1319,7 +372,11 @@ def write_report(path: Path, report: JsonObject) -> None:
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
         ) as stream:
             temporary_name = stream.name
             json.dump(report, stream, indent=2)
@@ -1346,105 +403,50 @@ def error_report(repository: str, error: CheckerError) -> JsonObject:
     }
 
 
-def enter_resource_scope(arguments: list[str], cpu_quota: str) -> NoReturn:
-    systemd_run = environment("NIXOS_UPDATE_CHECKER_SYSTEMD_RUN", "systemd-run")
-    ionice = environment("NIXOS_UPDATE_CHECKER_IONICE", "ionice")
-    nice = environment("NIXOS_UPDATE_CHECKER_NICE", "nice")
-    command = [
-        systemd_run,
-        "--user",
-        "--scope",
-        "--collect",
-        "--quiet",
-        "--same-dir",
-        "--description=NixOS update check",
-        f"--property=CPUQuota={cpu_quota}",
-        "--setenv=NIXOS_UPDATE_CHECKER_IN_SCOPE=1",
-        f"--setenv=NIXOS_UPDATE_CHECKER_CPU_QUOTA={cpu_quota}",
-        ionice,
-        "-c",
-        "3",
-        nice,
-        "-n",
-        "19",
-        sys.executable,
-        "-m",
-        "nixos_update_checker.checker",
-        *arguments,
-    ]
-    try:
-        os.execvp(systemd_run, command)
-    except OSError as error:
-        raise CheckerError(
-            "Could not enter the resource-limited systemd scope.", str(error)
-        ) from error
+def print_human_report(report: JsonObject) -> None:
+    inputs = report.get("inputs", [])
+    packages = report.get("packages", {})
+    changes = packages.get("changes", []) if isinstance(packages, dict) else []
+    store_only = packages.get("storeOnlyChanges", []) if isinstance(packages, dict) else []
+    build = report.get("build", {})
+    print(f"NixOS update check: {report.get('configuration', 'unknown')}")
+    print(f"Flake inputs: {len(inputs)}")
+    print(f"Package updates: {len(changes)}")
+    print(f"Rebuild-only changes: {len(store_only)}")
+    if isinstance(build, dict):
+        print(f"Build time: {build.get('elapsedSeconds', 0)} seconds")
+    print("flake.lock unchanged")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Check the running flake-based NixOS system for updates"
-    )
+    parser = argparse.ArgumentParser(description="Build and compare a candidate NixOS system")
     parser.add_argument("repository", nargs="?", default=".")
-    parser.add_argument(
-        "--build",
-        action="store_true",
-        help="build the candidate closure and report realized closure changes",
-    )
-    parser.add_argument("--source-only", action="store_true", help="skip manifest inspection")
+    parser.add_argument("--background", action="store_true")
+    parser.add_argument("--report", type=Path)
     parser.add_argument("--json", action="store_true", dest="json_output")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--no-limit", action="store_true")
-    parser.add_argument(
-        "--cpu-quota",
-        default=environment("NIXOS_UPDATE_CHECKER_DEFAULT_CPU_QUOTA", "25%"),
-    )
-    parser.add_argument("--service", action="store_true")
-    parser.add_argument("--report", default="/var/lib/nixos-update-checker/report.json")
     parser.add_argument("--version", action="version", version=f"%(prog)s {display_version()}")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    namespace = build_parser().parse_args(arguments)
-    if not re.fullmatch(r"[1-9][0-9]*%", namespace.cpu_quota):
-        print("--cpu-quota must be a positive percentage such as 25%", file=sys.stderr)
-        return 2
-
-    options = CheckOptions(
-        repository=namespace.repository,
-        cpu_quota=namespace.cpu_quota,
-        report_path=namespace.report,
-        build=namespace.build,
-        inspect_packages=not namespace.source_only,
-        json_output=namespace.json_output,
-        debug=namespace.debug,
-        limit_resources=not namespace.no_limit,
-        service=namespace.service,
-    )
-    if options.service:
-        options.json_output = True
-        options.limit_resources = False
-    if options.limit_resources and environment("NIXOS_UPDATE_CHECKER_IN_SCOPE") != "1":
-        enter_resource_scope(arguments, options.cpu_quota)
-
+    namespace = build_parser().parse_args(argv)
     try:
-        report = run_check(options)
-        if options.service:
-            write_report(Path(options.report_path), report)
-        elif options.json_output:
+        report = run_check(namespace.repository, background=namespace.background)
+        if namespace.report:
+            write_report(namespace.report, report)
+        if namespace.json_output:
             json.dump(report, sys.stdout, indent=2)
             print()
-        else:
+        elif not namespace.report:
             print_human_report(report)
         return 0
     except CheckerError as error:
         print(f"ERROR: {error.message}", file=sys.stderr)
         if error.diagnostics:
             print(error.diagnostics, file=sys.stderr)
-        if options.service:
+        if namespace.report:
             try:
-                write_report(Path(options.report_path), error_report(options.repository, error))
+                write_report(namespace.report, error_report(namespace.repository, error))
             except CheckerError as report_error:
                 print(f"ERROR: {report_error.message}", file=sys.stderr)
         return 1
