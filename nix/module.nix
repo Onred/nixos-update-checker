@@ -24,7 +24,7 @@ in
 
     cpuQuota = lib.mkOption {
       type = lib.types.strMatching "[1-9][0-9]*%";
-      default = "25%";
+      default = "50%";
       example = "50%";
       description = ''
         Aggregate CPU quota for the checker. Values below 100% throttle
