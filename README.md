@@ -52,11 +52,11 @@ Only three module options are exposed:
 |---|---:|---|
 | `enable` | `false` | Install and enable the checker. |
 | `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
-| `cpuLimit` | `1` | Aggregate background CPU throughput, in logical CPUs. |
+| `cpuQuota` | `25%` | Aggregate CPU quota for background checks. |
 
-For example, `cpuLimit = 2` permits the service to use two CPUs' worth of total
-time. Nix workers and their cores are split with the following bounded square
-allocation, while systemd enforces the aggregate limit:
+For example, `cpuQuota = "25%"` limits both single-threaded evaluation and
+parallel builds to one quarter of a CPU's total throughput. Nix workers and
+their cores are still split with the following bounded square allocation:
 
 | Available CPUs | Nix jobs | Cores per job | Worker budget |
 |---:|---:|---:|---:|

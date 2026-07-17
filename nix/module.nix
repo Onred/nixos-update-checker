@@ -22,13 +22,13 @@ in
       description = "Absolute path to the flake-based NixOS configuration.";
     };
 
-    cpuLimit = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 1;
-      example = 2;
+    cpuQuota = lib.mkOption {
+      type = lib.types.strMatching "[1-9][0-9]*%";
+      default = "25%";
+      example = "50%";
       description = ''
-        Maximum aggregate CPU throughput for the build, measured in logical
-        CPUs. Build jobs are still spread across all available CPUs.
+        Aggregate CPU quota for the checker. Values below 100% throttle
+        single-threaded evaluation as well as parallel build work.
       '';
     };
   };
@@ -64,7 +64,7 @@ in
         StateDirectoryMode = "0755";
         UMask = "0022";
 
-        CPUQuota = "${toString cfg.cpuLimit}00%";
+        CPUQuota = cfg.cpuQuota;
         CPUQuotaPeriodSec = "10ms";
         CPUWeight = 1;
         IOWeight = 1;
