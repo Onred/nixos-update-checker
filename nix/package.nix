@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "3.1.4";
+  version = "3.1.5";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -73,7 +73,9 @@ pkgs.stdenv.mkDerivation {
       --set NIXOS_UPDATE_CHECKER_ICON \
         "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
       --set NIXOS_UPDATE_CHECKER_SYSTEMCTL "${pkgs.systemd}/bin/systemctl"
+      --set NIXOS_UPDATE_CHECKER_JOURNALCTL "${pkgs.systemd}/bin/journalctl"
       --set NIXOS_UPDATE_CHECKER_REPORT "/var/lib/nixos-update-checker/report.json"
+      --set NIXOS_UPDATE_CHECKER_SERVICE "nixos-update-checker.service"
       --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"
     )
     wrapQtApp "$out/bin/nixos-update-checker"

@@ -38,6 +38,23 @@ in
     environment.etc."xdg/autostart/nixos-update-checker.desktop".source =
       "${package}/share/nixos-update-checker/autostart.desktop";
 
+    # Refresh is safe to request without authentication: the command, limits,
+    # and repository are fixed by this root-owned module. Applying an update is
+    # deliberately not covered by this rule and still requires authentication.
+    security.polkit = {
+      enable = true;
+      extraConfig = ''
+        polkit.addRule(function(action, subject) {
+          if (action.id == "org.freedesktop.systemd1.manage-units" &&
+              action.lookup("unit") == "nixos-update-checker.service" &&
+              action.lookup("verb") == "start" &&
+              subject.active && subject.local) {
+            return polkit.Result.YES;
+          }
+        });
+      '';
+    };
+
     systemd.services.nixos-update-checker = {
       description = "Build an updated NixOS candidate and publish a report";
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];

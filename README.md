@@ -9,13 +9,13 @@ The application has a deliberately narrow boundary:
   builds it, compares it with the appropriate system generation, and atomically
   writes a schema-2 JSON report.
 - `nixos-update-checker` reads that JSON and asks systemd to start the service
-  when **Check now** is selected.
+  when **Refresh** is selected.
 - `nixos-update-checker-apply` updates the real lock and switches the reported
   configuration when the GUI starts the apply service.
 
-The GUI itself does not run Nix, modify the configuration, collect garbage, or
-duplicate service logs. Check and apply operations remain root-owned systemd
-services, with their output available through `journalctl`.
+The GUI itself does not run Nix, modify the configuration, or collect garbage.
+Refresh and update operations remain root-owned systemd services. While either
+operation is running, the GUI follows its journal output in the progress area.
 
 ## Install
 
@@ -85,10 +85,20 @@ window contains only:
 
 - a flat table showing package name, new version or removal, and closure delta;
 - a vertically draggable text area with complete versions, closure sizes, and
-  store paths for the selected row;
+  store paths for the selected row, plus live service output;
 - a generation line describing a system that is ready for the next boot;
 - report time and configuration;
-- **Check now** and **Apply update** buttons that start their systemd services.
+- **Refresh** and **Update** buttons above the table.
+
+The tray icon uses a colored status badge: orange means updates are pending,
+green means the report is current with no updates, blue means work is running,
+and red means the last check failed. Its tooltip follows the live service state
+and shows the cached update counts while idle.
+
+An active local desktop user may start only the constrained refresh service
+without authentication. Updating the system is a separate service and still
+requires administrator authentication. After a successful update, the GUI
+restarts from the newly activated system so an updated checker is loaded too.
 
 Top-level flake inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long

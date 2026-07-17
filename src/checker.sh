@@ -59,6 +59,10 @@ write_report() {
   fi
 }
 
+log() {
+  printf 'INFO: %s\n' "$*" >&2
+}
+
 fail() {
   local message=$1
   local diagnostics=${2:-}
@@ -184,7 +188,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.4"
+      echo "nixos-update-checker-service 3.1.5"
       exit 0
       ;;
     --*)
@@ -209,6 +213,7 @@ if [[ -n "${NIXOS_UPDATE_CHECKER_LOCK:-}" ]]; then
   flock 9
 fi
 
+log "Inspecting the running and default-boot generations."
 [[ -f "$repository/flake.nix" ]] || fail "No flake.nix exists in $repository."
 [[ -f "$repository/flake.lock" ]] || fail "This checker requires a flake.lock baseline."
 
@@ -238,13 +243,16 @@ candidate_lock="$temporary_directory/candidate.lock"
 
 # Lock resolution is independent of selecting and evaluating the current
 # configuration. Run both within the same service-wide CPU quota.
+log "Resolving updated flake inputs."
 nix --store local flake update --flake "$flake" \
-  --output-lock-file "$candidate_lock" 2>"$temporary_directory/update.log" &
+  --output-lock-file "$candidate_lock" \
+  2> >(tee "$temporary_directory/update.log" >&2) &
 candidate_lock_pid=$!
 
 # This is a Nix expression; ${name} must reach Nix literally.
 # shellcheck disable=SC2016
 discovery_expression='configs: map (name: let value = builtins.tryEval configs.${name}.config.networking.hostName; in { inherit name; hostName = if value.success then value.value else ""; }) (builtins.attrNames configs)'
+log "Evaluating the current NixOS configuration."
 if ! configurations=$(nix --store local eval --json --no-write-lock-file \
   --apply "$discovery_expression" "$flake#nixosConfigurations" 2>"$temporary_directory/discovery.log"); then
   fail "Could not enumerate NixOS configurations." "$(<"$temporary_directory/discovery.log")"
@@ -359,12 +367,13 @@ if ((substitution_jobs > 4)); then
   substitution_jobs=4
 fi
 
+log "Building the candidate with $max_jobs jobs and $cores_per_job cores per job."
 if ! candidate_system=$(nix --store local \
   --option max-substitution-jobs "$substitution_jobs" \
-  build --no-link --print-out-paths --no-write-lock-file \
+  build --no-link --print-out-paths --print-build-logs --no-write-lock-file \
   --reference-lock-file "$candidate_lock" \
   --max-jobs "$max_jobs" --cores "$cores_per_job" \
-  "$installable" 2>"$temporary_directory/build.log"); then
+  "$installable" 2> >(tee "$temporary_directory/build.log" >&2)); then
   fail "Could not build the candidate NixOS system." "$(<"$temporary_directory/build.log")"
 fi
 candidate_system=$(head -n 1 <<<"$candidate_system")
@@ -374,6 +383,7 @@ candidate_json="$temporary_directory/candidate.json"
 baseline_log="$temporary_directory/baseline-path-info.log"
 candidate_log="$temporary_directory/candidate-path-info.log"
 
+log "Inspecting baseline and candidate closures."
 if [[ "$baseline_system" == "$candidate_system" ]]; then
   if ! query_path_info "$baseline_system" "$baseline_json" "$baseline_log"; then
     fail "Could not inspect the realized closure $baseline_system." "$(<"$baseline_log")"
@@ -407,6 +417,7 @@ else
   fi
 fi
 
+log "Comparing package and closure changes."
 jq -n \
   --slurpfile baseline "$temporary_directory/baseline.json" \
   --slurpfile candidate "$temporary_directory/candidate.json" '
@@ -565,3 +576,4 @@ jq -n \
   fail "flake.lock changed while the candidate was built."
 
 write_report "$temporary_directory/report.json"
+log "Update report published in ${elapsed}s."

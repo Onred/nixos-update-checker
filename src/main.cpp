@@ -3,6 +3,7 @@
 #include <QCloseEvent>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -18,21 +19,25 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPaintEvent>
 #include <QPlainTextEdit>
 #include <QProcess>
-#include <QProgressBar>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSplitter>
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
+#include <QTextCursor>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
 namespace {
 
-constexpr auto Version = "3.1.4";
+constexpr auto Version = "3.1.5";
 constexpr int DetailRole = Qt::UserRole;
 
 QString environment(const char *name, const QString &fallback = {})
@@ -195,6 +200,133 @@ QString rebuildDetails(const QJsonObject &rebuilds)
     return lines.join('\n');
 }
 
+class BusyIndicator final : public QWidget
+{
+public:
+    explicit BusyIndicator(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setFixedSize(170, 46);
+        connect(&timer_, &QTimer::timeout, this, [this] {
+            step_ = (step_ + 1) % 12;
+            update();
+        });
+    }
+
+    void setRunning(bool running, const QString &text)
+    {
+        text_ = text;
+        setVisible(running);
+        if (running) {
+            timer_.start(80);
+            raise();
+        } else {
+            timer_.stop();
+        }
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        QColor background = palette().color(QPalette::Base);
+        background.setAlpha(235);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(background);
+        painter.drawRoundedRect(rect().adjusted(1, 1, -1, -1), 8, 8);
+
+        const QPointF center(24, height() / 2.0);
+        const QColor color = palette().color(QPalette::Highlight);
+        for (int index = 0; index < 12; ++index) {
+            QColor spoke = color;
+            spoke.setAlpha(35 + 220 * ((index + step_) % 12) / 11);
+            painter.setPen(QPen(spoke, 2.4, Qt::SolidLine, Qt::RoundCap));
+            painter.save();
+            painter.translate(center);
+            painter.rotate(index * 30.0);
+            painter.drawLine(QPointF(0, -7), QPointF(0, -13));
+            painter.restore();
+        }
+        painter.setPen(palette().color(QPalette::Text));
+        painter.drawText(QRect(44, 0, width() - 52, height()), Qt::AlignVCenter, text_);
+    }
+
+private:
+    QTimer timer_;
+    int step_ = 0;
+    QString text_;
+};
+
+class UpdateTable final : public QTableWidget
+{
+public:
+    explicit UpdateTable(QWidget *parent = nullptr)
+        : QTableWidget(0, 3, parent)
+    {
+        setMouseTracking(true);
+        viewport()->setMouseTracking(true);
+
+        busy_ = new BusyIndicator(viewport());
+        busy_->hide();
+    }
+
+    void setBusy(bool busy, const QString &text = {})
+    {
+        busy_->setRunning(busy, text);
+        positionBusyIndicator();
+    }
+
+protected:
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        const int row = indexAt(event->position().toPoint()).row();
+        if (row != hoveredRow_) {
+            hoveredRow_ = row;
+            viewport()->update();
+        }
+        QTableWidget::mouseMoveEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override
+    {
+        hoveredRow_ = -1;
+        viewport()->update();
+        QTableWidget::leaveEvent(event);
+    }
+
+    void paintEvent(QPaintEvent *event) override
+    {
+        QTableWidget::paintEvent(event);
+        if (hoveredRow_ < 0 || selectionModel()->isRowSelected(hoveredRow_, QModelIndex{}))
+            return;
+
+        const QModelIndex first = model()->index(hoveredRow_, 0);
+        const QRect rowRect(0, visualRect(first).top(), viewport()->width(), rowHeight(hoveredRow_));
+        QColor hover = palette().color(QPalette::Highlight);
+        hover.setAlpha(28);
+        QPainter painter(viewport());
+        painter.fillRect(rowRect, hover);
+    }
+
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QTableWidget::resizeEvent(event);
+        positionBusyIndicator();
+    }
+
+private:
+    void positionBusyIndicator()
+    {
+        busy_->move((viewport()->width() - busy_->width()) / 2,
+            (viewport()->height() - busy_->height()) / 2);
+    }
+
+    int hoveredRow_ = -1;
+    BusyIndicator *busy_ = nullptr;
+};
+
 class MainWindow final : public QMainWindow
 {
 public:
@@ -210,10 +342,13 @@ public:
         connect(&pollTimer_, &QTimer::timeout, this, [this] {
             loadReport(false);
             refreshLiveSystemState();
+            pollServiceState();
         });
         pollTimer_.start(3000);
         loadReport(true);
         refreshLiveSystemState();
+        pollServiceState();
+        updatePresentation();
     }
 
 protected:
@@ -246,59 +381,72 @@ private:
         generationStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         layout->addWidget(generationStatus_);
 
+        auto *actions = new QHBoxLayout;
+        status_ = new QLabel("Waiting for a report", central);
+        status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        status_->setWordWrap(true);
+        refreshButton_ = new QPushButton("Refresh", central);
+        updateButton_ = new QPushButton("Update", central);
+        actions->addWidget(status_, 1);
+        actions->addWidget(refreshButton_);
+        actions->addWidget(updateButton_);
+        layout->addLayout(actions);
+
         auto *splitter = new QSplitter(Qt::Vertical, central);
         splitter->setChildrenCollapsible(false);
-        updates_ = new QTableWidget(0, 3, splitter);
+        splitter->setHandleWidth(12);
+        updates_ = new UpdateTable(splitter);
         updates_->setHorizontalHeaderLabels({"Package", "New version", "Size"});
         updates_->setAlternatingRowColors(false);
+        updates_->setShowGrid(false);
         updates_->setEditTriggers(QAbstractItemView::NoEditTriggers);
         updates_->setSelectionBehavior(QAbstractItemView::SelectRows);
         updates_->setSelectionMode(QAbstractItemView::SingleSelection);
         updates_->setTextElideMode(Qt::ElideRight);
+        updates_->setStyleSheet(
+            "QTableView::item { border: 0; padding-left: 8px; padding-right: 8px; }");
         updates_->verticalHeader()->hide();
         updates_->verticalHeader()->setDefaultSectionSize(40);
         updates_->horizontalHeader()->setSectionsMovable(false);
         updates_->horizontalHeader()->setSectionsClickable(false);
-        updates_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-        updates_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
-        updates_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+        updates_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        updates_->horizontalHeader()->setStretchLastSection(false);
+        updates_->setColumnWidth(0, 500);
         updates_->setColumnWidth(1, 190);
         updates_->setColumnWidth(2, 110);
 
-        details_ = new QPlainTextEdit(splitter);
+        auto *detailsPanel = new QWidget(splitter);
+        auto *detailsLayout = new QVBoxLayout(detailsPanel);
+        detailsLayout->setContentsMargins(0, 4, 0, 0);
+        detailsLayout->setSpacing(6);
+        auto *detailsLabel = new QLabel("Details and progress", detailsPanel);
+        QFont detailsFont = detailsLabel->font();
+        detailsFont.setBold(true);
+        detailsLabel->setFont(detailsFont);
+        details_ = new QPlainTextEdit(detailsPanel);
         details_->setReadOnly(true);
         details_->setPlaceholderText("Select an update to see its details.");
+        detailsLayout->addWidget(detailsLabel);
+        detailsLayout->addWidget(details_, 1);
         splitter->addWidget(updates_);
-        splitter->addWidget(details_);
+        splitter->addWidget(detailsPanel);
         splitter->setStretchFactor(0, 3);
         splitter->setStretchFactor(1, 1);
         splitter->setSizes({460, 150});
         layout->addWidget(splitter, 1);
 
-        auto *footer = new QHBoxLayout;
-        status_ = new QLabel("Waiting for a report", central);
-        status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        progress_ = new QProgressBar(central);
-        progress_->setRange(0, 0);
-        progress_->setTextVisible(false);
-        progress_->setFixedWidth(90);
-        progress_->hide();
-        applyButton_ = new QPushButton("Apply update", central);
-        checkButton_ = new QPushButton("Check now", central);
-        footer->addWidget(status_, 1);
-        footer->addWidget(progress_);
-        footer->addWidget(applyButton_);
-        footer->addWidget(checkButton_);
-        layout->addLayout(footer);
         setCentralWidget(central);
 
         connect(updates_, &QTableWidget::currentCellChanged, this,
                 [this](int row, int, int, int) {
+                    if (serviceBusy())
+                        return;
                     const QTableWidgetItem *item = row >= 0 ? updates_->item(row, 0) : nullptr;
+                    showingProgress_ = false;
                     details_->setPlainText(item ? item->data(DetailRole).toString() : QString{});
                 });
-        connect(checkButton_, &QPushButton::clicked, this, [this] { startCheck(); });
-        connect(applyButton_, &QPushButton::clicked, this, [this] { confirmApply(); });
+        connect(refreshButton_, &QPushButton::clicked, this, [this] { startCheck(); });
+        connect(updateButton_, &QPushButton::clicked, this, [this] { confirmApply(); });
         updateButtons();
     }
 
@@ -310,6 +458,28 @@ private:
         return style()->standardIcon(QStyle::SP_ComputerIcon);
     }
 
+    QIcon statusIcon(const QColor &color, const QString &symbol) const
+    {
+        QPixmap image = applicationIcon().pixmap(64, 64);
+        if (image.isNull()) {
+            image = QPixmap(64, 64);
+            image.fill(Qt::transparent);
+        }
+
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QRectF badge(image.width() - 25, image.height() - 25, 23, 23);
+        painter.setPen(QPen(Qt::white, 2));
+        painter.setBrush(color);
+        painter.drawEllipse(badge);
+        QFont font = painter.font();
+        font.setBold(true);
+        font.setPixelSize(15);
+        painter.setFont(font);
+        painter.drawText(badge, Qt::AlignCenter, symbol);
+        return QIcon(image);
+    }
+
     void buildTray()
     {
         setWindowIcon(applicationIcon());
@@ -319,11 +489,11 @@ private:
         tray_ = new QSystemTrayIcon(applicationIcon(), this);
         auto *menu = new QMenu(this);
         auto *showAction = menu->addAction("Show");
-        auto *checkAction = menu->addAction("Check now");
+        trayRefreshAction_ = menu->addAction("Refresh");
         menu->addSeparator();
         auto *quitAction = menu->addAction("Quit");
         connect(showAction, &QAction::triggered, this, [this] { showAndRaise(); });
-        connect(checkAction, &QAction::triggered, this, [this] { startCheck(); });
+        connect(trayRefreshAction_, &QAction::triggered, this, [this] { startCheck(); });
         connect(quitAction, &QAction::triggered, this, [this] {
             quitRequested_ = true;
             tray_->hide();
@@ -348,57 +518,99 @@ private:
 
     void startCheck()
     {
-        const QString service = environment("NIXOS_UPDATE_CHECKER_SERVICE", "nixos-update-checker.service");
-        startService(service, "check", "Check finished.");
+        startService(checkerService(), "refresh");
     }
 
     void confirmApply()
     {
-        if (!canApply() || activeProcess_)
+        if (!canApply() || serviceBusy())
             return;
-        const auto answer = QMessageBox::question(this, "Apply NixOS update?",
+        const auto answer = QMessageBox::question(this, "Update NixOS?",
             "This will update the real flake.lock, rebuild the reported configuration, "
             "and switch the running system.\n\nContinue?");
         if (answer != QMessageBox::Yes)
             return;
 
-        const QString service = environment(
-            "NIXOS_UPDATE_CHECKER_APPLY_SERVICE", "nixos-update-checker-apply.service");
-        startService(service, "update", "Update finished.");
+        startService(applyService(), "update");
     }
 
-    void startService(const QString &service, const QString &action, const QString &completedMessage)
+    QString checkerService() const
     {
-        if (activeProcess_)
+        return environment("NIXOS_UPDATE_CHECKER_SERVICE", "nixos-update-checker.service");
+    }
+
+    QString applyService() const
+    {
+        return environment(
+            "NIXOS_UPDATE_CHECKER_APPLY_SERVICE", "nixos-update-checker-apply.service");
+    }
+
+    void startService(const QString &service, const QString &action)
+    {
+        if (serviceBusy())
             return;
 
-        status_->setText("Requesting " + action + "…");
-        activeProcess_ = new QProcess(this);
-        progress_->show();
-        updateButtons();
+        activeAction_ = action;
+        operationError_.clear();
+        showingProgress_ = true;
+        details_->clear();
+        appendOutput(action == "refresh" ? QStringLiteral("Starting update check…\n")
+                                           : QStringLiteral("Starting system update…\n"));
+        startJournal(service, false);
+
+        auto *process = new QProcess(this);
+        activeProcess_ = process;
+        process->setProcessChannelMode(QProcess::MergedChannels);
+        updatePresentation();
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
-        connect(activeProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-                [this, service, action, completedMessage](int exitCode, QProcess::ExitStatus) {
-                    const QString diagnostics = QString::fromUtf8(activeProcess_->readAllStandardError()).trimmed();
-                    activeProcess_->deleteLater();
-                    activeProcess_ = nullptr;
-                    progress_->hide();
-                    updateButtons();
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, process, service, action](int exitCode, QProcess::ExitStatus) {
+                    const QByteArray output = process->readAll();
+                    appendOutput(output);
+                    if (activeProcess_ == process)
+                        activeProcess_ = nullptr;
+                    activeAction_.clear();
+                    if (action == "refresh")
+                        checkerRunning_ = false;
+                    else
+                        applyRunning_ = false;
+                    process->deleteLater();
+                    stopJournalSoon(service);
                     if (exitCode == 0) {
-                        status_->setText(completedMessage);
-                        loadReport(false);
-                        refreshLiveSystemState();
+                        if (action == "update") {
+                            markReportStale("The update finished. Waiting for the refreshed report.");
+                            updatePresentation();
+                            restartApplication();
+                        } else {
+                            loadReport(true);
+                            refreshLiveSystemState();
+                            updatePresentation();
+                        }
                         return;
                     }
+                    const QString diagnostics = QString::fromUtf8(output).trimmed();
                     const QString detail = diagnostics.isEmpty()
                         ? "Run journalctl -u " + service + " for details."
                         : diagnostics;
+                    operationError_ = "Could not start " + action + ": " + detail;
+                    appendOutput("\n" + operationError_ + "\n");
                     QMessageBox::critical(this, "Could not start " + action, detail);
-                    status_->setText("Could not start the " + action + " service");
+                    updatePresentation();
                 });
-        connect(activeProcess_, &QProcess::started, this,
-                [this, action] { status_->setText(action.left(1).toUpper() + action.mid(1) + " running…"); });
-        activeProcess_->start(systemctl, {"start", service});
+        connect(process, &QProcess::errorOccurred, this,
+                [this, process, service, action](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart || activeProcess_ != process)
+                        return;
+                    activeProcess_ = nullptr;
+                    activeAction_.clear();
+                    stopJournalSoon(service);
+                    operationError_ = "Could not run systemctl: " + process->errorString();
+                    appendOutput("\n" + operationError_ + "\n");
+                    process->deleteLater();
+                    QMessageBox::critical(this, "Could not start " + action, operationError_);
+                    updatePresentation();
+                });
+        process->start(systemctl, {"start", service});
     }
 
     bool canApply() const
@@ -408,8 +620,11 @@ private:
 
     void updateButtons()
     {
-        checkButton_->setEnabled(activeProcess_ == nullptr);
-        applyButton_->setEnabled(activeProcess_ == nullptr && canApply());
+        const bool busy = serviceBusy();
+        refreshButton_->setEnabled(!busy);
+        updateButton_->setEnabled(!busy && canApply());
+        if (trayRefreshAction_)
+            trayRefreshAction_->setEnabled(!busy);
     }
 
     void addRow(const QString &name, const QString &version, const QString &size,
@@ -435,7 +650,8 @@ private:
         const int rebuildCount = rebuilds.value("count").toInt();
 
         updates_->setRowCount(0);
-        details_->clear();
+        if (!showingProgress_)
+            details_->clear();
         for (const QJsonValue &value : inputs) {
             const QJsonObject change = value.toObject();
             addRow("Flake: " + change.value("name").toString(),
@@ -459,20 +675,22 @@ private:
         const QString text = plural(inputs.size(), "flake input") + "  ·  "
             + plural(changes.size(), "package change") + "  ·  "
             + plural(rebuildCount, "rebuilt package");
+        summaryText_ = text;
         summary_->setText(text);
         updatesAvailable_ = report.value("updatesAvailable").toBool();
         inputBaselineComplete_ = report.value("inputBaseline").toObject().value("complete").toBool();
         schemaSupported_ = true;
         reportStale_ = false;
-        updateButtons();
+        reportError_ = false;
+        reportErrorMessage_.clear();
+        operationError_.clear();
 
         QString checked = "Checked " + timestamp(report.value("generatedAt")) + "  ·  "
             + report.value("configuration").toString();
         if (!inputBaselineComplete_)
             checked += "  ·  partial flake history";
-        status_->setText(checked);
-        if (tray_)
-            tray_->setToolTip("NixOS Update Checker · " + text);
+        reportStatus_ = checked;
+        updatePresentation();
     }
 
     QString generationFor(const QString &system) const
@@ -524,30 +742,29 @@ private:
 
         if (!schemaSupported_ || lastReport_.isEmpty()
             || lastReport_.value("status").toString() != "success") {
-            updateButtons();
+            updatePresentation();
             return;
         }
         const QString expectedBaseline = liveBoot != liveRunning ? liveBoot : liveRunning;
         const QString reportBaseline = lastReport_.value("system").toObject()
                                            .value("baselinePath").toString();
         if (!expectedBaseline.isEmpty() && expectedBaseline != reportBaseline) {
-            reportStale_ = true;
-            updates_->setRowCount(0);
-            details_->clear();
-            summary_->setText("Report is stale");
-            status_->setText("The system profile changed. Waiting for a new background report.");
+            markReportStale("The system profile changed. Waiting for a new background report.");
         } else if (reportStale_) {
             populate(lastReport_);
         }
-        updateButtons();
+        updatePresentation();
     }
 
     void loadReport(bool initial)
     {
         const QFileInfo info(reportPath_);
         if (!info.exists()) {
-            if (initial)
-                status_->setText("No report yet. Select Check now to start the service.");
+            if (initial) {
+                reportStatus_ = "No report yet. Select Refresh to start the service.";
+                summary_->setText("No report yet");
+                updatePresentation();
+            }
             return;
         }
         if (!initial && info.lastModified() == reportMtime_)
@@ -555,13 +772,15 @@ private:
 
         QFile file(reportPath_);
         if (!file.open(QIODevice::ReadOnly)) {
-            status_->setText("The report is not readable");
+            reportStatus_ = "The report is not readable";
+            updatePresentation();
             return;
         }
         QJsonParseError parseError;
         const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
         if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            status_->setText("The service wrote an invalid report");
+            reportStatus_ = "The service wrote an invalid report";
+            updatePresentation();
             return;
         }
 
@@ -575,8 +794,9 @@ private:
             updates_->setRowCount(0);
             details_->clear();
             summary_->setText("Report needs refreshing");
-            status_->setText("Run Check now to replace the cached version-1 report.");
-            updateButtons();
+            reportStatus_ = "Select Refresh to replace the cached version-1 report.";
+            reportError_ = false;
+            updatePresentation();
             return;
         }
         if (report.value("status").toString() == "error") {
@@ -585,13 +805,284 @@ private:
             updatesAvailable_ = false;
             inputBaselineComplete_ = false;
             summary_->setText("Check failed");
-            status_->setText(error.value("message").toString("Background check failed"));
-            details_->setPlainText(error.value("diagnostics").toString());
+            reportErrorMessage_ = error.value("message").toString("Background check failed");
+            reportStatus_ = reportErrorMessage_;
+            reportError_ = true;
+            const QString diagnostics = error.value("diagnostics").toString();
+            if (showingProgress_)
+                appendOutput("\n" + diagnostics + "\n");
+            else
+                details_->setPlainText(diagnostics);
             updates_->setRowCount(0);
-            updateButtons();
+            updatePresentation();
             return;
         }
         populate(report);
+    }
+
+    void markReportStale(const QString &message)
+    {
+        reportStale_ = true;
+        updatesAvailable_ = false;
+        reportError_ = false;
+        updates_->setRowCount(0);
+        if (!showingProgress_)
+            details_->clear();
+        summary_->setText("Report is stale");
+        reportStatus_ = message;
+    }
+
+    bool isRefreshing() const
+    {
+        return checkerRunning_ || (activeProcess_ && activeAction_ == "refresh");
+    }
+
+    bool isUpdating() const
+    {
+        return applyRunning_ || (activeProcess_ && activeAction_ == "update");
+    }
+
+    bool serviceBusy() const
+    {
+        return isRefreshing() || isUpdating();
+    }
+
+    void appendOutput(const QByteArray &data)
+    {
+        appendOutput(QString::fromUtf8(data));
+    }
+
+    void appendOutput(const QString &text)
+    {
+        if (text.isEmpty())
+            return;
+        QTextCursor cursor = details_->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        cursor.insertText(text);
+        details_->setTextCursor(cursor);
+        details_->verticalScrollBar()->setValue(details_->verticalScrollBar()->maximum());
+    }
+
+    void startJournal(const QString &service, bool clear)
+    {
+        if (journalProcess_ && journalService_ == service)
+            return;
+        stopJournal();
+        if (clear)
+            details_->clear();
+        journalService_ = service;
+
+        auto *process = new QProcess(this);
+        journalProcess_ = process;
+        process->setProcessChannelMode(QProcess::MergedChannels);
+        connect(process, &QProcess::readyRead, this,
+                [this, process] { appendOutput(process->readAll()); });
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, process](int, QProcess::ExitStatus) {
+                    appendOutput(process->readAll());
+                    if (journalProcess_ == process) {
+                        journalProcess_ = nullptr;
+                        journalService_.clear();
+                    }
+                    process->deleteLater();
+                });
+        connect(process, &QProcess::errorOccurred, this,
+                [this, process](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart || journalProcess_ != process)
+                        return;
+                    journalProcess_ = nullptr;
+                    journalService_.clear();
+                    appendOutput("Could not follow the system journal: " + process->errorString() + "\n");
+                    process->deleteLater();
+                });
+        const QString journalctl = environment("NIXOS_UPDATE_CHECKER_JOURNALCTL", "journalctl");
+        process->start(journalctl,
+            {"--follow", "--unit", service, "--output=cat", "--since=-10s", "--no-pager"});
+    }
+
+    void stopJournal()
+    {
+        if (!journalProcess_)
+            return;
+        QProcess *process = journalProcess_;
+        journalProcess_ = nullptr;
+        journalService_.clear();
+        process->terminate();
+        QTimer::singleShot(500, process, [process] {
+            if (process->state() != QProcess::NotRunning)
+                process->kill();
+        });
+    }
+
+    void stopJournalSoon(const QString &service)
+    {
+        QTimer::singleShot(250, this, [this, service] {
+            if (journalService_ == service)
+                stopJournal();
+        });
+    }
+
+    void pollServiceState()
+    {
+        if (stateProcess_)
+            return;
+        auto *process = new QProcess(this);
+        stateProcess_ = process;
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, process](int, QProcess::ExitStatus) {
+                    const QString output = QString::fromUtf8(process->readAllStandardOutput());
+                    if (stateProcess_ == process)
+                        stateProcess_ = nullptr;
+                    process->deleteLater();
+
+                    bool checkerSeen = false;
+                    bool applySeen = false;
+                    bool checkerActive = false;
+                    bool applyActive = false;
+                    for (const QString &block : output.split("\n\n", Qt::SkipEmptyParts)) {
+                        QString id;
+                        QString active;
+                        for (const QString &line : block.split('\n')) {
+                            if (line.startsWith("Id="))
+                                id = line.mid(3).trimmed();
+                            else if (line.startsWith("ActiveState="))
+                                active = line.mid(12).trimmed();
+                        }
+                        const bool running = active == "active" || active == "activating"
+                            || active == "reloading";
+                        if (id == checkerService()) {
+                            checkerSeen = true;
+                            checkerActive = running;
+                        } else if (id == applyService()) {
+                            applySeen = true;
+                            applyActive = running;
+                        }
+                    }
+                    if (checkerSeen || applySeen)
+                        setServiceActivity(checkerSeen ? checkerActive : checkerRunning_,
+                            applySeen ? applyActive : applyRunning_);
+                });
+        connect(process, &QProcess::errorOccurred, this,
+                [this, process](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart || stateProcess_ != process)
+                        return;
+                    stateProcess_ = nullptr;
+                    process->deleteLater();
+                });
+        const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
+        process->start(systemctl,
+            {"show", "--property=Id", "--property=ActiveState", "--property=SubState",
+                checkerService(), applyService()});
+    }
+
+    void setServiceActivity(bool checkerActive, bool applyActive)
+    {
+        const bool checkerFinished = checkerRunning_ && !checkerActive;
+        const bool applyFinished = applyRunning_ && !applyActive;
+        checkerRunning_ = checkerActive;
+        applyRunning_ = applyActive;
+
+        if (applyRunning_) {
+            if (journalService_ != applyService()) {
+                showingProgress_ = true;
+                details_->clear();
+                appendOutput(QStringLiteral("System update in progress…\n"));
+                startJournal(applyService(), false);
+            }
+        } else if (checkerRunning_) {
+            if (journalService_ != checkerService()) {
+                showingProgress_ = true;
+                details_->clear();
+                appendOutput(QStringLiteral("Update check in progress…\n"));
+                startJournal(checkerService(), false);
+            }
+        } else if (checkerFinished || applyFinished) {
+            stopJournalSoon(journalService_);
+            loadReport(true);
+            refreshLiveSystemState();
+            if (applyFinished && !activeProcess_) {
+                markReportStale("The update finished. Waiting for the refreshed report.");
+                updatePresentation();
+                restartApplication();
+                return;
+            }
+        }
+        updatePresentation();
+    }
+
+    void updatePresentation()
+    {
+        QString busyText;
+        if (isUpdating()) {
+            busyText = "Updating…";
+            status_->setText("Updating the system…");
+        } else if (isRefreshing()) {
+            busyText = "Refreshing…";
+            status_->setText("Refreshing the update report…");
+        } else if (!operationError_.isEmpty()) {
+            status_->setText(operationError_);
+        } else {
+            status_->setText(reportStatus_);
+        }
+        updates_->setBusy(!busyText.isEmpty(), busyText);
+        updateButtons();
+        updateTray();
+    }
+
+    void updateTray()
+    {
+        if (!tray_)
+            return;
+
+        QColor color("#6b7280");
+        QString symbol = "?";
+        QString message = "No update report is available";
+        if (isUpdating()) {
+            color = QColor("#2563eb");
+            symbol = QString::fromUtf8("↑");
+            message = "Updating the system…";
+        } else if (isRefreshing()) {
+            color = QColor("#2563eb");
+            symbol = QString::fromUtf8("↻");
+            message = "Refreshing the update report…";
+        } else if (reportStale_) {
+            color = QColor("#d97706");
+            symbol = "!";
+            message = "The report is stale; waiting for a refresh";
+        } else if (reportError_) {
+            color = QColor("#dc2626");
+            symbol = QString::fromUtf8("×");
+            message = "Last check failed: " + reportErrorMessage_;
+        } else if (schemaSupported_ && updatesAvailable_) {
+            color = QColor("#d97706");
+            symbol = "!";
+            message = summaryText_;
+        } else if (schemaSupported_) {
+            color = QColor("#16a34a");
+            symbol = QString::fromUtf8("✓");
+            message = "System is up to date";
+        }
+        tray_->setIcon(statusIcon(color, symbol));
+        tray_->setToolTip("NixOS Update Checker\n" + message);
+    }
+
+    void restartApplication()
+    {
+        QString executable = "/run/current-system/sw/bin/nixos-update-checker";
+        if (!QFileInfo(executable).isExecutable())
+            executable = QCoreApplication::applicationFilePath();
+        QStringList arguments = QCoreApplication::arguments();
+        if (!arguments.isEmpty())
+            arguments.removeFirst();
+        if (!QProcess::startDetached(executable, arguments)) {
+            operationError_ = "The update finished, but the refreshed application could not start.";
+            updatePresentation();
+            return;
+        }
+        quitRequested_ = true;
+        if (tray_)
+            tray_->hide();
+        QApplication::quit();
     }
 
     QString reportPath_;
@@ -601,19 +1092,31 @@ private:
     bool reportStale_ = false;
     bool inputBaselineComplete_ = false;
     bool updatesAvailable_ = false;
+    bool reportError_ = false;
+    bool checkerRunning_ = false;
+    bool applyRunning_ = false;
+    bool showingProgress_ = false;
+    QString summaryText_;
+    QString reportStatus_ = "Waiting for a report";
+    QString reportErrorMessage_;
+    QString operationError_;
+    QString activeAction_;
+    QString journalService_;
     QDateTime reportMtime_;
     QJsonObject lastReport_;
     QTimer pollTimer_;
     QProcess *activeProcess_ = nullptr;
+    QProcess *stateProcess_ = nullptr;
+    QProcess *journalProcess_ = nullptr;
     QSystemTrayIcon *tray_ = nullptr;
+    QAction *trayRefreshAction_ = nullptr;
     QLabel *summary_ = nullptr;
     QLabel *generationStatus_ = nullptr;
     QLabel *status_ = nullptr;
-    QTableWidget *updates_ = nullptr;
+    UpdateTable *updates_ = nullptr;
     QPlainTextEdit *details_ = nullptr;
-    QProgressBar *progress_ = nullptr;
-    QPushButton *applyButton_ = nullptr;
-    QPushButton *checkButton_ = nullptr;
+    QPushButton *refreshButton_ = nullptr;
+    QPushButton *updateButton_ = nullptr;
 };
 
 } // namespace

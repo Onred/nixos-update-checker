@@ -16,7 +16,7 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
-  echo "nixos-update-checker-apply 3.1.4"
+  echo "nixos-update-checker-apply 3.1.5"
   exit 0
 fi
 [[ $# == 2 ]] || { usage >&2; exit 2; }
@@ -59,3 +59,8 @@ fi
 
 nix flake update --flake "path:$repository"
 nixos-rebuild switch --flake "path:$repository#$configuration"
+
+# The old report describes the generation that was just replaced. Removing it
+# prevents a restarted tray from briefly presenting those updates as pending;
+# the profile path unit publishes a fresh report immediately afterward.
+rm -f "$report"
