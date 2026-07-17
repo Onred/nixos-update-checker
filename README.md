@@ -14,7 +14,7 @@ only operation that updates the real `flake.lock` and applies a system.
 
 ## What the GUI shows
 
-The main table has three kinds of rows:
+The main update list has three native list sections:
 
 - **Flake**: a locked input changed.
 - **Package**: a package was added, removed, or has a different parsed version in
@@ -22,9 +22,11 @@ The main table has three kinds of rows:
 - **Rebuild**: one aggregate row for paths whose package version is unchanged but
   whose store identity changed. Selecting it lists every underlying path change.
 
-Flake rows appear first, packages second, and the rebuild-only aggregate last.
-Selecting a row shows old versions and other detail in the Information tab. The
-Activity tab shows output from refresh, rebuild, and garbage collection commands.
+Flake inputs appear first, packages second, and the rebuild-only aggregate last.
+There is no type column or custom window frame; the desktop supplies the normal
+window decorations. Selecting a row shows old versions and other detail in the
+Information tab. The Activity tab shows output from refresh, rebuild, and garbage
+collection commands.
 
 **Refresh** performs a complete unrestricted candidate build. **Rebuild** updates
 the repository lock, runs `nixos-rebuild switch`, and then refreshes the report.
@@ -34,11 +36,21 @@ days by default.
 Opening the GUI loads the last report written by the background service. It does
 not automatically start a second build.
 
-The System state window separately compares the system derivation described by
-the saved configuration with `/run/current-system`. Saved-but-unapplied changes
-therefore remain visible even when no input update exists. Update comparisons
-also keep using the running closure as their baseline until a rebuild is applied;
-merely changing `flake.lock` does not make pending system changes disappear.
+The backend compares the system derivation described by the saved configuration
+with `/run/current-system`, so saved-but-unapplied changes remain in the report.
+Package comparisons keep using the running closure as their baseline until a
+rebuild is applied; merely changing `flake.lock` does not make pending changes
+disappear.
+
+Flake inputs use an applied-lock snapshot instead of assuming the working lock is
+running. A successful Rebuild records the applied lock, and a background check
+also refreshes the snapshot whenever the saved system derivation exactly matches
+the running derivation. Before the first snapshot exists, the embedded running
+NixOS nixpkgs revision keeps the primary `nixpkgs` row accurate. Arbitrary
+third-party input revisions cannot be reconstructed from a realized NixOS closure
+after the fact, so their fully accurate applied baseline begins once a snapshot
+has been recorded.
+
 As with every Git-backed Nix flake, newly created source files must be staged
 before Nix includes them, though they do not need to be committed.
 

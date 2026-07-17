@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -23,11 +24,14 @@ from .logic import (
     choose_parallelism,
     compare_closures,
     compare_inputs,
+    input_details,
     nix_quote,
     package_summary,
     select_current_configuration,
     split_package_changes,
 )
+
+APPLIED_LOCK_SCHEMA = 1
 
 
 class CheckerError(RuntimeError):
@@ -54,6 +58,15 @@ def environment(name: str, fallback: str = "") -> str:
 
 def nix_executable() -> str:
     return environment("NIXOS_UPDATE_CHECKER_NIX", "nix")
+
+
+def applied_lock_path() -> Path:
+    return Path(
+        environment(
+            "NIXOS_UPDATE_CHECKER_APPLIED_LOCK",
+            "/var/lib/nixos-update-checker/applied-flake-lock.json",
+        )
+    )
 
 
 def available_cpu_count() -> int:
@@ -124,6 +137,96 @@ def current_hostname() -> str:
     if not hostname:
         raise CheckerError("The running hostname is empty.")
     return hostname
+
+
+def running_nixpkgs_revision() -> str:
+    executable = environment(
+        "NIXOS_UPDATE_CHECKER_NIXOS_VERSION",
+        "/run/current-system/sw/bin/nixos-version",
+    )
+    result = run_command(executable, ["--json"])
+    if not result.succeeded:
+        return ""
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return ""
+    return str(value.get("nixpkgsRevision", "")) if isinstance(value, dict) else ""
+
+
+def root_input_node(lock: JsonObject, input_name: str) -> tuple[str, JsonObject] | None:
+    nodes = lock.get("nodes", {})
+    root_name = lock.get("root")
+    if not isinstance(nodes, dict) or not isinstance(root_name, str):
+        return None
+    root = nodes.get(root_name, {})
+    inputs = root.get("inputs", {}) if isinstance(root, dict) else {}
+    node_name = inputs.get(input_name) if isinstance(inputs, dict) else None
+    if not isinstance(node_name, str):
+        return None
+    node = nodes.get(node_name, {})
+    return (node_name, node) if isinstance(node, dict) else None
+
+
+def include_running_nixpkgs_change(
+    changes: list[JsonObject], candidate_lock: JsonObject, revision: str
+) -> list[JsonObject]:
+    """Keep the primary nixpkgs update visible before an applied snapshot exists."""
+    candidate = root_input_node(candidate_lock, "nixpkgs")
+    if not revision or candidate is None:
+        return changes
+    node_name, node = candidate
+    locked = node.get("locked", {})
+    candidate_revision = str(locked.get("rev", "")) if isinstance(locked, dict) else ""
+    if not candidate_revision or candidate_revision == revision:
+        return changes
+    before = {
+        "revision": revision,
+        "narHash": None,
+        "url": None,
+        "lastModified": None,
+        "display": revision[:8],
+    }
+    replacement = {"name": node_name, "before": before, "after": input_details(node)}
+    result = [change for change in changes if change.get("name") != node_name]
+    result.append(replacement)
+    return sorted(result, key=lambda change: str(change.get("name", "")))
+
+
+def write_applied_lock_snapshot(repository: Path, lock: JsonObject, destination: Path) -> None:
+    write_json_file(
+        destination,
+        {
+            "schemaVersion": APPLIED_LOCK_SCHEMA,
+            "repository": str(repository),
+            "recordedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "lock": lock,
+        },
+    )
+
+
+def record_applied_lock(repository_value: str, destination: Path) -> None:
+    repository = Path(repository_value).expanduser().resolve()
+    lock_path = repository / "flake.lock"
+    lock = read_json_object(lock_path, f"Invalid flake lock: {lock_path}")
+    write_applied_lock_snapshot(repository, lock, destination)
+
+
+def read_applied_lock(repository: Path, path: Path) -> JsonObject | None:
+    if not path.is_file():
+        return None
+    try:
+        snapshot = read_json_object(path, f"Invalid applied lock snapshot: {path}")
+    except CheckerError:
+        return None
+    lock = snapshot.get("lock")
+    if (
+        snapshot.get("schemaVersion") != APPLIED_LOCK_SCHEMA
+        or snapshot.get("repository") != str(repository)
+        or not isinstance(lock, dict)
+    ):
+        return None
+    return lock
 
 
 DISCOVERY_APPLY = r"""
@@ -300,7 +403,21 @@ def run_check(repository_value: str, *, background: bool) -> JsonObject:
 
         current_lock = read_json_object(lock_path, "Invalid current flake.lock.")
         candidate_lock_value = read_json_object(candidate_lock, "Invalid candidate flake.lock.")
-        input_changes = compare_inputs(current_lock, candidate_lock_value)
+        snapshot_path = applied_lock_path()
+        applied_lock = read_applied_lock(repository, snapshot_path)
+        baseline_source = "appliedSnapshot" if applied_lock is not None else "workingLock"
+        if configuration_state == "applied":
+            applied_lock = current_lock
+            baseline_source = "currentConfiguration"
+            with contextlib.suppress(CheckerError):
+                write_applied_lock_snapshot(repository, current_lock, snapshot_path)
+        input_baseline = applied_lock or current_lock
+        input_changes = compare_inputs(input_baseline, candidate_lock_value)
+        running_revision = running_nixpkgs_revision()
+        if applied_lock is None:
+            input_changes = include_running_nixpkgs_change(
+                input_changes, candidate_lock_value, running_revision
+            )
 
         build = run_nix(
             build_arguments(
@@ -335,6 +452,11 @@ def run_check(repository_value: str, *, background: bool) -> JsonObject:
         "repository": str(repository),
         "configuration": configuration_name,
         "inputs": input_changes,
+        "inputBaseline": {
+            "source": baseline_source,
+            "path": str(snapshot_path) if baseline_source == "appliedSnapshot" else str(lock_path),
+            "runningNixpkgsRevision": running_revision or None,
+        },
         "packages": {
             "changes": package_changes,
             "storeOnlyChanges": store_only_changes,
@@ -367,7 +489,7 @@ def run_check(repository_value: str, *, background: bool) -> JsonObject:
     }
 
 
-def write_report(path: Path, report: JsonObject) -> None:
+def write_json_file(path: Path, value: JsonObject) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name = ""
     try:
@@ -379,7 +501,7 @@ def write_report(path: Path, report: JsonObject) -> None:
             delete=False,
         ) as stream:
             temporary_name = stream.name
-            json.dump(report, stream, indent=2)
+            json.dump(value, stream, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -389,6 +511,10 @@ def write_report(path: Path, report: JsonObject) -> None:
         if temporary_name:
             Path(temporary_name).unlink(missing_ok=True)
         raise CheckerError(f"Could not publish report: {path}", str(error)) from error
+
+
+def write_report(path: Path, report: JsonObject) -> None:
+    write_json_file(path, report)
 
 
 def error_report(repository: str, error: CheckerError) -> JsonObject:
@@ -422,6 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build and compare a candidate NixOS system")
     parser.add_argument("repository", nargs="?", default=".")
     parser.add_argument("--background", action="store_true")
+    parser.add_argument("--record-applied-lock", action="store_true")
+    parser.add_argument("--applied-lock", type=Path, default=applied_lock_path())
     parser.add_argument("--report", type=Path)
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--version", action="version", version=f"%(prog)s {display_version()}")
@@ -431,6 +559,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     namespace = build_parser().parse_args(argv)
     try:
+        if namespace.record_applied_lock:
+            record_applied_lock(namespace.repository, namespace.applied_lock)
+            return 0
         report = run_check(namespace.repository, background=namespace.background)
         if namespace.report:
             write_report(namespace.report, report)

@@ -5,7 +5,7 @@
 }:
 
 let
-  version = "2.0.0";
+  version = "2.1.0";
   output = builtins.placeholder "out";
 in
 pkgs.python3Packages.buildPythonApplication {
@@ -49,6 +49,9 @@ pkgs.python3Packages.buildPythonApplication {
     "NIXOS_UPDATE_CHECKER_NIX"
     "${pkgs.nix}/bin/nix"
     "--set"
+    "NIXOS_UPDATE_CHECKER_APPLIED_LOCK"
+    "/var/lib/nixos-update-checker/applied-flake-lock.json"
+    "--set"
     "NIXOS_UPDATE_CHECKER_PKEXEC"
     "${pkgs.polkit}/bin/pkexec"
     "--set"
@@ -84,10 +87,10 @@ pkgs.python3Packages.buildPythonApplication {
   installCheckPhase = ''
     runHook preInstallCheck
     pytest -p no:cacheprovider "$src/tests"
-    "$out/bin/nixos-update-checker" --version | grep -F "nixos-update-checker 2.0.0"
+    "$out/bin/nixos-update-checker" --version | grep -F "nixos-update-checker 2.1.0"
     QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" \
       --self-test --no-tray --report /nonexistent /etc/nixos
-    "$out/bin/check-nixos-updates" --version | grep -F "check-nixos-updates 2.0.0"
+    "$out/bin/check-nixos-updates" --version | grep -F "check-nixos-updates 2.1.0"
     "$out/bin/check-nixos-updates" --help >/dev/null
     runHook postInstallCheck
   '';

@@ -101,6 +101,53 @@ def test_configuration_discovery_reports_invalid_flakes(monkeypatch: pytest.Monk
     assert raised.value.diagnostics == "evaluation failed"
 
 
+def test_running_nixpkgs_revision_restores_an_already_updated_lock_row() -> None:
+    candidate = {
+        "root": "root",
+        "nodes": {
+            "root": {"inputs": {"nixpkgs": "nixpkgs"}},
+            "nixpkgs": {"locked": {"rev": "new-revision", "narHash": "new-hash"}},
+        },
+    }
+    changes = checker.include_running_nixpkgs_change([], candidate, "running-revision")
+    assert len(changes) == 1
+    assert changes[0]["name"] == "nixpkgs"
+    assert changes[0]["before"]["revision"] == "running-revision"
+    assert changes[0]["after"]["revision"] == "new-revision"
+
+
+def test_applied_lock_snapshot_is_repository_specific(tmp_path: Path) -> None:
+    repository = tmp_path / "config"
+    repository.mkdir()
+    (repository / "flake.lock").write_text('{"nodes":{"root":{}},"root":"root"}')
+    snapshot = tmp_path / "applied.json"
+    checker.record_applied_lock(str(repository), snapshot)
+    assert checker.read_applied_lock(repository.resolve(), snapshot) == {
+        "nodes": {"root": {}},
+        "root": "root",
+    }
+    assert checker.read_applied_lock(tmp_path / "different", snapshot) is None
+
+
+def test_cli_can_record_an_applied_lock(tmp_path: Path) -> None:
+    repository = tmp_path / "config"
+    repository.mkdir()
+    (repository / "flake.lock").write_text('{"nodes":{},"root":"root"}')
+    snapshot = tmp_path / "state" / "applied.json"
+    assert (
+        checker.main(
+            [
+                "--record-applied-lock",
+                "--applied-lock",
+                str(snapshot),
+                str(repository),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(snapshot.read_text())["repository"] == str(repository.resolve())
+
+
 def test_report_writes_atomically_and_is_world_readable(tmp_path: Path) -> None:
     destination = tmp_path / "state" / "report.json"
     checker.write_report(destination, {"status": "success", "value": 2})

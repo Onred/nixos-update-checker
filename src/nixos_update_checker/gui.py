@@ -8,18 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPoint, QProcess, QSettings, Qt, QTimer
-from PySide6.QtGui import (
-    QAction,
-    QBrush,
-    QCloseEvent,
-    QColor,
-    QIcon,
-    QMouseEvent,
-    QPalette,
-)
+from PySide6.QtCore import QModelIndex, QProcess, QRect, QSettings, QSize, Qt, QTimer
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QDialog,
@@ -27,9 +18,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -39,9 +31,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QSystemTrayIcon,
-    QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -49,6 +41,9 @@ from PySide6.QtWidgets import (
 
 from . import SCHEMA_VERSION, display_version
 from .logic import JsonObject, garbage_collection_arguments
+
+ROW_ROLE = int(Qt.ItemDataRole.UserRole)
+SECTION_ROLE = ROW_ROLE + 1
 
 
 def environment(name: str, fallback: str = "") -> str:
@@ -100,40 +95,57 @@ def update_sort_key(row: JsonObject) -> tuple[int, str]:
 
 def report_rows(report: JsonObject) -> list[JsonObject]:
     rows: list[JsonObject] = []
-    for change in report.get("inputs", []):
-        if not isinstance(change, dict):
-            continue
-        rows.append(
-            {
-                "type": "Flake",
-                "name": str(change.get("name", "")),
-                "current": str((change.get("before") or {}).get("display", "missing")),
-                "available": str((change.get("after") or {}).get("display", "missing")),
-                "change": change,
-            }
-        )
+    inputs = report.get("inputs", [])
+    if isinstance(inputs, list):
+        for change in inputs:
+            if not isinstance(change, dict):
+                continue
+            before_value = change.get("before")
+            after_value = change.get("after")
+            before = before_value if isinstance(before_value, dict) else {}
+            after = after_value if isinstance(after_value, dict) else {}
+            rows.append(
+                {
+                    "type": "Flake",
+                    "name": str(change.get("name", "")),
+                    "current": str(before.get("display", "missing")),
+                    "available": str(after.get("display", "missing")),
+                    "change": change,
+                }
+            )
+
     packages = report.get("packages", {})
     if not isinstance(packages, dict):
         packages = {}
-    for change in packages.get("changes", []):
-        if not isinstance(change, dict):
-            continue
-        after = change.get("after") if isinstance(change.get("after"), dict) else None
-        before = change.get("before") if isinstance(change.get("before"), dict) else None
-        rows.append(
-            {
-                "type": "Package",
-                "name": str(change.get("name", "")),
-                "current": str((before or {}).get("version", "not installed")),
-                "available": (
-                    "removed" if after is None else str(after.get("version", "unversioned"))
-                ),
-                "change": change,
-            }
-        )
-    store_only = [
-        change for change in packages.get("storeOnlyChanges", []) if isinstance(change, dict)
-    ]
+    changes = packages.get("changes", [])
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            package_after = change.get("after") if isinstance(change.get("after"), dict) else None
+            package_before = (
+                change.get("before") if isinstance(change.get("before"), dict) else None
+            )
+            rows.append(
+                {
+                    "type": "Package",
+                    "name": str(change.get("name", "")),
+                    "current": str((package_before or {}).get("version", "not installed")),
+                    "available": (
+                        "removed"
+                        if package_after is None
+                        else str(package_after.get("version", "unversioned"))
+                    ),
+                    "change": change,
+                }
+            )
+
+    store_values = packages.get("storeOnlyChanges", [])
+    store_only = (
+        [change for change in store_values if isinstance(change, dict)]
+        if isinstance(store_values, list)
+        else []
+    )
     if store_only:
         rows.append(
             {
@@ -168,6 +180,7 @@ def update_detail_lines(row: JsonObject) -> list[str]:
                 ]
             )
         return lines[:-1]
+
     lines = [str(row.get("name", ""))]
     current = str(row.get("current", ""))
     available = str(row.get("available", ""))
@@ -179,88 +192,100 @@ def update_detail_lines(row: JsonObject) -> list[str]:
             side = change.get(side_name)
             if isinstance(side, dict) and side.get("url"):
                 lines.append(f"• {side_name.title()}: {side['url']}")
+            if isinstance(side, dict):
+                paths = side.get("paths", [])
+                if isinstance(paths, list):
+                    lines.extend(f"• {side_name.title()} path: {path}" for path in paths)
     return lines
 
 
-class HeaderBar(QWidget):
-    def __init__(self, window: QMainWindow, title: str) -> None:
-        super().__init__(window)
-        self.window = window
-        self.drag_origin: QPoint | None = None
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 8, 8)
-        self.menu_button = QPushButton("☰")
-        self.menu_button.setFixedWidth(34)
-        layout.addWidget(self.menu_button)
-        label = QLabel(title)
-        font = label.font()
-        font.setBold(True)
-        label.setFont(font)
-        layout.addWidget(label)
-        layout.addStretch()
-        minimize = QPushButton("—")
-        close = QPushButton("×")
-        for button in (minimize, close):
-            button.setFixedSize(34, 28)
-            layout.addWidget(button)
-        minimize.clicked.connect(window.showMinimized)
-        close.clicked.connect(window.close)
+class UpdateItemDelegate(QStyledItemDelegate):
+    """Paint update rows through the active desktop style without table chrome."""
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_origin = (
-                event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        return QSize(option.rect.width(), 34 if index.data(SECTION_ROLE) else 54)
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> None:
+        section = index.data(SECTION_ROLE)
+        if section:
+            painter.save()
+            font = option.font
+            font.setBold(True)
+            painter.setFont(font)
+            color = readable_muted_color(
+                option.palette.color(QPalette.ColorRole.Text),
+                option.palette.color(QPalette.ColorRole.Base),
             )
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.drag_origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.window.move(event.globalPosition().toPoint() - self.drag_origin)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self.drag_origin = None
-        super().mouseReleaseEvent(event)
-
-
-class HoverTable(QTableWidget):
-    def __init__(self) -> None:
-        super().__init__(0, 3)
-        self.hovered_row = -1
-        self.setMouseTracking(True)
-        self.cellEntered.connect(self.set_hovered_row)
-
-    def set_hovered_row(self, row: int, _column: int = 0) -> None:
-        if row == self.hovered_row:
+            painter.setPen(color)
+            painter.drawText(
+                option.rect.adjusted(12, 4, -12, 0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                str(section),
+            )
+            painter.restore()
             return
-        old_row = self.hovered_row
-        self.hovered_row = row
-        self._paint_hover(old_row, False)
-        self._paint_hover(row, True)
 
-    def _paint_hover(self, row: int, active: bool) -> None:
-        if not 0 <= row < self.rowCount():
+        row = index.data(ROW_ROLE)
+        if not isinstance(row, dict):
+            super().paint(painter, option, index)
             return
-        color = self.palette().color(QPalette.ColorRole.Highlight)
-        color.setAlpha(38)
-        brush = QBrush(color) if active else QBrush()
-        for column in range(self.columnCount()):
-            item = self.item(row, column)
-            if item is not None:
-                item.setBackground(brush)
 
-    def leaveEvent(self, event: Any) -> None:
-        old_row = self.hovered_row
-        self.hovered_row = -1
-        self._paint_hover(old_row, False)
-        super().leaveEvent(event)
+        styled = QStyleOptionViewItem(option)
+        self.initStyleOption(styled, index)
+        styled.text = ""
+        style = styled.widget.style() if styled.widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, styled, painter, styled.widget)
+
+        selected = bool(styled.state & QStyle.StateFlag.State_Selected)
+        role = QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text
+        painter.save()
+        painter.setPen(styled.palette.color(role))
+        content = styled.rect.adjusted(14, 7, -14, -7)
+        available_width = min(260, max(150, content.width() // 3))
+        name_rect = QRect(
+            content.left(), content.top(), content.width() - available_width - 18, content.height()
+        )
+        available_rect = QRect(
+            content.right() - available_width,
+            content.top(),
+            available_width,
+            content.height(),
+        )
+        name_font = styled.font
+        name_font.setBold(True)
+        painter.setFont(name_font)
+        name = painter.fontMetrics().elidedText(
+            str(row.get("name", "")), Qt.TextElideMode.ElideRight, name_rect.width()
+        )
+        painter.drawText(
+            name_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            name,
+        )
+        painter.setFont(styled.font)
+        available = painter.fontMetrics().elidedText(
+            str(row.get("available", "")),
+            Qt.TextElideMode.ElideLeft,
+            available_rect.width(),
+        )
+        painter.drawText(
+            available_rect,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            available,
+        )
+        painter.restore()
 
 
 class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget, repository: str, settings: QSettings) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(560, 220)
+        self.resize(560, 230)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         repository_row = QWidget()
@@ -284,10 +309,9 @@ class SettingsDialog(QDialog):
         form.addRow("Keep generations", self.retention)
         layout.addLayout(form)
         note = QLabel(
-            "Background checks always perform a thermally limited candidate build. "
-            "Candidate builds can increase Nix store usage, so periodic garbage collection "
-            "is recommended. Configured cleanup runs only after an applied rebuild. Refresh "
-            "and Rebuild are unrestricted because they are explicitly requested."
+            "Background checks use thermally limited candidate builds, which can increase "
+            "Nix store usage. Configured cleanup runs only after an applied rebuild. "
+            "Refresh and Rebuild are unrestricted."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -321,11 +345,10 @@ class UpdateCheckerWindow(QMainWindow):
         self.stderr = bytearray()
         self.pending_configuration = ""
         self.quit_requested = False
+        self.rendered_update_count = 0
         self.setWindowTitle("NixOS Update Checker")
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
-        self.resize(1080, 720)
+        self.resize(1000, 720)
         self._build_ui()
-        self._build_menu()
         self._build_tray()
         self.report_timer = QTimer(self)
         self.report_timer.timeout.connect(self.load_cached_report)
@@ -336,63 +359,40 @@ class UpdateCheckerWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(1, 1, 1, 1)
-        layout.setSpacing(0)
-        self.header = HeaderBar(self, "NixOS Update Checker")
-        layout.addWidget(self.header)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(8)
 
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(16, 12, 16, 16)
-        actions = QHBoxLayout()
+        summaries = QHBoxLayout()
         self.package_summary = self._summary_widget("Packages")
         self.flake_summary = self._summary_widget("Flakes")
         self.rebuild_summary = self._summary_widget("Rebuild-only")
-        actions.addWidget(self.package_summary)
-        actions.addWidget(self.flake_summary)
-        actions.addWidget(self.rebuild_summary)
-        actions.addStretch()
-        self.refresh_button = QPushButton("Refresh")
-        self.rebuild_button = QPushButton("Rebuild")
-        self.refresh_button.clicked.connect(self.start_refresh)
-        self.rebuild_button.clicked.connect(self.confirm_rebuild)
-        actions.addWidget(self.refresh_button)
-        actions.addWidget(self.rebuild_button)
-        body_layout.addLayout(actions)
+        summaries.addWidget(self.package_summary)
+        summaries.addWidget(self.flake_summary)
+        summaries.addWidget(self.rebuild_summary)
+        summaries.addStretch()
+        layout.addLayout(summaries)
 
         self.status = QLabel("No report loaded")
-        body_layout.addWidget(self.status)
+        layout.addWidget(self.status)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(3)
         self.progress.hide()
-        body_layout.addWidget(self.progress)
+        layout.addWidget(self.progress)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        self.table = HoverTable()
-        self.table.setHorizontalHeaderLabels(["Type", "Package", "Available"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setShowGrid(False)
-        self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(42)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 150)
-        self.table.setColumnWidth(2, 190)
-        self.table.itemSelectionChanged.connect(self.update_information)
-        splitter.addWidget(self.table)
+        self.updates = QListWidget()
+        self.updates.setItemDelegate(UpdateItemDelegate(self.updates))
+        self.updates.setMouseTracking(True)
+        self.updates.setSpacing(2)
+        self.updates.currentItemChanged.connect(self.update_information)
+        splitter.addWidget(self.updates)
 
         tabs = QTabWidget()
         self.information = QPlainTextEdit()
         self.information.setReadOnly(True)
-        self.information.setPlaceholderText(
-            "Select an update to see its current version and paths."
-        )
+        self.information.setPlaceholderText("Select an update for its current version and paths.")
         self.activity = QPlainTextEdit()
         self.activity.setReadOnly(True)
         self.activity.document().setMaximumBlockCount(1000)
@@ -401,9 +401,24 @@ class UpdateCheckerWindow(QMainWindow):
         splitter.addWidget(tabs)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([560, 140])
-        body_layout.addWidget(splitter, 1)
-        layout.addWidget(body, 1)
+        splitter.setSizes([540, 150])
+        layout.addWidget(splitter, 1)
+
+        actions = QHBoxLayout()
+        self.settings_button = QPushButton("Settings")
+        self.quit_button = QPushButton("Exit")
+        self.refresh_button = QPushButton("Refresh")
+        self.rebuild_button = QPushButton("Rebuild")
+        self.settings_button.clicked.connect(self.edit_settings)
+        self.quit_button.clicked.connect(self.request_quit)
+        self.refresh_button.clicked.connect(self.start_refresh)
+        self.rebuild_button.clicked.connect(self.confirm_rebuild)
+        actions.addWidget(self.settings_button)
+        actions.addWidget(self.quit_button)
+        actions.addStretch()
+        actions.addWidget(self.refresh_button)
+        actions.addWidget(self.rebuild_button)
+        layout.addLayout(actions)
 
     def _summary_widget(self, label: str) -> QWidget:
         widget = QWidget()
@@ -424,27 +439,11 @@ class UpdateCheckerWindow(QMainWindow):
         if number is not None:
             number.setText(str(value))
 
-    def _build_menu(self) -> None:
-        menu = QMenu(self)
-        settings_action = QAction("Settings…", self)
-        settings_action.triggered.connect(self.edit_settings)
-        state_action = QAction("System state…", self)
-        state_action.triggered.connect(self.show_system_state)
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(self.request_quit)
-        menu.addAction(settings_action)
-        menu.addAction(state_action)
-        menu.addSeparator()
-        menu.addAction(quit_action)
-        self.header.menu_button.setMenu(menu)
-
     def _icon(self) -> QIcon:
         path = environment("NIXOS_UPDATE_CHECKER_ICON")
-        return (
-            QIcon(path)
-            if path and Path(path).is_file()
-            else self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-        )
+        if path and Path(path).is_file():
+            return QIcon(path)
+        return self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
 
     def _build_tray(self) -> None:
         self.tray: QSystemTrayIcon | None = None
@@ -466,7 +465,9 @@ class UpdateCheckerWindow(QMainWindow):
     def validate_repository(self) -> bool:
         if not (Path(self.repository) / "flake.nix").is_file():
             QMessageBox.warning(
-                self, "Invalid NixOS flake", f"No flake.nix exists in:\n{self.repository}"
+                self,
+                "Invalid NixOS flake",
+                f"No flake.nix exists in:\n{self.repository}",
             )
             return False
         return True
@@ -567,6 +568,42 @@ class UpdateCheckerWindow(QMainWindow):
             "Rebuilding and switching NixOS…",
         )
 
+    def record_applied_lock(self) -> None:
+        self.start_process(
+            "record-applied-lock",
+            environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
+            [
+                environment("NIXOS_UPDATE_CHECKER_BACKEND", "check-nixos-updates"),
+                "--record-applied-lock",
+                "--applied-lock",
+                environment(
+                    "NIXOS_UPDATE_CHECKER_APPLIED_LOCK",
+                    "/var/lib/nixos-update-checker/applied-flake-lock.json",
+                ),
+                self.repository,
+            ],
+            "Recording the applied flake inputs…",
+        )
+
+    def continue_after_rebuild(self) -> None:
+        if self.settings.value("garbageCollectionEnabled", False, type=bool):
+            days = self.settings.value("garbageCollectionDays", 30, type=int)
+            self.start_process(
+                "garbage-collect",
+                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
+                [
+                    environment("NIXOS_UPDATE_CHECKER_GC", "nix-collect-garbage"),
+                    *garbage_collection_arguments(days),
+                ],
+                "Garbage collecting old generations…",
+            )
+            return
+        self.finish_rebuild()
+
+    def finish_rebuild(self) -> None:
+        self.set_busy(False, "Rebuild complete")
+        QTimer.singleShot(0, self.start_refresh)
+
     def start_process(self, job: str, program: str, arguments: list[str], message: str) -> None:
         self.active_job = job
         self.stdout.clear()
@@ -608,6 +645,10 @@ class UpdateCheckerWindow(QMainWindow):
         self.active_job = ""
         if exit_code != 0:
             detail = bytes(self.stderr or self.stdout).decode(errors="replace").strip()
+            if job == "record-applied-lock":
+                self.append_log(f"Could not save applied flake inputs: {detail}")
+                self.continue_after_rebuild()
+                return
             self.pending_configuration = ""
             self.set_busy(False, f"{job} failed")
             QMessageBox.critical(self, f"{job} failed", detail[-5000:])
@@ -627,24 +668,19 @@ class UpdateCheckerWindow(QMainWindow):
         if job == "update-lock":
             self.start_rebuild()
             return
-        if job == "rebuild" and self.settings.value("garbageCollectionEnabled", False, type=bool):
-            days = self.settings.value("garbageCollectionDays", 30, type=int)
-            self.start_process(
-                "garbage-collect",
-                environment("NIXOS_UPDATE_CHECKER_PKEXEC", "pkexec"),
-                [
-                    environment("NIXOS_UPDATE_CHECKER_GC", "nix-collect-garbage"),
-                    *garbage_collection_arguments(days),
-                ],
-                "Garbage collecting old generations…",
-            )
+        if job == "rebuild":
+            self.record_applied_lock()
             return
-        self.set_busy(False, "Rebuild complete")
-        QTimer.singleShot(0, self.start_refresh)
+        if job == "record-applied-lock":
+            self.continue_after_rebuild()
+            return
+        if job == "garbage-collect":
+            self.finish_rebuild()
 
     def set_busy(self, busy: bool, message: str) -> None:
         self.refresh_button.setEnabled(not busy)
         self.rebuild_button.setEnabled(not busy)
+        self.settings_button.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.status.setText(message)
 
@@ -669,58 +705,57 @@ class UpdateCheckerWindow(QMainWindow):
             )
             self.tray.setToolTip(f"NixOS Update Checker · {count} updates")
 
+    def add_section(self, title: str, count: int) -> None:
+        item = QListWidgetItem(f"{title} ({count})")
+        item.setData(SECTION_ROLE, f"{title} ({count})")
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.updates.addItem(item)
+
     def populate_report(self, report: JsonObject) -> None:
         rows = report_rows(report)
-        self.table.setRowCount(len(rows))
-        for row_number, row in enumerate(rows):
-            values = [str(row.get(key, "")) for key in ("type", "name", "available")]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, row)
-                self.table.setItem(row_number, column, item)
+        self.updates.clear()
+        self.rendered_update_count = len(rows)
+        for row_type, title in (
+            ("Flake", "Flake inputs"),
+            ("Package", "Packages"),
+            ("Rebuild", "Rebuild-only"),
+        ):
+            grouped = [row for row in rows if row.get("type") == row_type]
+            if not grouped:
+                continue
+            self.add_section(title, len(grouped))
+            for row in grouped:
+                item = QListWidgetItem(str(row.get("name", "")))
+                item.setData(ROW_ROLE, row)
+                self.updates.addItem(item)
+        if not rows:
+            empty = QListWidgetItem("No updates found")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.updates.addItem(empty)
+
         packages = report.get("packages", {}) if isinstance(report, dict) else {}
         package_changes = packages.get("changes", []) if isinstance(packages, dict) else []
         store_only = packages.get("storeOnlyChanges", []) if isinstance(packages, dict) else []
-        self._set_summary(self.package_summary, len(package_changes))
-        self._set_summary(self.flake_summary, len(report.get("inputs", [])))
-        self._set_summary(self.rebuild_summary, len(store_only))
+        inputs = report.get("inputs", []) if isinstance(report, dict) else []
+        self._set_summary(
+            self.package_summary, len(package_changes) if isinstance(package_changes, list) else 0
+        )
+        self._set_summary(self.flake_summary, len(inputs) if isinstance(inputs, list) else 0)
+        self._set_summary(
+            self.rebuild_summary, len(store_only) if isinstance(store_only, list) else 0
+        )
         self.information.clear()
 
-    def update_information(self) -> None:
-        selected = self.table.selectedItems()
-        if not selected:
-            self.information.clear()
-            return
-        item = self.table.item(selected[0].row(), 0)
-        row = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
-        self.information.setPlainText("\n".join(update_detail_lines(row or {})))
-
-    def show_system_state(self) -> None:
-        report = self.last_report
-        system = report.get("system", {}) if isinstance(report, dict) else {}
-        build = report.get("build", {}) if isinstance(report, dict) else {}
-        parallel = (build or {}).get("parallelism") or {}
-        lines = [
-            f"Repository: {self.repository}",
-            f"Configuration: {report.get('configuration', 'unknown')}",
-            f"Running generation: {(system or {}).get('runningGeneration', 'unknown')}",
-            f"Saved configuration: {(system or {}).get('configurationState', 'unknown')}",
-            f"Reboot pending: {'yes' if (system or {}).get('rebootPending') else 'no'}",
-            f"Candidate closure: {(build or {}).get('candidateSystem', 'unknown')}",
-        ]
-        if parallel:
-            lines.extend(
-                [
-                    "",
-                    "Background parallelism:",
-                    f"  Logical CPUs: {parallel.get('logical_cpus')}",
-                    f"  Worker budget: {parallel.get('worker_budget')}",
-                    "  Nix jobs × cores: "
-                    f"{parallel.get('max_jobs')} × {parallel.get('cores_per_job')}",
-                ]
-            )
-        QMessageBox.information(self, "System state", "\n".join(lines))
+    def update_information(
+        self,
+        current: QListWidgetItem | None = None,
+        _previous: QListWidgetItem | None = None,
+    ) -> None:
+        item = current or self.updates.currentItem()
+        row = item.data(ROW_ROLE) if item is not None else None
+        self.information.setPlainText(
+            "\n".join(update_detail_lines(row)) if isinstance(row, dict) else ""
+        )
 
     def append_log(self, message: str) -> None:
         self.activity.appendPlainText(message)
@@ -772,9 +807,13 @@ class UpdateCheckerWindow(QMainWindow):
             "build": {"elapsedSeconds": 1.2, "background": True},
         }
         self.apply_report(sample, "self-test")
+        number = self.package_summary.findChild(QLabel, "number")
+        has_native_frame = not bool(self.windowFlags() & Qt.WindowType.FramelessWindowHint)
         if (
-            self.table.rowCount() != 3
-            or self.package_summary.findChild(QLabel, "number").text() != "1"
+            self.rendered_update_count != 3
+            or number is None
+            or number.text() != "1"
+            or not has_native_frame
         ):
             raise RuntimeError("GUI report rendering self-test failed")
 
