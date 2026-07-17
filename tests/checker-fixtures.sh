@@ -30,16 +30,21 @@ run_check() {
     NIXOS_UPDATE_CHECKER_STATE="$state" \
     NIXOS_UPDATE_CHECKER_HOSTNAME=fixture \
     NIXOS_UPDATE_CHECKER_CPU_LIST=0-31 \
+    FAKE_WORK_DIRECTORY="$work" \
+    FAKE_VERIFY_PARALLEL="${FAKE_VERIFY_PARALLEL:-}" \
+    FAKE_FAIL_PATH_INFO="${FAKE_FAIL_PATH_INFO:-}" \
     NIXOS_UPDATE_CHECKER_BASELINE_NIXPKGS_REVISION=old-nixpkgs-revision \
     FAKE_RUNNING_SYSTEM="$(readlink -f "$work/running-link")" \
     FAKE_BOOT_SYSTEM="$(readlink -f "$work/boot-link")" \
-    FAKE_CANDIDATE_SYSTEM="$work/systems/candidate" \
+    FAKE_CANDIDATE_SYSTEM="${FAKE_CANDIDATE_SYSTEM_OVERRIDE:-$work/systems/candidate}" \
     FAKE_DECLARED_DERIVER="$declared" \
     "$checker" --report "$work/report-$name.json" "$work/repository"
 }
 
 # No system-bound lock: recover nixpkgs only and mark the input history partial.
+FAKE_VERIFY_PARALLEL=1
 run_check incomplete /nix/store/different.drv "$work/state/incomplete.json"
+unset FAKE_VERIFY_PARALLEL
 jq -e '
   .schemaVersion == 2 and
   .inputBaseline == {
@@ -103,5 +108,41 @@ jq -e '
   .system.baseline == "running" and
   .system.readyForBoot == false
 ' "$work/report-switch.json" >/dev/null
+
+# Equal systems need only one closure query.
+: >"$work/path-info-calls"
+FAKE_CANDIDATE_SYSTEM_OVERRIDE="$work/systems/boot"
+run_check equal-system /nix/store/boot.drv "$work/state/equal-lock.json"
+unset FAKE_CANDIDATE_SYSTEM_OVERRIDE
+[[ $(wc -l <"$work/path-info-calls") == 1 ]]
+jq -e '
+  .system.baselinePath == .system.candidate and
+  (.packages.changes | length) == 0 and
+  .packages.rebuilds.count == 0
+' "$work/report-equal-system.json" >/dev/null
+
+# Either parallel closure query can fail without leaving a child or partial report.
+for side in baseline candidate; do
+  rm -f "$work"/path-info-*.pid
+  FAKE_FAIL_PATH_INFO=$side
+  if run_check "failure-$side" /nix/store/boot.drv "$work/state/failure-$side.json" \
+    >/dev/null 2>&1; then
+    echo "Expected the $side closure query to fail" >&2
+    exit 1
+  fi
+  unset FAKE_FAIL_PATH_INFO
+  jq -e --arg side "$side" '
+    .schemaVersion == 2 and .status == "error" and
+    (has("packages") | not) and
+    (.error.diagnostics | ascii_downcase | contains($side))
+  ' "$work/report-failure-$side.json" >/dev/null
+  for pid_file in "$work"/path-info-*.pid; do
+    [[ -e "$pid_file" ]] || continue
+    if kill -0 "$(<"$pid_file")" 2>/dev/null; then
+      echo "Closure query process was left running: $(<"$pid_file")" >&2
+      exit 1
+    fi
+  done
+done
 
 echo "checker fixtures passed"

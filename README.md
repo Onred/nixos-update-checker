@@ -69,6 +69,9 @@ their cores are still split with the following bounded square allocation:
 This lets independent builds and multithreaded build phases share the available
 CPUs instead of forcing all work through one builder. No Nix job setting can
 guarantee that an individual compiler thread never briefly uses a complete core.
+Cached checks also overlap candidate-lock resolution with baseline evaluation
+and query differing system closures concurrently. All work still shares the
+same service-wide CPU quota.
 
 The service uses the direct local Nix store. This is intentional: work delegated
 to `nix-daemon.service` would leave the checker's cgroup and escape its CPU

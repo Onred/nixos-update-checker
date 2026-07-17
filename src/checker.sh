@@ -5,6 +5,9 @@ set -euo pipefail
 report_path=""
 repository=""
 temporary_directory=""
+candidate_lock_pid=""
+baseline_query_pid=""
+candidate_query_pid=""
 state_path=${NIXOS_UPDATE_CHECKER_STATE:-/var/lib/nixos-update-checker/system-lock.json}
 running_link=${NIXOS_UPDATE_CHECKER_RUNNING_SYSTEM:-/run/current-system}
 boot_link=${NIXOS_UPDATE_CHECKER_BOOT_SYSTEM:-/nix/var/nix/profiles/system}
@@ -20,6 +23,17 @@ EOF
 }
 
 cleanup() {
+  local pid
+  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid"; do
+    if [[ -n "$pid" ]]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   if [[ -n "$temporary_directory" ]]; then
     rm -rf "$temporary_directory"
   fi
@@ -131,6 +145,33 @@ deriver_for() {
   nix --store local path-info --derivation "$system" 2>/dev/null | head -n 1 || true
 }
 
+query_path_info() {
+  local system=$1
+  local destination=$2
+  local diagnostics=$3
+  local command_pid=""
+  trap 'if [[ -n "$command_pid" ]]; then kill "$command_pid" 2>/dev/null || true; fi' TERM INT
+
+  nix --store local path-info --json --json-format 1 --recursive --size \
+    "$system" >"$destination" 2>"$diagnostics" &
+  command_pid=$!
+  if wait "$command_pid"; then
+    command_pid=""
+    trap - TERM INT
+    return
+  fi
+  command_pid=""
+
+  nix --store local path-info --json --recursive --size \
+    "$system" >"$destination" 2>"$diagnostics" &
+  command_pid=$!
+  local status=0
+  wait "$command_pid" || status=$?
+  command_pid=""
+  trap - TERM INT
+  return "$status"
+}
+
 while (($#)); do
   case "$1" in
     --report)
@@ -143,7 +184,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.3"
+      echo "nixos-update-checker-service 3.1.4"
       exit 0
       ;;
     --*)
@@ -193,6 +234,13 @@ flake="path:$repository"
 hostname=${NIXOS_UPDATE_CHECKER_HOSTNAME:-$(cat /proc/sys/kernel/hostname)}
 lock_hash=$(sha256sum "$repository/flake.lock" | cut -d ' ' -f 1)
 started=$(date +%s)
+candidate_lock="$temporary_directory/candidate.lock"
+
+# Lock resolution is independent of selecting and evaluating the current
+# configuration. Run both within the same service-wide CPU quota.
+nix --store local flake update --flake "$flake" \
+  --output-lock-file "$candidate_lock" 2>"$temporary_directory/update.log" &
+candidate_lock_pid=$!
 
 # This is a Nix expression; ${name} must reach Nix literally.
 # shellcheck disable=SC2016
@@ -245,9 +293,10 @@ if [[ -z "$baseline_revision" && -x "$baseline_system/sw/bin/nixos-version" ]]; 
     jq -r '.nixpkgsRevision // empty' || true)
 fi
 
-candidate_lock="$temporary_directory/candidate.lock"
-if ! nix --store local flake update --flake "$flake" \
-  --output-lock-file "$candidate_lock" 2>"$temporary_directory/update.log"; then
+if wait "$candidate_lock_pid"; then
+  candidate_lock_pid=""
+else
+  candidate_lock_pid=""
   fail "Could not resolve updated flake inputs." "$(<"$temporary_directory/update.log")"
 fi
 
@@ -320,22 +369,43 @@ if ! candidate_system=$(nix --store local \
 fi
 candidate_system=$(head -n 1 <<<"$candidate_system")
 
-path_info() {
-  local system=$1
-  local destination=$2
-  if nix --store local path-info --json --json-format 1 --recursive --size \
-    "$system" >"$destination" 2>"$temporary_directory/path-info.log"; then
-    return
-  fi
-  if ! nix --store local path-info --json --recursive --size \
-    "$system" >"$destination" 2>"$temporary_directory/path-info.log"; then
-    fail "Could not inspect the realized closure $system." \
-      "$(<"$temporary_directory/path-info.log")"
-  fi
-}
+baseline_json="$temporary_directory/baseline.json"
+candidate_json="$temporary_directory/candidate.json"
+baseline_log="$temporary_directory/baseline-path-info.log"
+candidate_log="$temporary_directory/candidate-path-info.log"
 
-path_info "$baseline_system" "$temporary_directory/baseline.json"
-path_info "$candidate_system" "$temporary_directory/candidate.json"
+if [[ "$baseline_system" == "$candidate_system" ]]; then
+  if ! query_path_info "$baseline_system" "$baseline_json" "$baseline_log"; then
+    fail "Could not inspect the realized closure $baseline_system." "$(<"$baseline_log")"
+  fi
+  install -m 0644 "$baseline_json" "$candidate_json"
+else
+  query_path_info "$baseline_system" "$baseline_json" "$baseline_log" &
+  baseline_query_pid=$!
+  query_path_info "$candidate_system" "$candidate_json" "$candidate_log" &
+  candidate_query_pid=$!
+
+  baseline_status=0
+  candidate_status=0
+  wait "$baseline_query_pid" || baseline_status=$?
+  baseline_query_pid=""
+  wait "$candidate_query_pid" || candidate_status=$?
+  candidate_query_pid=""
+
+  if ((baseline_status != 0 || candidate_status != 0)); then
+    diagnostics=""
+    if ((baseline_status != 0)); then
+      diagnostics+="Baseline closure ($baseline_system):"$'\n'"$(<"$baseline_log")"
+    fi
+    if ((candidate_status != 0)); then
+      if [[ -n "$diagnostics" ]]; then
+        diagnostics+=$'\n'
+      fi
+      diagnostics+="Candidate closure ($candidate_system):"$'\n'"$(<"$candidate_log")"
+    fi
+    fail "Could not inspect the realized system closures." "$diagnostics"
+  fi
+fi
 
 jq -n \
   --slurpfile baseline "$temporary_directory/baseline.json" \
