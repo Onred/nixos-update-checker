@@ -965,7 +965,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.1"
+      echo "nixos-update-checker-service 4.1.2"
       exit 0
       ;;
     --*)

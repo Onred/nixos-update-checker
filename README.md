@@ -173,9 +173,9 @@ leaving it ready for the GUI's Build Update and install flow.
   is present in the realized baseline; explicit configured packages remain
   eligible as additions.
 - A manual build realizes the exact saved candidate but never activates it.
-- Installing requires confirmation, installs the exact reviewed `flake.lock`,
-  and runs either `nixos-rebuild switch` or `nixos-rebuild boot` for the
-  configuration recorded in the report.
+- Installing is privileged, installs the exact reviewed `flake.lock`, and runs
+  either `nixos-rebuild switch` or `nixos-rebuild boot` for the configuration
+  recorded in the report.
 - Failed and cancelled operations leave the last successful report and reviewed
   candidate untouched. Manual operations do not restart automatically;
   automatic previews retry only transient failures and stop after bounded retries.

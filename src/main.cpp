@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QCloseEvent>
@@ -28,7 +30,9 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSplitter>
+#include <QSplitterHandle>
 #include <QStandardPaths>
 #include <QStyle>
 #include <QSystemTrayIcon>
@@ -41,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.1";
+constexpr auto Version = "4.1.2";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -315,6 +319,43 @@ private:
     QString text_;
 };
 
+class LowerPaneHandle final : public QSplitterHandle
+{
+public:
+    LowerPaneHandle(Qt::Orientation orientation, QSplitter *parent)
+        : QSplitterHandle(orientation, parent)
+    {
+        setToolTip("Drag to resize the lower pane");
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(palette().color(QPalette::Mid));
+        const qreal gripWidth = std::min(56, width() / 4);
+        painter.drawRoundedRect(
+            QRectF((width() - gripWidth) / 2.0, height() - 3.0, gripWidth, 3.0), 1.5, 1.5);
+    }
+};
+
+class LowerPaneSplitter final : public QSplitter
+{
+public:
+    LowerPaneSplitter(Qt::Orientation orientation, QWidget *parent)
+        : QSplitter(orientation, parent)
+    {
+    }
+
+protected:
+    QSplitterHandle *createHandle() override
+    {
+        return new LowerPaneHandle(orientation(), this);
+    }
+};
+
 class UpdateTable final : public QTableWidget
 {
 public:
@@ -324,8 +365,34 @@ public:
         setMouseTracking(true);
         viewport()->setMouseTracking(true);
 
-        busy_ = new BusyIndicator(viewport());
+        busy_ = new BusyIndicator(this);
         busy_->hide();
+
+        connect(horizontalHeader(), &QHeaderView::sectionResized, this,
+                [this](int index, int oldSize, int newSize) {
+                    if (!pairedResizing_ || adjustingColumns_ || index < 0 || index > 1
+                        || oldSize == newSize)
+                        return;
+                    QHeaderView *header = horizontalHeader();
+                    const int neighbor = index + 1;
+                    const int total = oldSize + header->sectionSize(neighbor);
+                    const int minimum = header->minimumSectionSize();
+                    const int primary = std::clamp(newSize, minimum, total - minimum);
+                    adjustingColumns_ = true;
+                    const QSignalBlocker blocker(header);
+                    header->resizeSection(index, primary);
+                    header->resizeSection(neighbor, total - primary);
+                    adjustingColumns_ = false;
+                });
+    }
+
+    void setInitialColumnWidths(int packageWidth, int versionWidth, int sizeWidth)
+    {
+        const QSignalBlocker blocker(horizontalHeader());
+        horizontalHeader()->resizeSection(0, packageWidth);
+        horizontalHeader()->resizeSection(1, versionWidth);
+        horizontalHeader()->resizeSection(2, sizeWidth);
+        pairedResizing_ = true;
     }
 
     void setBusy(bool busy, const QString &text = {})
@@ -369,17 +436,38 @@ protected:
     void resizeEvent(QResizeEvent *event) override
     {
         QTableWidget::resizeEvent(event);
+        fitColumnsToViewport();
         positionBusyIndicator();
     }
 
 private:
     void positionBusyIndicator()
     {
-        busy_->move((viewport()->width() - busy_->width()) / 2,
-            (viewport()->height() - busy_->height()) / 2);
+        const QPoint viewportPosition = viewport()->mapTo(this, QPoint(0, 0));
+        busy_->move(viewportPosition.x() + (viewport()->width() - busy_->width()) / 2,
+            viewportPosition.y() + (viewport()->height() - busy_->height()) / 2);
+    }
+
+    void fitColumnsToViewport()
+    {
+        if (!pairedResizing_)
+            return;
+        const int total = columnWidth(0) + columnWidth(1) + columnWidth(2);
+        const int difference = viewport()->width() - total;
+        if (difference == 0)
+            return;
+        const int packageWidth = columnWidth(0) + difference;
+        if (packageWidth < horizontalHeader()->minimumSectionSize())
+            return;
+        adjustingColumns_ = true;
+        const QSignalBlocker blocker(horizontalHeader());
+        horizontalHeader()->resizeSection(0, packageWidth);
+        adjustingColumns_ = false;
     }
 
     int hoveredRow_ = -1;
+    bool pairedResizing_ = false;
+    bool adjustingColumns_ = false;
     BusyIndicator *busy_ = nullptr;
 };
 
@@ -470,9 +558,9 @@ private:
         actions->addWidget(updateButton_);
         layout->addLayout(actions);
 
-        auto *splitter = new QSplitter(Qt::Vertical, central);
+        auto *splitter = new LowerPaneSplitter(Qt::Vertical, central);
         splitter->setChildrenCollapsible(false);
-        splitter->setHandleWidth(12);
+        splitter->setHandleWidth(8);
         updates_ = new UpdateTable(splitter);
         updates_->setHorizontalHeaderLabels({"Package", "New version", "Size"});
         updates_->setAlternatingRowColors(false);
@@ -488,10 +576,9 @@ private:
         updates_->horizontalHeader()->setSectionsMovable(false);
         updates_->horizontalHeader()->setSectionsClickable(false);
         updates_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-        updates_->horizontalHeader()->setStretchLastSection(true);
-        updates_->setColumnWidth(0, 500);
-        updates_->setColumnWidth(1, 190);
-        updates_->setColumnWidth(2, 110);
+        updates_->horizontalHeader()->setMinimumSectionSize(70);
+        updates_->horizontalHeader()->setStretchLastSection(false);
+        updates_->setInitialColumnWidths(500, 190, 110);
 
         infoTabs_ = new QTabWidget(splitter);
         details_ = new QPlainTextEdit(infoTabs_);
@@ -598,12 +685,6 @@ private:
     {
         if (!canApply() || serviceBusy())
             return;
-        const auto answer = QMessageBox::question(this, "Update NixOS?",
-            "This will update the real flake.lock, rebuild the reported configuration, "
-            "and switch the running system.\n\nContinue?");
-        if (answer != QMessageBox::Yes)
-            return;
-
         startService(applyService(), "update");
     }
 
