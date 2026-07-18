@@ -26,7 +26,9 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSettings>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
@@ -37,13 +39,44 @@
 
 namespace {
 
-constexpr auto Version = "3.1.5";
+constexpr auto Version = "3.1.6";
 constexpr int DetailRole = Qt::UserRole;
+
+struct AppSettings {
+    QString reportPath;
+    bool trayEnabled = true;
+};
 
 QString environment(const char *name, const QString &fallback = {})
 {
     const QString value = qEnvironmentVariable(name);
     return value.isEmpty() ? fallback : value;
+}
+
+QString settingsPath()
+{
+    const QString configHome = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+    return QDir(configHome).filePath("nixos-update-checker/nixos-update-checker.conf");
+}
+
+AppSettings loadSettings()
+{
+    const QString path = settingsPath();
+    QSettings settings(path, QSettings::IniFormat);
+
+    // Older Python releases stored window placement as a user preference. The
+    // native window manager should decide placement, so remove that obsolete key.
+    if (settings.contains("windowGeometry")) {
+        settings.remove("windowGeometry");
+        settings.sync();
+        if (settings.allKeys().isEmpty())
+            QFile::remove(path);
+    }
+
+    AppSettings result;
+    result.reportPath = settings.value("reportPath").toString().trimmed();
+    result.trayEnabled = settings.value("trayEnabled", true).toBool();
+    return result;
 }
 
 QString canonicalPath(const QString &path)
@@ -1133,15 +1166,20 @@ int main(int argc, char **argv)
     parser.addHelpOption();
     parser.addVersionOption();
     QCommandLineOption reportOption("report", "Read reports from PATH.", "PATH",
-        environment("NIXOS_UPDATE_CHECKER_REPORT", "/var/lib/nixos-update-checker/report.json"));
+        QString{});
     QCommandLineOption noTrayOption("no-tray", "Do not create a system tray icon.");
     parser.addOption(reportOption);
     parser.addOption(noTrayOption);
     parser.process(application);
 
-    const bool trayEnabled = !parser.isSet(noTrayOption);
+    const AppSettings settings = loadSettings();
+    QString reportPath = parser.isSet(reportOption) ? parser.value(reportOption) : settings.reportPath;
+    if (reportPath.isEmpty())
+        reportPath = environment(
+            "NIXOS_UPDATE_CHECKER_REPORT", "/var/lib/nixos-update-checker/report.json");
+    const bool trayEnabled = settings.trayEnabled && !parser.isSet(noTrayOption);
     application.setQuitOnLastWindowClosed(!trayEnabled);
-    MainWindow window(parser.value(reportOption), trayEnabled);
+    MainWindow window(reportPath, trayEnabled);
     window.show();
     return application.exec();
 }

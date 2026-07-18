@@ -6,7 +6,16 @@ checker=${1:-src/checker.sh}
 project=$(readlink -f "$(dirname "$0")/..")
 fixtures="$project/tests/fixtures"
 work=$(mktemp -d -t nixos-update-checker-test.XXXXXX)
-trap 'rm -rf "$work"' EXIT
+lock_holder=""
+
+cleanup_test() {
+  if [[ -n "$lock_holder" ]]; then
+    kill "$lock_holder" 2>/dev/null || true
+    wait "$lock_holder" 2>/dev/null || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup_test EXIT
 
 mkdir -p "$work/repository" "$work/profiles" "$work/state"
 install -m 0644 "$fixtures/flake.nix" "$work/repository/flake.nix"
@@ -30,6 +39,8 @@ run_check() {
     NIXOS_UPDATE_CHECKER_STATE="$state" \
     NIXOS_UPDATE_CHECKER_HOSTNAME=fixture \
     NIXOS_UPDATE_CHECKER_CPU_LIST=0-31 \
+    NIXOS_UPDATE_CHECKER_LOCK="${NIXOS_UPDATE_CHECKER_LOCK:-}" \
+    NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT="${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}" \
     FAKE_WORK_DIRECTORY="$work" \
     FAKE_VERIFY_PARALLEL="${FAKE_VERIFY_PARALLEL:-}" \
     FAKE_FAIL_PATH_INFO="${FAKE_FAIL_PATH_INFO:-}" \
@@ -144,5 +155,31 @@ for side in baseline candidate; do
     fi
   done
 done
+
+# Lock contention fails quickly so systemd can retry instead of waiting forever.
+held_lock="$work/held-operation.lock"
+lock_ready="$work/held-operation.ready"
+(
+  exec 8>"$held_lock"
+  flock 8
+  : >"$lock_ready"
+  sleep 30
+) &
+lock_holder=$!
+for _ in {1..50}; do
+  [[ -e "$lock_ready" ]] && break
+  sleep 0.02
+done
+[[ -e "$lock_ready" ]]
+if NIXOS_UPDATE_CHECKER_LOCK="$held_lock" NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT=0.1 \
+  run_check lock-contention /nix/store/boot.drv "$work/state/lock-contention.json" \
+  >/dev/null 2>&1; then
+  echo "Expected lock contention to fail" >&2
+  exit 1
+fi
+kill "$lock_holder" 2>/dev/null || true
+wait "$lock_holder" 2>/dev/null || true
+lock_holder=""
+[[ ! -e "$work/report-lock-contention.json" ]]
 
 echo "checker fixtures passed"

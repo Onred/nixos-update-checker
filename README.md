@@ -42,9 +42,9 @@ Import and enable the module:
 ```
 
 The module installs the app, starts it from desktop autostart, and enables a
-daily persistent timer with up to one hour of random delay. A systemd path unit
-also starts the same low-priority check whenever the default system profile
-changes outside this application.
+persistent timer that checks ten minutes after boot and then daily. A systemd
+path unit also starts the same low-priority check whenever the default system
+profile changes outside this application.
 
 Only three module options are exposed:
 
@@ -52,7 +52,7 @@ Only three module options are exposed:
 |---|---:|---|
 | `enable` | `false` | Install and enable the checker. |
 | `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
-| `cpuQuota` | `25%` | Aggregate CPU quota for background checks. |
+| `cpuQuota` | `50%` | Aggregate CPU quota for background checks; `null` disables it. |
 
 For example, `cpuQuota = "25%"` limits both single-threaded evaluation and
 parallel builds to one quarter of a CPU's total throughput. Nix workers and
@@ -78,6 +78,9 @@ to `nix-daemon.service` would leave the checker's cgroup and escape its CPU
 limit. CPU and I/O weights, nice level, and idle I/O scheduling further favor
 interactive work.
 
+Set `cpuQuota = null` to leave CPU time unrestricted while retaining the low
+CPU and I/O scheduling priorities.
+
 ## Use
 
 Open **NixOS Update Checker** from the application launcher or system tray. The
@@ -94,6 +97,20 @@ The tray icon uses a colored status badge: orange means updates are pending,
 green means the report is current with no updates, blue means work is running,
 and red means the last check failed. Its tooltip follows the live service state
 and shows the cached update counts while idle.
+
+The GUI reads optional user settings from
+`$XDG_CONFIG_HOME/nixos-update-checker/nixos-update-checker.conf` (normally
+`~/.config/nixos-update-checker/nixos-update-checker.conf`). Supported keys in
+the `[General]` section are `trayEnabled` and `reportPath`. Explicit command-line
+options take precedence, followed by this file, packaged environment defaults,
+and built-in defaults. The obsolete `windowGeometry` key from older releases is
+removed automatically; window placement is left to the desktop.
+
+```ini
+[General]
+trayEnabled=true
+reportPath=/var/lib/nixos-update-checker/report.json
+```
 
 An active local desktop user may start only the constrained refresh service
 without authentication. Updating the system is a separate service and still

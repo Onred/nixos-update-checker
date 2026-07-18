@@ -23,12 +23,13 @@ in
     };
 
     cpuQuota = lib.mkOption {
-      type = lib.types.strMatching "[1-9][0-9]*%";
+      type = lib.types.nullOr (lib.types.strMatching "[1-9][0-9]*%");
       default = "50%";
-      example = "50%";
+      example = null;
       description = ''
         Aggregate CPU quota for the checker. Values below 100% throttle
-        single-threaded evaluation as well as parallel build work.
+        single-threaded evaluation as well as parallel build work. Set this
+        to null to disable CPU quota enforcement.
       '';
     };
   };
@@ -81,15 +82,18 @@ in
         StateDirectoryMode = "0755";
         UMask = "0022";
 
-        CPUQuota = cfg.cpuQuota;
-        CPUQuotaPeriodSec = "10ms";
         CPUWeight = 1;
         IOWeight = 1;
         Nice = 19;
         IOSchedulingClass = "idle";
         IOSchedulingPriority = 7;
         OOMScoreAdjust = 500;
-        TimeoutStartSec = "infinity";
+        Restart = "on-failure";
+        RestartSec = "10m";
+        KillMode = "control-group";
+        TimeoutStopSec = "30s";
+        SendSIGKILL = true;
+        TimeoutStartSec = "24h";
 
         # Local builders stay in this service's cgroup. nix-daemon builders do not.
         ReadWritePaths = [
@@ -101,6 +105,10 @@ in
         ProtectSystem = "strict";
         ProtectHome = "read-only";
         NoNewPrivileges = true;
+      }
+      // lib.optionalAttrs (cfg.cpuQuota != null) {
+        CPUQuota = cfg.cpuQuota;
+        CPUQuotaPeriodSec = "10ms";
       };
     };
 
@@ -136,11 +144,11 @@ in
     };
 
     systemd.timers.nixos-update-checker = {
-      description = "Run the daily NixOS update check";
+      description = "Run NixOS update checks after boot and daily";
       wantedBy = [ "timers.target" ];
       timerConfig = {
+        OnBootSec = "10m";
         OnCalendar = "daily";
-        RandomizedDelaySec = "1h";
         Persistent = true;
       };
     };

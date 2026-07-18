@@ -12,6 +12,7 @@ state_path=${NIXOS_UPDATE_CHECKER_STATE:-/var/lib/nixos-update-checker/system-lo
 running_link=${NIXOS_UPDATE_CHECKER_RUNNING_SYSTEM:-/run/current-system}
 boot_link=${NIXOS_UPDATE_CHECKER_BOOT_SYSTEM:-/nix/var/nix/profiles/system}
 profile_directory=${NIXOS_UPDATE_CHECKER_PROFILE_DIRECTORY:-/nix/var/nix/profiles}
+lock_timeout=${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}
 
 usage() {
   cat <<'EOF'
@@ -38,7 +39,14 @@ cleanup() {
     rm -rf "$temporary_directory"
   fi
 }
+
+stop_checker() {
+  trap - TERM INT
+  exit 143
+}
+
 trap cleanup EXIT
+trap stop_checker TERM INT
 
 write_json_file() {
   local source=$1
@@ -188,7 +196,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.5"
+      echo "nixos-update-checker-service 3.1.6"
       exit 0
       ;;
     --*)
@@ -210,7 +218,10 @@ temporary_directory=$(mktemp -d -t nixos-update-checker.XXXXXX)
 
 if [[ -n "${NIXOS_UPDATE_CHECKER_LOCK:-}" ]]; then
   exec 9>"$NIXOS_UPDATE_CHECKER_LOCK"
-  flock 9
+  if ! flock -w "$lock_timeout" 9; then
+    printf 'ERROR: Another update operation still holds the shared lock.\n' >&2
+    exit 75
+  fi
 fi
 
 log "Inspecting the running and default-boot generations."
@@ -486,7 +497,7 @@ if [[ "$record_system_lock" == true ]]; then
     }
   ' >"$temporary_directory/system-lock.json"
   if ! write_json_file "$temporary_directory/system-lock.json" "$state_path"; then
-    printf 'WARNING: Could not save system lock state at %s\n' "$state_path" >&2
+    fail "Could not save system lock state at $state_path."
   fi
 fi
 
