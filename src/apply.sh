@@ -79,7 +79,7 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
-  echo "nixos-update-checker-apply 4.1.2"
+  echo "nixos-update-checker-apply 4.1.3"
   exit 0
 fi
 if [[ ${1:-} == "--boot" ]]; then
@@ -163,9 +163,9 @@ if ! nixos-rebuild "$action" --flake "path:$repository#$configuration"; then
   die "nixos-rebuild $action failed."
 fi
 
-write_status succeeded \
-  "$(if [[ "$action" == boot ]]; then echo 'Update installed for next boot'; else echo 'System updated'; fi)" ""
-
 # The profile path unit publishes a fresh report. Removing the old report keeps
 # restarted readers from presenting an update that was already installed.
 rm -f "$report" "$candidate_lock"
+
+write_status succeeded \
+  "$(if [[ "$action" == boot ]]; then echo 'Update installed for next boot'; else echo 'System updated'; fi)" ""

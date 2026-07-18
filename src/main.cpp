@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.2";
+constexpr auto Version = "4.1.3";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -524,6 +524,12 @@ private:
 
         restartBanner_ = new QFrame(central);
         restartBanner_->setFrameShape(QFrame::StyledPanel);
+        restartBanner_->setAutoFillBackground(true);
+        QPalette bannerPalette = restartBanner_->palette();
+        bannerPalette.setColor(QPalette::Window, bannerPalette.color(QPalette::Highlight));
+        bannerPalette.setColor(
+            QPalette::WindowText, bannerPalette.color(QPalette::HighlightedText));
+        restartBanner_->setPalette(bannerPalette);
         auto *restartLayout = new QHBoxLayout(restartBanner_);
         restartLayout->setContentsMargins(10, 7, 10, 7);
         auto *restartLabel = new QLabel(
@@ -1497,7 +1503,8 @@ private:
             "/run/current-system/sw/bin/nixos-update-checker");
         const QString installedPackage = nixStorePackage(executable);
         const bool replacementAvailable = !runningPackage_.isEmpty()
-            && !installedPackage.isEmpty() && runningPackage_ != installedPackage;
+            && !installedPackage.isEmpty() && runningPackage_ != installedPackage
+            && !isUpdating();
         if (restartBanner_->isVisible() != replacementAvailable) {
             restartBanner_->setVisible(replacementAvailable);
             updateTray();

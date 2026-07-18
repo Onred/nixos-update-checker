@@ -276,18 +276,13 @@ filter_preview_discovery() {
   jq -n \
     --slurpfile baseline "$baseline" \
     --slurpfile discovery "$discovery" '
-    def parsedName($path):
-      ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
-      try ($base | capture("^(?<name>.*?)-[0-9].*$").name) catch $base;
     ($baseline[0] | keys) as $baselinePaths |
-    ($baselinePaths | map(parsedName(.)) | unique) as $baselineNames |
     $discovery[0] |
     .packages |= map(
       . as $package |
       select(
         any($package.sources[]; startswith("option:") | not)
         or ($baselinePaths | index($package.storePath)) != null
-        or ($baselineNames | index($package.name)) != null
       )
     )
   ' >"$destination"
@@ -965,7 +960,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.2"
+      echo "nixos-update-checker-service 4.1.3"
       exit 0
       ;;
     --*)

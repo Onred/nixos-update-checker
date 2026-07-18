@@ -44,6 +44,7 @@ run_checker() {
     FAKE_CANDIDATE_SYSTEM="${FAKE_CANDIDATE_SYSTEM_OVERRIDE:-$work/systems/candidate}" \
     FAKE_DECLARED_DERIVER="${FAKE_DECLARED_DERIVER:-/nix/store/different.drv}" \
     FAKE_METADATA_FAILURE="${FAKE_METADATA_FAILURE:-}" \
+    FAKE_UNCHANGED_PACKAGES="${FAKE_UNCHANGED_PACKAGES:-}" \
     FAKE_DISCOVERY_FAILURE="${FAKE_DISCOVERY_FAILURE:-}" \
     FAKE_DISCOVERY_BLOCK="${FAKE_DISCOVERY_BLOCK:-}" \
     FAKE_DISCOVERY_MARKER="$work/discovery-blocked" \
@@ -78,6 +79,10 @@ jq -e '
 ' "$report" >/dev/null
 if grep -q 'unused-option-package' "$work/nix-invocations"; then
   echo "Preview queried an unconfirmed package-option hint" >&2
+  exit 1
+fi
+if grep -q 'firefox-option-hint' "$work/nix-invocations"; then
+  echo "Preview queried an option hint merely because its name matched" >&2
   exit 1
 fi
 [[ -s "$candidate_lock" ]]
@@ -145,6 +150,22 @@ jq -e '
   all(.packages.changes[]; .confidence == "configured" and .sizeKnown == false) and
   .packages.rebuilds.sizeKnown == false
 ' "$work/cache-miss-report.json" >/dev/null
+
+# Moving unchanged configuration between modules may change the system
+# derivation without changing packages. Same-name option hints must not turn
+# into speculative rebuilds when their exact paths are absent from baseline.
+: >"$work/nix-invocations"
+FAKE_UNCHANGED_PACKAGES=1 \
+  run_checker --report "$work/config-only-report.json" \
+    --candidate-lock "$work/config-only.lock" "$work/repository"
+jq -e '
+  (.packages.changes | length) == 0 and
+  .packages.rebuilds.count == 0
+' "$work/config-only-report.json" >/dev/null
+if grep -q 'firefox-option-hint' "$work/nix-invocations"; then
+  echo "Configuration-only preview queried a same-name option hint" >&2
+  exit 1
+fi
 
 # An identical candidate is already exact. It must short-circuit metadata and
 # dry-run work and publish an empty verified package comparison.

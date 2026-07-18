@@ -29,8 +29,16 @@ elif [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
       : >"${FAKE_DISCOVERY_MARKER:?}"
       sleep 2
     fi
+    firefox_version=2.0
+    firefox_path=/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0
+    glibc_path=/nix/store/gggggggggggggggggggggggggggggggg-glibc-2.40
+    if [[ ${FAKE_UNCHANGED_PACKAGES:-} == 1 ]]; then
+      firefox_version=1.0
+      firefox_path=/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-1.0
+      glibc_path=/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40
+    fi
     cat <<EOF
-{"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"2.0","storePath":"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"/nix/store/gggggggggggggggggggggggggggggggg-glibc-2.40","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"}]}
+{"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"$firefox_version","storePath":"$firefox_path","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"$glibc_path","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"$firefox_version","storePath":"/nix/store/llllllllllllllllllllllllllllllll-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"}]}
 EOF
   else
     echo '[{"name":"desktop","hostName":"fixture"}]'
@@ -61,6 +69,8 @@ elif [[ "$arguments" == *" path-info "* ]]; then
   elif [[ ${FAKE_METADATA_FAILURE:-} == 1 ]]; then
     echo '{"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0":null}'
     exit 1
+  elif [[ ${FAKE_UNCHANGED_PACKAGES:-} == 1 ]]; then
+    cat "$fixtures/baseline-closure.json"
   else
     cat "$fixtures/candidate-closure.json"
   fi

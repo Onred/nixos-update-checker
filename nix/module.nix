@@ -19,7 +19,6 @@ let
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
-
       environment = {
         HOME = "/var/lib/nixos-update-checker";
         NIX_REMOTE = "local";
@@ -92,6 +91,10 @@ let
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      # A self-update changes ExecStart to a new store path while this oneshot
+      # is still running. Let the current invocation finish its cleanup.
+      restartIfChanged = false;
+      stopIfChanged = false;
 
       environment = {
         NIXOS_UPDATE_CHECKER_LOCK = lock;
