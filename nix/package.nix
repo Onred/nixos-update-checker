@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "4.1.3";
+  version = "4.1.5";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -96,7 +96,7 @@ pkgs.stdenv.mkDerivation {
   ];
   installCheckPhase = ''
     runHook preInstallCheck
-    patchShebangs src/checker.sh scripts/live-regression-test.sh \
+    patchShebangs src/checker.sh src/apply.sh scripts/live-regression-test.sh \
       tests/checker-fixtures.sh tests/fixtures/bin/nix
     shellcheck src/checker.sh src/apply.sh \
       scripts/live-regression-test.sh tests/checker-fixtures.sh tests/fixtures/bin/nix

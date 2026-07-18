@@ -121,6 +121,13 @@ activated system contains a different updater package. The old tray instance is
 hidden before its replacement starts. The banner uses the active Qt theme's
 highlight and highlighted-text colors.
 
+All preview, build, and install services share one operation lock. A timed or
+profile-triggered preview cannot run concurrently with or interrupt a manual
+build or install. Explicit builds and both install actions also hold a systemd
+inhibitor against sleep, hibernation, reboot, and shutdown until they finish or
+are cancelled. Refreshes remain uninhibited. A successful install explicitly
+starts a fresh background report after releasing the shared lock.
+
 Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
@@ -188,9 +195,11 @@ leaving it ready for the GUI's Build Update and install flow.
   `/var/lib/nixos-update-checker/system-lock.json`. If no complete lock can be
   matched to the baseline system, it recovers only nixpkgs history from that
   system and marks the report incomplete.
-- Apply is disabled for previews, stale reports, incomplete input history, old
-  reports, and reports with no remaining updates. The root apply helper repeats
-  the live profile check before modifying anything.
+- Apply is disabled for previews, out-of-date reports, old report formats, and
+  reports with no remaining updates. Missing historical input data affects only
+  the source-change summary; it does not block an exact update that has already
+  been built and verified. The root apply helper repeats the live system and
+  configuration checks before modifying anything.
 - Only changed inputs declared directly by the configuration flake are reported.
   These are not every transitive node in `flake.lock`: direct inputs may
   themselves be flakes or non-flake sources, and direct `follows`

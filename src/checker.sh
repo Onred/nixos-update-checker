@@ -23,9 +23,8 @@ Usage: nixos-update-checker-service [--build] [--report PATH]
                                     [--candidate-lock PATH] [--status PATH]
                                     REPOSITORY
 
-Without --build, evaluate an updated NixOS candidate without realizing it and
-publish a schema-3 preview report. --build realizes the exact saved candidate
-and replaces the preview with a verified closure report.
+Without --build, check for updates without building them. --build builds the
+exact saved update and records complete package and size information.
 EOF
 }
 
@@ -44,8 +43,8 @@ stop_checker() {
 unexpected_error() {
   local exit_status=$?
   trap - ERR
-  write_operation_status failed "Operation failed unexpectedly." \
-    "See the system journal for the command that failed."
+  write_operation_status failed "The update check stopped unexpectedly." \
+    "Open Progress for technical details."
   exit "$exit_status"
 }
 
@@ -211,7 +210,7 @@ query_candidate_metadata() {
   part="$directory/$index.json"
   diagnostics="$directory/$index.log"
   if ! query_path_info "$store" "$part" "$diagnostics" "${roots[@]}"; then
-    log "The local store could not describe every candidate package."
+    log "Some updated package information was unavailable in the local Nix store."
     printf '{}\n' >"$part"
   fi
   ((index += 1))
@@ -232,7 +231,7 @@ query_candidate_metadata() {
     diagnostics="$directory/$index.log"
     log "Querying package metadata from $query_store."
     if ! query_path_info "$query_store" "$part" "$diagnostics" "${roots[@]}"; then
-      log "Metadata query failed for $query_store; continuing with other stores."
+      log "Package information was unavailable from $query_store; trying other sources."
       printf '{}\n' >"$part"
     fi
     ((index += 1))
@@ -487,7 +486,7 @@ compare_closures() {
 current_system_state() {
   running_system=$(resolved_path "$running_link")
   boot_system=$(resolved_path "$boot_link")
-  [[ -n "$running_system" ]] || fail "No running NixOS system is available."
+  [[ -n "$running_system" ]] || fail "The running NixOS system could not be found."
   [[ -n "$boot_system" ]] || boot_system=$running_system
   baseline_kind=running
   baseline_system=$running_system
@@ -511,7 +510,7 @@ select_configuration() {
   if ! configurations=$(nix --store "$store" eval --json --no-write-lock-file \
     --apply "$discovery_expression" "$flake#nixosConfigurations" \
     2>"$temporary_directory/configurations.log"); then
-    fail "Could not enumerate NixOS configurations." \
+    fail "Could not find NixOS configurations in the selected configuration folder." \
       "$({ cat "$temporary_directory/configurations.log"; } 2>/dev/null)" 2
   fi
   configuration=$(jq -r --arg hostname "$hostname" '
@@ -520,7 +519,7 @@ select_configuration() {
     end
   ' <<<"$configurations")
   [[ -n "$configuration" ]] || fail \
-    "Could not select one NixOS configuration for host $hostname." \
+    "Could not find a NixOS configuration for this computer ($hostname)." \
     "Available configurations: $(jq -c '.' <<<"$configurations")" 2
 }
 
@@ -598,14 +597,14 @@ run_preview() {
   working_lock_hash=$(sha256_file "$repository/flake.lock")
   local candidate_lock="$temporary_directory/candidate.lock"
 
-  log "Resolving updated configuration inputs without modifying flake.lock."
+  log "Checking configuration sources for updates without changing flake.lock."
   if ! nix --store "$store" flake update --flake "$flake" \
     --output-lock-file "$candidate_lock" \
     2> >(tee "$temporary_directory/update.log" >&2); then
-    fail "Could not resolve updated configuration inputs." "$({ cat "$temporary_directory/update.log"; } 2>/dev/null)"
+    fail "Could not check for newer configuration sources." "$({ cat "$temporary_directory/update.log"; } 2>/dev/null)"
   fi
   [[ "$working_lock_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-    fail "flake.lock changed while the preview was running." "" 2
+    fail "Your NixOS configuration changed during the refresh. Try again." "" 2
 
   log "Selecting the NixOS configuration."
   select_configuration "$flake"
@@ -614,7 +613,7 @@ run_preview() {
   local declared_deriver
   if ! declared_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
     "$system_installable.drvPath" 2>"$temporary_directory/declared.log"); then
-    fail "Could not evaluate the configured NixOS system." \
+    fail "Could not read your NixOS configuration." \
       "$({ cat "$temporary_directory/declared.log"; } 2>/dev/null)" 2
   fi
   local baseline_deriver
@@ -653,12 +652,12 @@ run_preview() {
     fail "Package discovery rules are missing at $discovery_file." "" 2
   local discovery_expression
   discovery_expression=$(<"$discovery_file")
-  log "Discovering configured packages in one candidate evaluation."
+  log "Reading packages from the updated configuration."
   if ! nix --store "$store" eval --json --no-write-lock-file \
     --reference-lock-file "$candidate_lock" --apply "$discovery_expression" \
     "$installable" >"$temporary_directory/discovery-raw.json" \
     2> >(tee "$temporary_directory/discovery.log" >&2); then
-    fail "Could not discover configured candidate packages." \
+    fail "Could not read packages from your NixOS configuration." \
       "$({ cat "$temporary_directory/discovery.log"; } 2>/dev/null)" 2
   fi
   normalise_discovery "$temporary_directory/discovery-raw.json" \
@@ -667,10 +666,10 @@ run_preview() {
   candidate_deriver=$(jq -er '.system.drvPath' "$temporary_directory/discovery.json")
   candidate_system=$(jq -er '.system.storePath' "$temporary_directory/discovery.json")
 
-  log "Inspecting the realized baseline closure."
+  log "Reading packages from the current system."
   query_path_info "$store" "$temporary_directory/baseline.json" \
     "$temporary_directory/baseline-path-info.log" "$baseline_system" || \
-    fail "Could not inspect the realized baseline closure." \
+    fail "Could not read packages from the current system." \
       "$({ cat "$temporary_directory/baseline-path-info.log"; } 2>/dev/null)"
 
   local analysis_mode=preview
@@ -678,7 +677,7 @@ run_preview() {
   local build_size_known=false
   local candidate_data="$temporary_directory/candidate-preview.json"
   if [[ "$candidate_system" == "$baseline_system" ]]; then
-    log "The candidate is the current baseline; reusing its exact closure."
+    log "The available update matches the current system; reusing its package information."
     install -m 0644 "$temporary_directory/baseline.json" "$candidate_data"
     compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
       "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
@@ -687,10 +686,10 @@ run_preview() {
     build_size_known=true
     : >"$temporary_directory/local-builds.txt"
   elif [[ -e "$candidate_system" ]]; then
-    log "The candidate is already realized; inspecting its exact closure."
+    log "The update is already built; reading its package information."
     query_path_info "$store" "$candidate_data" \
       "$temporary_directory/candidate-path-info.log" "$candidate_system" || \
-      fail "Could not inspect the realized candidate closure." \
+      fail "Could not read packages from the available update." \
         "$({ cat "$temporary_directory/candidate-path-info.log"; } 2>/dev/null)"
     compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
       "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
@@ -714,13 +713,13 @@ run_preview() {
     compare_preview "$temporary_directory/baseline.json" "$candidate_data" \
       "$temporary_directory/preview-discovery.json" "$temporary_directory/comparison.json"
 
-    log "Asking Nix which derivations would require local builds."
+    log "Checking which parts of the update need to be built on this computer."
     local dry_run_status=0
     nix --store "$store" build --dry-run --json --no-link --no-write-lock-file \
       --reference-lock-file "$candidate_lock" "$system_installable" \
       >"$temporary_directory/dry-run.json" 2>"$temporary_directory/dry-run.log" || dry_run_status=$?
     if ((dry_run_status != 0)); then
-      fail "Nix could not calculate the candidate build plan." \
+      fail "Nix could not calculate what the update needs to build." \
         "$({ cat "$temporary_directory/dry-run.log"; } 2>/dev/null)" 2
     fi
     grep -Eo '/nix/store/[a-z0-9]{32}-[^[:space:]]+\.drv' \
@@ -831,44 +830,44 @@ run_preview() {
   ' >"$temporary_directory/report.json"
 
   [[ "$working_lock_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-    fail "flake.lock changed while the preview was running." "" 2
+    fail "Your NixOS configuration changed during the refresh. Try again." "" 2
   if [[ -n "$candidate_lock_path" ]]; then
     write_json_file "$candidate_lock" "$candidate_lock_path"
   fi
   write_report "$temporary_directory/report.json"
-  write_operation_status succeeded "Update report refreshed" ""
+  write_operation_status succeeded "Update check finished" ""
   if [[ "$analysis_mode" == verified ]]; then
-    log "Exact report published in ${elapsed}s; the candidate was already realized."
+    log "Complete update information saved in ${elapsed}s; the update was already built."
   else
-    log "Conservative preview published in ${elapsed}s without realizing the candidate."
+    log "Update preview saved in ${elapsed}s without building the update."
   fi
 }
 
 run_build() {
   [[ -n "$report_path" && -f "$report_path" ]] || \
-    fail "No preview report is available to build."
+    fail "Refresh before building the update."
   [[ -n "$candidate_lock_path" && -f "$candidate_lock_path" ]] || \
-    fail "No saved candidate lock is available to build."
+    fail "The saved update information is missing. Refresh and try again."
 
   local preview="$temporary_directory/preview.json"
   install -m 0644 "$report_path" "$preview"
   jq -e --arg repository "$repository" '
     .schemaVersion == 3 and .status == "success" and .analysis.mode == "preview"
     and .repository == $repository and .updatesAvailable == true
-  ' "$preview" >/dev/null || fail "The saved report is not a buildable preview."
+  ' "$preview" >/dev/null || fail "This update is not ready to build. Refresh and try again."
 
   current_system_state
   local report_baseline
   report_baseline=$(jq -er '.system.baselinePath' "$preview")
   [[ "$report_baseline" == "$baseline_system" ]] || \
-    fail "The system profile changed after this preview was generated. Run Refresh first."
+    fail "Your system changed since the last refresh. Refresh and try again."
   local expected_working_hash expected_candidate_hash
   expected_working_hash=$(jq -er '.candidate.workingLockHash' "$preview")
   expected_candidate_hash=$(jq -er '.candidate.lockHash' "$preview")
   [[ "$expected_working_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-    fail "flake.lock changed after this preview was generated. Run Refresh first."
+    fail "Your NixOS configuration changed since the last refresh. Refresh and try again."
   [[ "$expected_candidate_hash" == "$(sha256_file "$candidate_lock_path")" ]] || \
-    fail "The saved candidate lock does not match the preview."
+    fail "The saved update is no longer valid. Refresh and try again."
 
   configuration=$(jq -er '.configuration' "$preview")
   local flake="path:$repository"
@@ -877,32 +876,32 @@ run_build() {
   if ! candidate_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
     --reference-lock-file "$candidate_lock_path" "$system_installable.drvPath" \
     2>"$temporary_directory/build-eval.log"); then
-    fail "Could not evaluate the saved candidate." "$({ cat "$temporary_directory/build-eval.log"; } 2>/dev/null)"
+    fail "The saved update could not be checked." "$({ cat "$temporary_directory/build-eval.log"; } 2>/dev/null)"
   fi
   [[ "$candidate_deriver" == "$(jq -er '.candidate.deriver' "$preview")" ]] || \
-    fail "The evaluated candidate no longer matches the preview."
+    fail "Your NixOS configuration changed. Refresh and try again."
 
   local started
   started=$(date +%s)
-  log "Building the reviewed candidate with normal Nix scheduling."
+  log "Building the selected update with normal Nix scheduling."
   local candidate_system
   if ! candidate_system=$(nix --store "$store" build --no-link --print-out-paths \
     --print-build-logs --no-write-lock-file \
     --reference-lock-file "$candidate_lock_path" "$system_installable" \
     2> >(tee "$temporary_directory/build.log" >&2)); then
-    fail "Could not build the reviewed NixOS candidate." "$({ cat "$temporary_directory/build.log"; } 2>/dev/null)"
+    fail "NixOS could not build the update." "$({ cat "$temporary_directory/build.log"; } 2>/dev/null)"
   fi
   candidate_system=$(head -n 1 <<<"$candidate_system")
   [[ "$candidate_system" == "$(jq -er '.system.candidate' "$preview")" ]] || \
-    fail "The realized candidate path differs from the preview."
+    fail "The built update differs from the preview. Refresh and try again."
 
-  log "Inspecting the verified baseline and candidate closures."
+  log "Reading packages from the current system and the built update."
   query_path_info "$store" "$temporary_directory/baseline.json" \
     "$temporary_directory/baseline.log" "$baseline_system" || \
-    fail "Could not inspect the baseline closure." "$({ cat "$temporary_directory/baseline.log"; } 2>/dev/null)"
+    fail "Could not read packages from the current system after the build." "$({ cat "$temporary_directory/baseline.log"; } 2>/dev/null)"
   query_path_info "$store" "$temporary_directory/candidate.json" \
     "$temporary_directory/candidate.log" "$candidate_system" || \
-    fail "Could not inspect the candidate closure." "$({ cat "$temporary_directory/candidate.log"; } 2>/dev/null)"
+    fail "Could not read packages from the built update." "$({ cat "$temporary_directory/candidate.log"; } 2>/dev/null)"
   jq '.discovery' "$preview" >"$temporary_directory/discovery.json"
   compare_closures "$temporary_directory/baseline.json" "$temporary_directory/candidate.json" \
     "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
@@ -930,8 +929,8 @@ run_build() {
       + ($diff.rebuilds.count // 0) > 0)
   ' "$preview" >"$temporary_directory/verified-report.json"
   write_report "$temporary_directory/verified-report.json"
-  write_operation_status succeeded "Candidate build verified" ""
-  log "Verified closure report published after a ${elapsed}s manual build."
+  write_operation_status succeeded "Update is ready to install" ""
+  log "The update is ready to install after a ${elapsed}s build."
 }
 
 while (($#)); do
@@ -960,7 +959,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.3"
+      echo "nixos-update-checker-service 4.1.5"
       exit 0
       ;;
     --*)

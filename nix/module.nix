@@ -12,6 +12,16 @@ let
   candidateLock = "/var/lib/nixos-update-checker/candidate.lock";
   status = "/var/lib/nixos-update-checker/status.json";
   lock = "/var/lib/nixos-update-checker/operation.lock";
+  inhibit =
+    reason: command:
+    [
+      "${pkgs.systemd}/bin/systemd-inhibit"
+      "--what=sleep:shutdown"
+      "--who=NixOS Update Checker"
+      "--why=${reason}"
+      "--mode=block"
+    ]
+    ++ command;
   previewService =
     { description, constrained }:
     {
@@ -95,6 +105,7 @@ let
       # is still running. Let the current invocation finish its cleanup.
       restartIfChanged = false;
       stopIfChanged = false;
+      unitConfig.OnSuccess = "nixos-update-checker-background.service";
 
       environment = {
         NIXOS_UPDATE_CHECKER_LOCK = lock;
@@ -104,13 +115,22 @@ let
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.escapeShellArgs (
-          [ "${package}/bin/nixos-update-checker-apply" ]
-          ++ lib.optional boot "--boot"
-          ++ [
-            report
-            candidateLock
-            cfg.repository
-          ]
+          inhibit
+            (
+              if boot then
+                "Installing the selected NixOS update for the next boot"
+              else
+                "Applying the selected NixOS update"
+            )
+            (
+              [ "${package}/bin/nixos-update-checker-apply" ]
+              ++ lib.optional boot "--boot"
+              ++ [
+                report
+                candidateLock
+                cfg.repository
+              ]
+            )
         );
         User = "root";
         StateDirectory = "nixos-update-checker";
@@ -194,7 +214,7 @@ in
     };
 
     systemd.services.nixos-update-checker-build = {
-      description = "Build and verify the reviewed NixOS update candidate";
+      description = "Build and verify the selected NixOS update";
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -207,17 +227,19 @@ in
 
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = lib.escapeShellArgs [
-          "${package}/bin/nixos-update-checker-service"
-          "--build"
-          "--report"
-          report
-          "--candidate-lock"
-          candidateLock
-          "--status"
-          status
-          cfg.repository
-        ];
+        ExecStart = lib.escapeShellArgs (
+          inhibit "Building the selected NixOS update" [
+            "${package}/bin/nixos-update-checker-service"
+            "--build"
+            "--report"
+            report
+            "--candidate-lock"
+            candidateLock
+            "--status"
+            status
+            cfg.repository
+          ]
+        );
         User = "root";
         StateDirectory = "nixos-update-checker";
         StateDirectoryMode = "0755";
@@ -240,7 +262,7 @@ in
     };
 
     systemd.paths.nixos-update-checker = {
-      description = "Refresh the NixOS update report when the system profile changes";
+      description = "Check for updates when the installed NixOS system changes";
       wantedBy = [ "multi-user.target" ];
       pathConfig = {
         PathChanged = "/nix/var/nix/profiles/system";

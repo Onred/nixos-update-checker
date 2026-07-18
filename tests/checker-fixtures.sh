@@ -3,6 +3,7 @@
 set -euo pipefail
 
 checker=${1:-src/checker.sh}
+apply=${2:-src/apply.sh}
 project=$(readlink -f "$(dirname "$0")/..")
 fixtures="$project/tests/fixtures"
 work=$(mktemp -d -t nixos-update-checker-test.XXXXXX)
@@ -88,7 +89,7 @@ fi
 [[ -s "$candidate_lock" ]]
 jq -e '
   .schemaVersion == 1 and .state == "succeeded" and
-  .operation == "refresh" and .message == "Update report refreshed"
+  .operation == "refresh" and .message == "Update check finished"
 ' "$work/status.json" >/dev/null
 
 # Configuration errors are terminal for this invocation. They are recorded
@@ -104,7 +105,7 @@ fi
 [[ "$candidate_hash" == "$(sha256sum "$candidate_lock")" ]]
 jq -e '
   .state == "failed" and .operation == "refresh" and
-  .message == "Could not discover configured candidate packages."
+  .message == "Could not read packages from your NixOS configuration."
 ' "$work/status.json" >/dev/null
 
 # Cancellation also preserves the published state and reaches a terminal
@@ -192,6 +193,7 @@ jq -e '
   .schemaVersion == 3 and .status == "success" and
   .analysis.mode == "verified" and
   .analysis.candidateClosureComplete == true and
+  .inputBaseline.complete == false and
   .build.sizeKnown == true and
   (.packages.changes[] | select(.name == "added") | .deltaBytes) == 50 and
   (.packages.changes[] | select(.name == "removed") | .deltaBytes) == -30 and
@@ -199,6 +201,21 @@ jq -e '
   .packages.rebuilds.deltaBytes == 1
 ' "$report" >/dev/null
 jq -e '.state == "succeeded" and .operation == "build"' "$work/status.json" >/dev/null
+
+# Incomplete historical source data must not reject an exact, verified build.
+# An unprivileged invocation reaches the permission check only after the same
+# report eligibility check used by the root service has accepted the report.
+if ((EUID != 0)); then
+  if NIXOS_UPDATE_CHECKER_STATUS="$work/apply-status.json" \
+    "$apply" "$report" "$candidate_lock" "$work/repository" >/dev/null 2>&1; then
+    echo "Expected the unprivileged apply fixture to stop at its permission check" >&2
+    exit 1
+  fi
+  jq -e '
+    .state == "failed" and
+    .message == "Administrator permission is required to install updates."
+  ' "$work/apply-status.json" >/dev/null
+fi
 
 # A newer default generation is selected as the baseline and reports ready-to-boot.
 ln -sfn "$work/systems/boot" "$work/boot-link"

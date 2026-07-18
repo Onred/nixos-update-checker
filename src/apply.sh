@@ -11,9 +11,9 @@ usage() {
   cat <<'EOF'
 Usage: nixos-update-checker-apply [--boot] REPORT CANDIDATE_LOCK REPOSITORY
 
-Apply the exact candidate recorded in a verified schema-3 report. The default
-activates it immediately; --boot installs it as the default for the next boot.
-This command must run as root.
+Install an update that was built by NixOS Update Checker. The default activates
+it immediately; --boot installs it for the next boot. Administrator permission
+is required.
 EOF
 }
 
@@ -65,8 +65,8 @@ cancel() {
 unexpected_error() {
   local exit_status=$?
   trap - ERR
-  write_status failed "Operation failed unexpectedly." \
-    "See the system journal for the command that failed."
+  write_status failed "The update could not be installed." \
+    "Open Progress for technical details."
   exit "$exit_status"
 }
 
@@ -79,7 +79,7 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
-  echo "nixos-update-checker-apply 4.1.3"
+  echo "nixos-update-checker-apply 4.1.5"
   exit 0
 fi
 if [[ ${1:-} == "--boot" ]]; then
@@ -101,21 +101,23 @@ started_at=$(date --iso-8601=seconds)
 write_status running \
   "$(if [[ "$action" == boot ]]; then echo 'Installing update for next boot'; else echo 'Applying update now'; fi)" ""
 
-[[ $EUID == 0 ]] || die "This command must run as root."
-[[ -f "$repository/flake.nix" ]] || die "No flake.nix exists in $repository."
-[[ -f "$repository/flake.lock" ]] || die "No flake.lock exists in $repository."
-[[ -f "$report" ]] || die "No verified update report exists yet."
-[[ -f "$candidate_lock" ]] || die "The reviewed candidate lock is missing."
+[[ -f "$repository/flake.nix" ]] || die "The NixOS configuration could not be found."
+[[ -f "$repository/flake.lock" ]] || die "The NixOS configuration lock file could not be found."
+[[ -f "$report" ]] || die "No built update is ready to install."
+[[ -f "$candidate_lock" ]] || die "The saved update information is missing. Refresh and try again."
 
 if ! jq -e --arg repository "$repository" '
   .schemaVersion == 3 and .status == "success"
   and .analysis.mode == "verified"
-  and .inputBaseline.complete == true
   and .updatesAvailable == true
   and .repository == $repository
 ' "$report" >/dev/null; then
-  die "The report is not a complete, verified update for this repository."
+  die "This update is not ready to install. Refresh, then build it again."
 fi
+
+# Validate the reviewed report before privilege so fixtures can exercise the
+# same eligibility rule without performing an installation.
+[[ $EUID == 0 ]] || die "Administrator permission is required to install updates."
 
 configuration=$(jq -er '.configuration' "$report")
 report_baseline=$(jq -er '.system.baselinePath' "$report")
@@ -132,27 +134,27 @@ if [[ "$boot_system" != "$running_system" ]]; then
   current_baseline=$boot_system
 fi
 [[ "$report_baseline" == "$current_baseline" ]] || \
-  die "The system profile changed after this report was generated. Run Refresh first."
+  die "Your system changed since the last refresh. Refresh and try again."
 
 sha256_file() {
   sha256sum "$1" | cut -d ' ' -f 1
 }
 
 [[ "$expected_working_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-  die "flake.lock changed after this report was generated. Run Refresh first."
+  die "Your NixOS configuration changed since the last refresh. Refresh and try again."
 [[ "$expected_candidate_hash" == "$(sha256_file "$candidate_lock")" ]] || \
-  die "The saved candidate lock does not match the verified report."
+  die "The saved update is no longer valid. Refresh and build it again."
 [[ -e "$expected_candidate" ]] || \
-  die "The verified system is no longer present in the Nix store. Build it again."
+  die "The built update is no longer available. Build it again."
 
 if ! evaluated_candidate=$(nix eval --raw --no-write-lock-file \
   --reference-lock-file "$candidate_lock" \
   "path:$repository#nixosConfigurations.\"$configuration\".config.system.build.toplevel.outPath" \
   2>&1); then
-  die "Could not re-evaluate the verified configuration." "$evaluated_candidate"
+  die "The NixOS configuration could not be checked before installation." "$evaluated_candidate"
 fi
 [[ "$evaluated_candidate" == "$expected_candidate" ]] || \
-  die "The configuration changed after the verified build. Run Refresh and Build Update again."
+  die "Your NixOS configuration changed after the build. Refresh and build the update again."
 
 temporary_lock=$(mktemp "$repository/.flake.lock.nixos-update-checker.XXXXXX")
 install -m 0644 "$candidate_lock" "$temporary_lock"
@@ -160,7 +162,7 @@ mv -f "$temporary_lock" "$repository/flake.lock"
 temporary_lock=""
 
 if ! nixos-rebuild "$action" --flake "path:$repository#$configuration"; then
-  die "nixos-rebuild $action failed."
+  die "NixOS could not install the update."
 fi
 
 # The profile path unit publishes a fresh report. Removing the old report keeps
