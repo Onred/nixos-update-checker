@@ -116,8 +116,9 @@ reportPath=/var/lib/nixos-update-checker/report.json
 An active local desktop user may start or cancel preview and explicit build
 services without authentication. Installing either kind of system update is a
 separate service and still requires administrator authentication. After a
-successful immediate update, the GUI restarts from the newly activated system
-so an updated checker is loaded too.
+successful immediate update, a banner offers to restart the GUI when the newly
+activated system contains a different updater package. The old tray instance is
+hidden before its replacement starts.
 
 Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
@@ -167,6 +168,10 @@ leaving it ready for the GUI's Build Update and install flow.
 - A preview never modifies the working `flake.lock` or realizes the candidate.
 - A preview never treats missing cache metadata as a removal or as a complete
   runtime closure. Exact removals and closure sizes require a realized candidate.
+- Package-valued module options are discovery hints, not proof of closure
+  membership. A preview includes those hints only when the same package or path
+  is present in the realized baseline; explicit configured packages remain
+  eligible as additions.
 - A manual build realizes the exact saved candidate but never activates it.
 - Installing requires confirmation, installs the exact reviewed `flake.lock`,
   and runs either `nixos-rebuild switch` or `nixos-rebuild boot` for the

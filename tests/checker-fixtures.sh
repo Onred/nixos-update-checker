@@ -71,10 +71,15 @@ jq -e '
     .after.revision == "new-nixpkgs-revision"
   )) | length) == 1 and
   (.packages.changes | map(.kind) | index("removed") | not) and
+  (.packages.changes | map(.name) | index("unused-option-package") | not) and
   all(.packages.changes[]; .sizeKnown == false) and
   .packages.rebuilds.sizeKnown == false and
   (.packages.changes[] | select(.name == "firefox") | .confidence) == "confirmed"
 ' "$report" >/dev/null
+if grep -q 'unused-option-package' "$work/nix-invocations"; then
+  echo "Preview queried an unconfirmed package-option hint" >&2
+  exit 1
+fi
 [[ -s "$candidate_lock" ]]
 jq -e '
   .schemaVersion == 1 and .state == "succeeded" and

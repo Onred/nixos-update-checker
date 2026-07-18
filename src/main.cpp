@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
+#include <QFrame>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -40,7 +41,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.0";
+constexpr auto Version = "4.1.1";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -83,6 +84,16 @@ AppSettings loadSettings()
 QString canonicalPath(const QString &path)
 {
     return QFileInfo(path).canonicalFilePath();
+}
+
+QString nixStorePackage(const QString &path)
+{
+    const QString resolved = canonicalPath(path);
+    const QString prefix = "/nix/store/";
+    if (!resolved.startsWith(prefix))
+        return {};
+    const qsizetype end = resolved.indexOf('/', prefix.size());
+    return end < 0 ? resolved : resolved.left(end);
 }
 
 QString plural(int count, const QString &singular)
@@ -379,6 +390,7 @@ public:
         : reportPath_(std::move(reportPath))
         , statusPath_(environment("NIXOS_UPDATE_CHECKER_STATUS",
               "/var/lib/nixos-update-checker/status.json"))
+        , runningPackage_(nixStorePackage(QCoreApplication::applicationFilePath()))
         , trayEnabled_(trayEnabled)
     {
         setWindowTitle("NixOS Update Checker");
@@ -391,12 +403,14 @@ public:
             loadReport(false);
             loadOperationStatus(false);
             refreshLiveSystemState();
+            checkForReplacement();
             pollServiceState();
         });
         pollTimer_.start(3000);
         loadReport(true);
         loadOperationStatus(true);
         refreshLiveSystemState();
+        checkForReplacement();
         pollServiceState();
         updatePresentation();
     }
@@ -419,6 +433,18 @@ private:
         auto *layout = new QVBoxLayout(central);
         layout->setContentsMargins(18, 16, 18, 16);
         layout->setSpacing(10);
+
+        restartBanner_ = new QFrame(central);
+        restartBanner_->setFrameShape(QFrame::StyledPanel);
+        auto *restartLayout = new QHBoxLayout(restartBanner_);
+        restartLayout->setContentsMargins(10, 7, 10, 7);
+        auto *restartLabel = new QLabel(
+            "A new version of NixOS Update Checker is installed.", restartBanner_);
+        restartButton_ = new QPushButton("Restart", restartBanner_);
+        restartLayout->addWidget(restartLabel, 1);
+        restartLayout->addWidget(restartButton_);
+        restartBanner_->hide();
+        layout->addWidget(restartBanner_);
 
         summary_ = new QLabel("No report yet", central);
         QFont summaryFont = summary_->font();
@@ -507,6 +533,7 @@ private:
                 startUpdateAction();
         });
         connect(bootButton_, &QPushButton::clicked, this, [this] { confirmBoot(); });
+        connect(restartButton_, &QPushButton::clicked, this, [this] { restartApplication(); });
         updateButtons();
     }
 
@@ -1263,8 +1290,8 @@ private:
             refreshLiveSystemState();
             if (applyFinished && !activeProcess_) {
                 markReportStale("The update finished. Waiting for the refreshed report.");
+                checkForReplacement();
                 updatePresentation();
-                restartApplication();
                 return;
             }
             if (bootFinished) {
@@ -1325,6 +1352,9 @@ private:
         } else if (isRefreshing()) {
             iconName = "view-refresh";
             message = "Refreshing the update report…";
+        } else if (restartBanner_->isVisible()) {
+            iconName = "software-update-available";
+            message = "A new updater is installed; open the window to restart";
         } else if (readyForBoot_) {
             iconName = "system-reboot";
             message = generationStatus_->text();
@@ -1355,25 +1385,47 @@ private:
 
     void restartApplication()
     {
-        QString executable = "/run/current-system/sw/bin/nixos-update-checker";
+        const QString executable = environment("NIXOS_UPDATE_CHECKER_INSTALLED_EXECUTABLE",
+            "/run/current-system/sw/bin/nixos-update-checker");
         if (!QFileInfo(executable).isExecutable())
-            executable = QCoreApplication::applicationFilePath();
+            return;
         QStringList arguments = QCoreApplication::arguments();
         if (!arguments.isEmpty())
             arguments.removeFirst();
+        const bool windowWasVisible = isVisible();
+        if (tray_)
+            tray_->hide();
+        hide();
+        QApplication::processEvents();
         if (!QProcess::startDetached(executable, arguments)) {
-            operationError_ = "The update finished, but the refreshed application could not start.";
+            operationError_ = "The new application could not start.";
+            if (tray_)
+                tray_->show();
+            if (windowWasVisible)
+                showAndRaise();
             updatePresentation();
             return;
         }
         quitRequested_ = true;
-        if (tray_)
-            tray_->hide();
         QApplication::quit();
+    }
+
+    void checkForReplacement()
+    {
+        const QString executable = environment("NIXOS_UPDATE_CHECKER_INSTALLED_EXECUTABLE",
+            "/run/current-system/sw/bin/nixos-update-checker");
+        const QString installedPackage = nixStorePackage(executable);
+        const bool replacementAvailable = !runningPackage_.isEmpty()
+            && !installedPackage.isEmpty() && runningPackage_ != installedPackage;
+        if (restartBanner_->isVisible() != replacementAvailable) {
+            restartBanner_->setVisible(replacementAvailable);
+            updateTray();
+        }
     }
 
     QString reportPath_;
     QString statusPath_;
+    QString runningPackage_;
     bool trayEnabled_ = true;
     bool quitRequested_ = false;
     bool schemaSupported_ = false;
@@ -1407,6 +1459,7 @@ private:
     QProcess *journalProcess_ = nullptr;
     QSystemTrayIcon *tray_ = nullptr;
     QAction *trayRefreshAction_ = nullptr;
+    QFrame *restartBanner_ = nullptr;
     QLabel *summary_ = nullptr;
     QLabel *generationStatus_ = nullptr;
     QLabel *status_ = nullptr;
@@ -1415,6 +1468,7 @@ private:
     QPlainTextEdit *details_ = nullptr;
     QPlainTextEdit *progress_ = nullptr;
     QPushButton *refreshButton_ = nullptr;
+    QPushButton *restartButton_ = nullptr;
     QPushButton *bootButton_ = nullptr;
     QPushButton *updateButton_ = nullptr;
 };

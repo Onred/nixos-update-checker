@@ -268,6 +268,31 @@ build_preview_candidates() {
   ' >"$destination"
 }
 
+filter_preview_discovery() {
+  local baseline=$1
+  local discovery=$2
+  local destination=$3
+
+  jq -n \
+    --slurpfile baseline "$baseline" \
+    --slurpfile discovery "$discovery" '
+    def parsedName($path):
+      ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
+      try ($base | capture("^(?<name>.*?)-[0-9].*$").name) catch $base;
+    ($baseline[0] | keys) as $baselinePaths |
+    ($baselinePaths | map(parsedName(.)) | unique) as $baselineNames |
+    $discovery[0] |
+    .packages |= map(
+      . as $package |
+      select(
+        any($package.sources[]; startswith("option:") | not)
+        or ($baselinePaths | index($package.storePath)) != null
+        or ($baselineNames | index($package.name)) != null
+      )
+    )
+  ' >"$destination"
+}
+
 compare_preview() {
   local baseline=$1
   local candidate=$2
@@ -679,14 +704,20 @@ run_preview() {
     build_size_known=true
     : >"$temporary_directory/local-builds.txt"
   else
-    jq -r '.packages[].storePath' "$temporary_directory/discovery.json" | sort -u \
+    filter_preview_discovery "$temporary_directory/baseline.json" \
+      "$temporary_directory/discovery.json" "$temporary_directory/preview-discovery.json"
+    local discovered_count preview_count
+    discovered_count=$(jq '.packages | length' "$temporary_directory/discovery.json")
+    preview_count=$(jq '.packages | length' "$temporary_directory/preview-discovery.json")
+    log "Using $preview_count of $discovered_count safe package roots for the preview."
+    jq -r '.packages[].storePath' "$temporary_directory/preview-discovery.json" | sort -u \
       >"$temporary_directory/candidate-roots.txt"
     query_candidate_metadata "$temporary_directory/candidate-roots.txt" \
       "$temporary_directory/candidate-metadata.json"
-    build_preview_candidates "$temporary_directory/discovery.json" \
+    build_preview_candidates "$temporary_directory/preview-discovery.json" \
       "$temporary_directory/candidate-metadata.json" "$candidate_data"
     compare_preview "$temporary_directory/baseline.json" "$candidate_data" \
-      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+      "$temporary_directory/preview-discovery.json" "$temporary_directory/comparison.json"
 
     log "Asking Nix which derivations would require local builds."
     local dry_run_status=0
@@ -934,7 +965,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.0"
+      echo "nixos-update-checker-service 4.1.1"
       exit 0
       ;;
     --*)
