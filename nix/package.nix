@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "3.1.7";
+  version = "4.0.0";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -37,6 +37,8 @@ pkgs.stdenv.mkDerivation {
     install -Dm755 nixos-update-checker "$out/bin/nixos-update-checker"
     install -Dm755 src/checker.sh "$out/bin/nixos-update-checker-service"
     install -Dm755 src/apply.sh "$out/bin/nixos-update-checker-apply"
+    install -Dm644 nix/discovery.nix \
+      "$out/share/nixos-update-checker/discovery.nix"
     install -Dm644 assets/nixos-update-checker.svg \
       "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
     install -Dm644 assets/nixos-update-checker.desktop \
@@ -45,6 +47,8 @@ pkgs.stdenv.mkDerivation {
       "$out/share/nixos-update-checker/autostart.desktop"
 
     wrapProgram "$out/bin/nixos-update-checker-service" \
+      --set NIXOS_UPDATE_CHECKER_DISCOVERY \
+        "$out/share/nixos-update-checker/discovery.nix" \
       --prefix PATH : ${
         pkgs.lib.makeBinPath [
           pkgs.coreutils
@@ -76,6 +80,8 @@ pkgs.stdenv.mkDerivation {
       --set NIXOS_UPDATE_CHECKER_JOURNALCTL "${pkgs.systemd}/bin/journalctl"
       --set NIXOS_UPDATE_CHECKER_REPORT "/var/lib/nixos-update-checker/report.json"
       --set NIXOS_UPDATE_CHECKER_SERVICE "nixos-update-checker.service"
+      --set NIXOS_UPDATE_CHECKER_BUILD_SERVICE \
+        "nixos-update-checker-build.service"
       --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"
     )
     wrapQtApp "$out/bin/nixos-update-checker"
@@ -88,10 +94,9 @@ pkgs.stdenv.mkDerivation {
   ];
   installCheckPhase = ''
     runHook preInstallCheck
-    patchShebangs src/checker.sh tests/checker-fixtures.sh \
-      tests/fixtures/bin/nix tests/fixtures/bin/nix-store
+    patchShebangs src/checker.sh tests/checker-fixtures.sh tests/fixtures/bin/nix
     shellcheck src/checker.sh src/apply.sh \
-      tests/checker-fixtures.sh tests/fixtures/bin/nix tests/fixtures/bin/nix-store
+      tests/checker-fixtures.sh tests/fixtures/bin/nix
     tests/checker-fixtures.sh ./src/checker.sh
     QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" --version
     "$out/bin/nixos-update-checker-service" --help
@@ -100,7 +105,7 @@ pkgs.stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Quiet background NixOS update builds with a native Qt report viewer";
+    description = "No-build NixOS update previews with opt-in verification and a Qt viewer";
     homepage = "https://github.com/Onred/nixos-update-checker";
     mainProgram = "nixos-update-checker";
     platforms = pkgs.lib.platforms.linux;

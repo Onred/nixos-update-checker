@@ -1,21 +1,25 @@
 # NixOS Update Checker
 
-A small NixOS service that quietly builds an updated system once a day, plus a
-native Qt application that displays the resulting report.
+A small NixOS service that previews updates from the active configuration
+without performing background builds, plus an opt-in verifier and a native Qt
+application that displays their reports.
 
 The application has a deliberately narrow boundary:
 
 - `nixos-update-checker-service` resolves a temporary candidate `flake.lock`,
-  builds it, compares it with the appropriate system generation, and atomically
-  writes a schema-2 JSON report.
+  evaluates configured packages, queries local and configured binary caches,
+  and atomically writes a schema-3 preview without realizing the candidate.
+- `nixos-update-checker-build.service` is started explicitly to run a normal,
+  unrestricted Nix build of that exact candidate and replace the preview with
+  a verified closure report.
 - `nixos-update-checker` reads that JSON and asks systemd to start the service
   when **Refresh** is selected.
-- `nixos-update-checker-apply` updates the real lock and switches the reported
-  configuration when the GUI starts the apply service.
+- `nixos-update-checker-apply` installs the reviewed candidate lock and switches
+  the verified configuration when the GUI starts the privileged apply service.
 
 The GUI itself does not run Nix, modify the configuration, or collect garbage.
-Refresh and update operations remain root-owned systemd services. While either
-operation is running, the GUI follows its journal output in the progress area.
+Preview, build, and update operations remain root-owned systemd services. The
+GUI is only a state reader and service launcher; it never evaluates Nix itself.
 
 ## Install
 
@@ -46,44 +50,32 @@ persistent timer that checks ten minutes after boot and then daily. A systemd
 path unit also starts the same low-priority check whenever the default system
 profile changes outside this application.
 
-Only three module options are exposed:
+Only four module options are exposed:
 
 | Option | Default | Purpose |
 |---|---:|---|
 | `enable` | `false` | Install and enable the checker. |
 | `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
 | `cpuQuota` | `50%` | Aggregate CPU quota for background checks; `null` disables it. |
+| `extraPackages` | `{}` | Named packages to preview when automatic discovery cannot find them. |
 
-For example, `cpuQuota = "25%"` limits evaluation and all build workers together
-to one quarter of a CPU's total throughput. The checker explicitly queues
-uncached derivations across independent, single-job Nix processes:
+The quota applies only to automatic previews, which can still contain Nix
+evaluation work. Set `cpuQuota = null` to disable that throttle while retaining
+low CPU/I/O weights and idle I/O scheduling. The explicit build service has no
+quota: it uses normal Nix scheduling because a heavily throttled source build
+can otherwise take hours.
 
-| Available CPUs | Worker processes | Cores per worker | Worker budget |
-|---:|---:|---:|---:|
-| 1 | 1 | 1 | 1 |
-| 4 | 4 | 1 | 4 |
-| 8 | 8 | 1 | 8 |
-| 16 | 16 | 1 | 16 |
-| 32 or more | 32 | 1 | 32 |
+Discovery starts with the kernel, Nix, systemd, active NVIDIA driver, Ollama,
+system/user/font packages, systemd service paths, and active package-valued
+module options. It then uses the candidate derivation graph to fill gaps for
+packages already present in the baseline. Site-specific packages can be added
+without changing this project:
 
-The queue is dependency-first and contains only derivations whose outputs are
-not already in the store. Each worker realises one derivation at a time, while
-Nix's store locks prevent duplicate work. Cached checks also overlap
-candidate-lock resolution with baseline evaluation and query differing system
-closures concurrently. All workers still share the same service-wide CPU quota.
-
-The service uses the direct local Nix store. This is intentional: work delegated
-to `nix-daemon.service` would leave the checker's cgroup and escape its CPU
-limit. CPU and I/O weights, nice level, and idle I/O scheduling further favor
-interactive work.
-
-Set `cpuQuota = null` to leave CPU time unrestricted while retaining the low
-CPU and I/O scheduling priorities.
-
-`CPUQuota` is an aggregate systemd limit, not a per-worker limit. For example,
-`cpuQuota = "800%"` permits eight CPUs of total work; with 32 runnable workers,
-the scheduler will usually spread that to roughly 25% per worker. It does not
-guarantee that an individual worker cannot briefly use a complete core.
+```nix
+programs.nixos-update-checker.extraPackages = {
+  inherit (pkgs) my-custom-package;
+};
+```
 
 ## Use
 
@@ -95,7 +87,8 @@ window contains only:
   store paths for the selected row, plus live service output;
 - a generation line describing a system that is ready for the next boot;
 - report time and configuration;
-- **Refresh** and **Update** buttons above the table.
+- **Refresh** and one state-dependent update button above the table. A preview
+  offers **Build Update**; a verified report offers **Update**.
 
 The tray icon uses a colored status badge: orange means updates are pending,
 green means the report is current with no updates, blue means work is running,
@@ -116,12 +109,12 @@ trayEnabled=true
 reportPath=/var/lib/nixos-update-checker/report.json
 ```
 
-An active local desktop user may start only the constrained refresh service
-without authentication. Updating the system is a separate service and still
-requires administrator authentication. After a successful update, the GUI
+An active local desktop user may start the preview and explicit build services
+without authentication. Updating the active system is a separate service and
+still requires administrator authentication. After a successful update, the GUI
 restarts from the newly activated system so an updated checker is loaded too.
 
-Root configuration inputs appear first, changed packages are sorted alphabetically,
+Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
 area.
@@ -140,16 +133,21 @@ Service diagnostics remain in the system journal:
 systemctl status nixos-update-checker.timer
 systemctl status nixos-update-checker.path
 systemctl status nixos-update-checker.service
+systemctl status nixos-update-checker-build.service
 journalctl -u nixos-update-checker.service
+journalctl -u nixos-update-checker-build.service
 journalctl -u nixos-update-checker-apply.service
-sudo systemctl start nixos-update-checker.service
+systemctl start nixos-update-checker.service
+systemctl start nixos-update-checker-build.service
+sudo systemctl start nixos-update-checker-apply.service
+jq . /var/lib/nixos-update-checker/report.json
 ```
 
 ## Safety and scope
 
-- A check never modifies the working `flake.lock`.
-- A check builds but never activates the candidate system.
-- Applying requires confirmation, updates the real `flake.lock`, and runs
+- A preview never modifies the working `flake.lock` or realizes the candidate.
+- A manual build realizes the exact saved candidate but never activates it.
+- Applying requires confirmation, installs the exact reviewed `flake.lock`, and runs
   `nixos-rebuild switch` for the configuration recorded in the report.
 - When the default boot profile differs from the running system, both package
   and input comparisons use that newer boot generation. This avoids reporting
@@ -159,11 +157,12 @@ sudo systemctl start nixos-update-checker.service
   `/var/lib/nixos-update-checker/system-lock.json`. If no complete lock can be
   matched to the baseline system, it recovers only nixpkgs history from that
   system and marks the report incomplete.
-- Apply is disabled for stale reports, incomplete input history, schema-1
+- Apply is disabled for previews, stale reports, incomplete input history, old
   reports, and reports with no remaining updates. The root apply helper repeats
   the live profile check before modifying anything.
-- Only changed inputs declared directly by the root flake are reported. Inputs
-  may themselves be flakes or non-flake sources, and root-level `follows`
+- Only changed inputs declared directly by the configuration flake are reported.
+  These are not every transitive node in `flake.lock`: direct inputs may
+  themselves be flakes or non-flake sources, and direct `follows`
   references are resolved before comparison.
 - The service currently requires `flake.nix` and `flake.lock`.
 

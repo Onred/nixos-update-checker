@@ -1,5 +1,5 @@
 {
-  description = "Quiet NixOS update builds with a native Qt report viewer";
+  description = "No-build NixOS update previews with opt-in verification";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

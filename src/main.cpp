@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr auto Version = "3.1.7";
+constexpr auto Version = "4.0.0";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -197,11 +197,17 @@ QString packageDetails(const QJsonObject &change)
         "",
         versionLines("Candidate versions", versions(after)),
         "",
-        "Net closure change: " + formatBytes(change.value("deltaBytes").toInteger(), true),
-        "Added to candidate closure: " + formatBytes(change.value("addedBytes").toInteger()),
-        "No longer referenced by candidate: " + formatBytes(change.value("removedBytes").toInteger()),
     };
-    if (after.isObject())
+    if (change.value("sizeKnown").toBool()) {
+        lines << "Net closure change: " + formatBytes(change.value("deltaBytes").toInteger(), true)
+              << "Added to candidate closure: " + formatBytes(change.value("addedBytes").toInteger())
+              << "No longer referenced by candidate: "
+                     + formatBytes(change.value("removedBytes").toInteger());
+    } else {
+        lines << "Closure size: available after Build Update";
+    }
+    lines << "Preview confidence: " + change.value("confidence").toString("confirmed");
+    if (after.isObject() && change.value("sizeKnown").toBool())
         lines << "Candidate total: " + formatBytes(after.toObject().value("narSize").toInteger());
 
     const QStringList oldPaths = storePaths(before);
@@ -218,11 +224,16 @@ QString rebuildDetails(const QJsonObject &rebuilds)
     QStringList lines{
         "Rebuilt packages (" + QString::number(rebuilds.value("count").toInt()) + ")",
         "",
-        "Net closure change: " + formatBytes(rebuilds.value("deltaBytes").toInteger(), true),
-        "Added to candidate closure: " + formatBytes(rebuilds.value("addedBytes").toInteger()),
-        "No longer referenced by candidate: " + formatBytes(rebuilds.value("removedBytes").toInteger()),
-        "",
     };
+    if (rebuilds.value("sizeKnown").toBool()) {
+        lines << "Net closure change: " + formatBytes(rebuilds.value("deltaBytes").toInteger(), true)
+              << "Added to candidate closure: " + formatBytes(rebuilds.value("addedBytes").toInteger())
+              << "No longer referenced by candidate: "
+                     + formatBytes(rebuilds.value("removedBytes").toInteger());
+    } else {
+        lines << "Closure size: available after Build Update";
+    }
+    lines << "";
     for (const QJsonValue &value : rebuilds.value("items").toArray()) {
         const QJsonObject item = value.toObject();
         QStringList itemVersions;
@@ -479,7 +490,7 @@ private:
                     details_->setPlainText(item ? item->data(DetailRole).toString() : QString{});
                 });
         connect(refreshButton_, &QPushButton::clicked, this, [this] { startCheck(); });
-        connect(updateButton_, &QPushButton::clicked, this, [this] { confirmApply(); });
+        connect(updateButton_, &QPushButton::clicked, this, [this] { startUpdateAction(); });
         updateButtons();
     }
 
@@ -554,6 +565,16 @@ private:
         startService(checkerService(), "refresh");
     }
 
+    void startUpdateAction()
+    {
+        if (analysisMode_ == "preview") {
+            if (canBuild() && !serviceBusy())
+                startService(buildService(), "build");
+            return;
+        }
+        confirmApply();
+    }
+
     void confirmApply()
     {
         if (!canApply() || serviceBusy())
@@ -578,6 +599,12 @@ private:
             "NIXOS_UPDATE_CHECKER_APPLY_SERVICE", "nixos-update-checker-apply.service");
     }
 
+    QString buildService() const
+    {
+        return environment("NIXOS_UPDATE_CHECKER_BUILD_SERVICE",
+            "nixos-update-checker-build.service");
+    }
+
     void startService(const QString &service, const QString &action)
     {
         if (serviceBusy())
@@ -587,8 +614,12 @@ private:
         operationError_.clear();
         showingProgress_ = true;
         details_->clear();
-        appendOutput(action == "refresh" ? QStringLiteral("Starting update check…\n")
-                                           : QStringLiteral("Starting system update…\n"));
+        if (action == "refresh")
+            appendOutput(QStringLiteral("Starting update preview…\n"));
+        else if (action == "build")
+            appendOutput(QStringLiteral("Starting reviewed update build…\n"));
+        else
+            appendOutput(QStringLiteral("Starting system update…\n"));
         startJournal(service, false);
 
         auto *process = new QProcess(this);
@@ -605,6 +636,8 @@ private:
                     activeAction_.clear();
                     if (action == "refresh")
                         checkerRunning_ = false;
+                    else if (action == "build")
+                        buildRunning_ = false;
                     else
                         applyRunning_ = false;
                     process->deleteLater();
@@ -648,14 +681,22 @@ private:
 
     bool canApply() const
     {
-        return schemaSupported_ && !reportStale_ && inputBaselineComplete_ && updatesAvailable_;
+        return schemaSupported_ && analysisMode_ == "verified" && !reportStale_
+            && inputBaselineComplete_ && updatesAvailable_;
+    }
+
+    bool canBuild() const
+    {
+        return schemaSupported_ && analysisMode_ == "preview" && !reportStale_
+            && updatesAvailable_;
     }
 
     void updateButtons()
     {
         const bool busy = serviceBusy();
         refreshButton_->setEnabled(!busy);
-        updateButton_->setEnabled(!busy && canApply());
+        updateButton_->setText(analysisMode_ == "preview" ? "Build Update" : "Update");
+        updateButton_->setEnabled(!busy && (canBuild() || canApply()));
         if (trayRefreshAction_)
             trayRefreshAction_->setEnabled(!busy);
     }
@@ -676,6 +717,7 @@ private:
 
     void populate(const QJsonObject &report)
     {
+        analysisMode_ = report.value("analysis").toObject().value("mode").toString();
         const QJsonArray inputs = report.value("inputs").toArray();
         const QJsonObject packages = report.value("packages").toObject();
         const QJsonArray changes = packages.value("changes").toArray();
@@ -693,14 +735,18 @@ private:
         }
         for (const QJsonValue &value : changes) {
             const QJsonObject change = value.toObject();
+            const QString size = change.value("sizeKnown").toBool()
+                ? formatBytes(change.value("deltaBytes").toInteger(), true)
+                : QStringLiteral("—");
             addRow(change.value("name").toString(), versionSummary(change),
-                formatBytes(change.value("deltaBytes").toInteger(), true),
-                packageDetails(change));
+                size, packageDetails(change));
         }
         if (rebuildCount > 0) {
+            const QString size = rebuilds.value("sizeKnown").toBool()
+                ? formatBytes(rebuilds.value("deltaBytes").toInteger(), true)
+                : QStringLiteral("—");
             addRow("Rebuilt packages", QString::number(rebuildCount) + " unchanged",
-                formatBytes(rebuilds.value("deltaBytes").toInteger(), true),
-                rebuildDetails(rebuilds));
+                size, rebuildDetails(rebuilds));
         }
         if (updates_->rowCount() == 0)
             addRow("No updates available", "", "", "");
@@ -718,8 +764,11 @@ private:
         reportErrorMessage_.clear();
         operationError_.clear();
 
-        QString checked = "Checked " + timestamp(report.value("generatedAt")) + "  ·  "
+        QString checked = (analysisMode_ == "verified" ? "Verified " : "Previewed ")
+            + timestamp(report.value("generatedAt")) + "  ·  "
             + report.value("configuration").toString();
+        if (analysisMode_ == "preview")
+            checked += "  ·  no candidate build performed";
         if (!inputBaselineComplete_)
             checked += "  ·  partial input history";
         reportStatus_ = checked;
@@ -820,14 +869,15 @@ private:
         const QJsonObject report = document.object();
         reportMtime_ = info.lastModified();
         lastReport_ = report;
-        if (report.value("schemaVersion").toInt() != 2) {
+        if (report.value("schemaVersion").toInt() != 3) {
             schemaSupported_ = false;
+            analysisMode_.clear();
             updatesAvailable_ = false;
             inputBaselineComplete_ = false;
             updates_->setRowCount(0);
             details_->clear();
             summary_->setText("Report needs refreshing");
-            reportStatus_ = "Select Refresh to replace the cached version-1 report.";
+            reportStatus_ = "Select Refresh to replace the cached report.";
             reportError_ = false;
             updatePresentation();
             return;
@@ -835,6 +885,7 @@ private:
         if (report.value("status").toString() == "error") {
             const QJsonObject error = report.value("error").toObject();
             schemaSupported_ = true;
+            analysisMode_ = report.value("analysis").toObject().value("mode").toString();
             updatesAvailable_ = false;
             inputBaselineComplete_ = false;
             summary_->setText("Check failed");
@@ -856,6 +907,7 @@ private:
     void markReportStale(const QString &message)
     {
         reportStale_ = true;
+        analysisMode_.clear();
         updatesAvailable_ = false;
         reportError_ = false;
         updates_->setRowCount(0);
@@ -875,9 +927,14 @@ private:
         return applyRunning_ || (activeProcess_ && activeAction_ == "update");
     }
 
+    bool isBuilding() const
+    {
+        return buildRunning_ || (activeProcess_ && activeAction_ == "build");
+    }
+
     bool serviceBusy() const
     {
-        return isRefreshing() || isUpdating();
+        return isRefreshing() || isBuilding() || isUpdating();
     }
 
     void appendOutput(const QByteArray &data)
@@ -969,8 +1026,10 @@ private:
                     process->deleteLater();
 
                     bool checkerSeen = false;
+                    bool buildSeen = false;
                     bool applySeen = false;
                     bool checkerActive = false;
+                    bool buildActive = false;
                     bool applyActive = false;
                     for (const QString &block : output.split("\n\n", Qt::SkipEmptyParts)) {
                         QString id;
@@ -986,13 +1045,17 @@ private:
                         if (id == checkerService()) {
                             checkerSeen = true;
                             checkerActive = running;
+                        } else if (id == buildService()) {
+                            buildSeen = true;
+                            buildActive = running;
                         } else if (id == applyService()) {
                             applySeen = true;
                             applyActive = running;
                         }
                     }
-                    if (checkerSeen || applySeen)
+                    if (checkerSeen || buildSeen || applySeen)
                         setServiceActivity(checkerSeen ? checkerActive : checkerRunning_,
+                            buildSeen ? buildActive : buildRunning_,
                             applySeen ? applyActive : applyRunning_);
                 });
         connect(process, &QProcess::errorOccurred, this,
@@ -1005,14 +1068,16 @@ private:
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
         process->start(systemctl,
             {"show", "--property=Id", "--property=ActiveState", "--property=SubState",
-                checkerService(), applyService()});
+                checkerService(), buildService(), applyService()});
     }
 
-    void setServiceActivity(bool checkerActive, bool applyActive)
+    void setServiceActivity(bool checkerActive, bool buildActive, bool applyActive)
     {
         const bool checkerFinished = checkerRunning_ && !checkerActive;
+        const bool buildFinished = buildRunning_ && !buildActive;
         const bool applyFinished = applyRunning_ && !applyActive;
         checkerRunning_ = checkerActive;
+        buildRunning_ = buildActive;
         applyRunning_ = applyActive;
 
         if (applyRunning_) {
@@ -1022,6 +1087,13 @@ private:
                 appendOutput(QStringLiteral("System update in progress…\n"));
                 startJournal(applyService(), false);
             }
+        } else if (buildRunning_) {
+            if (journalService_ != buildService()) {
+                showingProgress_ = true;
+                details_->clear();
+                appendOutput(QStringLiteral("Reviewed update build in progress…\n"));
+                startJournal(buildService(), false);
+            }
         } else if (checkerRunning_) {
             if (journalService_ != checkerService()) {
                 showingProgress_ = true;
@@ -1029,7 +1101,7 @@ private:
                 appendOutput(QStringLiteral("Update check in progress…\n"));
                 startJournal(checkerService(), false);
             }
-        } else if (checkerFinished || applyFinished) {
+        } else if (checkerFinished || buildFinished || applyFinished) {
             stopJournalSoon(journalService_);
             loadReport(true);
             refreshLiveSystemState();
@@ -1049,6 +1121,9 @@ private:
         if (isUpdating()) {
             busyText = "Updating…";
             status_->setText("Updating the system…");
+        } else if (isBuilding()) {
+            busyText = "Building…";
+            status_->setText("Building and verifying the reviewed update…");
         } else if (isRefreshing()) {
             busyText = "Refreshing…";
             status_->setText("Refreshing the update report…");
@@ -1074,6 +1149,10 @@ private:
             color = QColor("#2563eb");
             symbol = QString::fromUtf8("↑");
             message = "Updating the system…";
+        } else if (isBuilding()) {
+            color = QColor("#2563eb");
+            symbol = QString::fromUtf8("↓");
+            message = "Building and verifying the reviewed update…";
         } else if (isRefreshing()) {
             color = QColor("#2563eb");
             symbol = QString::fromUtf8("↻");
@@ -1090,6 +1169,8 @@ private:
             color = QColor("#d97706");
             symbol = "!";
             message = summaryText_;
+            if (analysisMode_ == "preview")
+                message += " (preview; build to verify)";
         } else if (schemaSupported_) {
             color = QColor("#16a34a");
             symbol = QString::fromUtf8("✓");
@@ -1127,9 +1208,11 @@ private:
     bool updatesAvailable_ = false;
     bool reportError_ = false;
     bool checkerRunning_ = false;
+    bool buildRunning_ = false;
     bool applyRunning_ = false;
     bool showingProgress_ = false;
     QString summaryText_;
+    QString analysisMode_;
     QString reportStatus_ = "Waiting for a report";
     QString reportErrorMessage_;
     QString operationError_;

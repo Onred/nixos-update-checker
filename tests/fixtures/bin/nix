@@ -5,36 +5,8 @@ set -euo pipefail
 arguments=" $* "
 last=${!#}
 fixtures=${NIXOS_UPDATE_CHECKER_FIXTURES:?}
-work=${FAKE_WORK_DIRECTORY:-}
 
-wait_for_file() {
-  local path=$1
-  local _
-  for _ in {1..200}; do
-    [[ -e "$path" ]] && return
-    sleep 0.01
-  done
-  echo "Timed out waiting for fixture marker: $path" >&2
-  exit 1
-}
-
-if [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
-  if [[ ${FAKE_VERIFY_PARALLEL:-} == 1 ]]; then
-    wait_for_file "$work/update-started"
-    touch "$work/eval-during-update"
-  fi
-  echo '[{"name":"desktop","hostName":"fixture"}]'
-elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
-  if [[ "$arguments" == *" --reference-lock-file "* ]]; then
-    echo /nix/store/candidate.drv
-  else
-    echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
-  fi
-elif [[ "$arguments" == *" flake update "* ]]; then
-  if [[ ${FAKE_VERIFY_PARALLEL:-} == 1 ]]; then
-    touch "$work/update-started"
-    wait_for_file "$work/eval-during-update"
-  fi
+if [[ "$arguments" == *" flake update "* ]]; then
   while (($#)); do
     if [[ "$1" == "--output-lock-file" ]]; then
       install -m 0644 "$fixtures/flake.lock" "$2"
@@ -42,24 +14,29 @@ elif [[ "$arguments" == *" flake update "* ]]; then
     fi
     shift
   done
+elif [[ "$arguments" == *" config show "* ]]; then
+  echo '{"substituters":{"value":[]}}'
+elif [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
+  if [[ "$arguments" == *" --reference-lock-file "* ]]; then
+    cat <<EOF
+{"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"2.0","storePath":"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"/nix/store/gggggggggggggggggggggggggggggggg-glibc-2.40","drvPath":"/nix/store/glibc.drv","position":"fixture"}]}
+EOF
+  else
+    echo '[{"name":"desktop","hostName":"fixture"}]'
+  fi
+elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
+  if [[ "$arguments" == *" --reference-lock-file "* ]]; then
+    echo /nix/store/candidate.drv
+  else
+    echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
+  fi
 elif [[ "$arguments" == *" derivation show "* ]]; then
-  printf '{"derivations":{'
-  for number in {1..8}; do
-    if ((number > 1)); then
-      printf ','
-    fi
-    printf '"fixture-worker-%d.drv":{"outputs":{"out":{"path":"fixture-worker-%d"}}}' \
-      "$number" "$number"
-  done
-  printf ',"candidate.drv":{"inputs":{"drvs":{'
-  for number in {1..8}; do
-    if ((number > 1)); then
-      printf ','
-    fi
-    printf '"fixture-worker-%d.drv":{}' "$number"
-  done
-  printf '}},"outputs":{"out":{"path":"fixture-candidate"}}}'
-  printf '},"version":4}\n'
+  cat <<'EOF'
+{"derivations":{"/nix/store/candidate.drv":{"env":{"pname":"candidate","version":"1"},"outputs":{"out":{"path":"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0"}}}}}
+EOF
+elif [[ "$arguments" == *" build "* && "$arguments" == *" --dry-run "* ]]; then
+  echo 'this path will be built: /nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-firefox.drv' >&2
+  echo '[]'
 elif [[ "$arguments" == *" build "* ]]; then
   echo "${FAKE_CANDIDATE_SYSTEM:?}"
 elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]; then
@@ -71,27 +48,10 @@ elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]
     echo /nix/store/candidate.drv
   fi
 elif [[ "$arguments" == *" path-info "* ]]; then
-  side=baseline
-  if [[ "$last" == "${FAKE_CANDIDATE_SYSTEM:?}" ]]; then
-    side=candidate
-  fi
-  if [[ -n "$work" ]]; then
-    printf '%s\n' "$$" >"$work/path-info-$side.pid"
-    printf '%s\n' "$side" >>"$work/path-info-calls"
-  fi
-  if [[ ${FAKE_VERIFY_PARALLEL:-} == 1 ]]; then
-    touch "$work/path-info-$side-started"
-    wait_for_file "$work/path-info-baseline-started"
-    wait_for_file "$work/path-info-candidate-started"
-  fi
-  if [[ ${FAKE_FAIL_PATH_INFO:-} == "$side" ]]; then
-    echo "Injected $side closure query failure" >&2
-    exit 1
-  fi
-  if [[ "$side" == candidate ]]; then
-    cat "$fixtures/candidate-closure.json"
-  else
+  if [[ "$last" == "${FAKE_BOOT_SYSTEM:-}" || "$last" == "${FAKE_RUNNING_SYSTEM:-}" ]]; then
     cat "$fixtures/baseline-closure.json"
+  else
+    cat "$fixtures/candidate-closure.json"
   fi
 else
   echo "Unexpected nix invocation: $*" >&2

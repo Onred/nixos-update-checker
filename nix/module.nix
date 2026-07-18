@@ -9,6 +9,7 @@ let
   cfg = config.programs.nixos-update-checker;
   package = import ./package.nix { inherit pkgs; };
   report = "/var/lib/nixos-update-checker/report.json";
+  candidateLock = "/var/lib/nixos-update-checker/candidate.lock";
   lock = "/var/lib/nixos-update-checker/operation.lock";
 in
 {
@@ -28,8 +29,18 @@ in
       example = null;
       description = ''
         Aggregate CPU quota for the checker. Values below 100% throttle
-        single-threaded evaluation as well as parallel build work. Set this
-        to null to disable CPU quota enforcement.
+        single-threaded preview evaluation. Set this to null to disable CPU
+        quota enforcement. Explicit candidate builds are never throttled.
+      '';
+    };
+
+    extraPackages = lib.mkOption {
+      type = lib.types.attrsOf lib.types.package;
+      default = { };
+      example = lib.literalExpression "{ inherit (pkgs) my-custom-package; }";
+      description = ''
+        Additional packages to include in the lightweight update preview when
+        they cannot be discovered from the active NixOS configuration.
       '';
     };
   };
@@ -39,15 +50,15 @@ in
     environment.etc."xdg/autostart/nixos-update-checker.desktop".source =
       "${package}/share/nixos-update-checker/autostart.desktop";
 
-    # Refresh is safe to request without authentication: the command, limits,
-    # and repository are fixed by this root-owned module. Applying an update is
-    # deliberately not covered by this rule and still requires authentication.
+    # Previewing and explicitly building the fixed, root-owned configuration do
+    # not alter the active system. Applying an update is deliberately excluded.
     security.polkit = {
       enable = true;
       extraConfig = ''
         polkit.addRule(function(action, subject) {
           if (action.id == "org.freedesktop.systemd1.manage-units" &&
-              action.lookup("unit") == "nixos-update-checker.service" &&
+              (action.lookup("unit") == "nixos-update-checker.service" ||
+               action.lookup("unit") == "nixos-update-checker-build.service") &&
               action.lookup("verb") == "start" &&
               subject.active && subject.local) {
             return polkit.Result.YES;
@@ -57,7 +68,7 @@ in
     };
 
     systemd.services.nixos-update-checker = {
-      description = "Build an updated NixOS candidate and publish a report";
+      description = "Preview available NixOS updates without realizing the candidate";
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -75,6 +86,8 @@ in
           "${package}/bin/nixos-update-checker-service"
           "--report"
           report
+          "--candidate-lock"
+          candidateLock
           cfg.repository
         ];
         User = "root";
@@ -95,7 +108,7 @@ in
         SendSIGKILL = true;
         TimeoutStartSec = "24h";
 
-        # Local builders stay in this service's cgroup. nix-daemon builders do not.
+        # Preview evaluation writes derivations but never realizes the candidate.
         ReadWritePaths = [
           "/nix/store"
           "/nix/var/nix"
@@ -112,6 +125,40 @@ in
       };
     };
 
+    systemd.services.nixos-update-checker-build = {
+      description = "Build and verify the reviewed NixOS update candidate";
+      documentation = [ "https://github.com/Onred/nixos-update-checker" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+
+      environment = {
+        HOME = "/var/lib/nixos-update-checker";
+        NIXOS_UPDATE_CHECKER_LOCK = lock;
+        NIXOS_UPDATE_CHECKER_STATE = "/var/lib/nixos-update-checker/system-lock.json";
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.escapeShellArgs [
+          "${package}/bin/nixos-update-checker-service"
+          "--build"
+          "--report"
+          report
+          "--candidate-lock"
+          candidateLock
+          cfg.repository
+        ];
+        User = "root";
+        StateDirectory = "nixos-update-checker";
+        StateDirectoryMode = "0755";
+        UMask = "0022";
+        KillMode = "control-group";
+        TimeoutStopSec = "30s";
+        SendSIGKILL = true;
+        TimeoutStartSec = "infinity";
+      };
+    };
+
     systemd.services.nixos-update-checker-apply = {
       description = "Apply the latest reported NixOS update";
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
@@ -125,6 +172,7 @@ in
         ExecStart = lib.escapeShellArgs [
           "${package}/bin/nixos-update-checker-apply"
           report
+          candidateLock
           cfg.repository
         ];
         User = "root";
