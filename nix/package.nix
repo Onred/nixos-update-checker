@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "4.0.1";
+  version = "4.1.0";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -75,12 +75,14 @@ pkgs.stdenv.mkDerivation {
       --set NIXOS_UPDATE_CHECKER_SYSTEMCTL "${pkgs.systemd}/bin/systemctl"
       --set NIXOS_UPDATE_CHECKER_JOURNALCTL "${pkgs.systemd}/bin/journalctl"
       --set NIXOS_UPDATE_CHECKER_REPORT "/var/lib/nixos-update-checker/report.json"
+      --set NIXOS_UPDATE_CHECKER_STATUS "/var/lib/nixos-update-checker/status.json"
       --set NIXOS_UPDATE_CHECKER_SERVICE "nixos-update-checker.service"
       --set NIXOS_UPDATE_CHECKER_BACKGROUND_SERVICE \
         "nixos-update-checker-background.service"
       --set NIXOS_UPDATE_CHECKER_BUILD_SERVICE \
         "nixos-update-checker-build.service"
       --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"
+      --set NIXOS_UPDATE_CHECKER_BOOT_SERVICE "nixos-update-checker-boot.service"
     )
     wrapQtApp "$out/bin/nixos-update-checker"
   '';
@@ -92,9 +94,10 @@ pkgs.stdenv.mkDerivation {
   ];
   installCheckPhase = ''
     runHook preInstallCheck
-    patchShebangs src/checker.sh tests/checker-fixtures.sh tests/fixtures/bin/nix
-    shellcheck src/checker.sh src/apply.sh \
+    patchShebangs src/checker.sh scripts/live-regression-test.sh \
       tests/checker-fixtures.sh tests/fixtures/bin/nix
+    shellcheck src/checker.sh src/apply.sh \
+      scripts/live-regression-test.sh tests/checker-fixtures.sh tests/fixtures/bin/nix
     tests/checker-fixtures.sh ./src/checker.sh
     QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" --version
     "$out/bin/nixos-update-checker-service" --help

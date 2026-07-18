@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr auto Version = "4.0.1";
+constexpr auto Version = "4.1.0";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -375,7 +375,10 @@ class MainWindow final : public QMainWindow
 {
 public:
     MainWindow(QString reportPath, bool trayEnabled)
-        : reportPath_(std::move(reportPath)), trayEnabled_(trayEnabled)
+        : reportPath_(std::move(reportPath))
+        , statusPath_(environment("NIXOS_UPDATE_CHECKER_STATUS",
+              "/var/lib/nixos-update-checker/status.json"))
+        , trayEnabled_(trayEnabled)
     {
         setWindowTitle("NixOS Update Checker");
         resize(840, 650);
@@ -385,11 +388,13 @@ public:
 
         connect(&pollTimer_, &QTimer::timeout, this, [this] {
             loadReport(false);
+            loadOperationStatus(false);
             refreshLiveSystemState();
             pollServiceState();
         });
         pollTimer_.start(3000);
         loadReport(true);
+        loadOperationStatus(true);
         refreshLiveSystemState();
         pollServiceState();
         updatePresentation();
@@ -430,9 +435,11 @@ private:
         status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         status_->setWordWrap(true);
         refreshButton_ = new QPushButton("Refresh", central);
+        bootButton_ = new QPushButton("Install for Next Boot", central);
         updateButton_ = new QPushButton("Update", central);
         actions->addWidget(status_, 1);
         actions->addWidget(refreshButton_);
+        actions->addWidget(bootButton_);
         actions->addWidget(updateButton_);
         layout->addLayout(actions);
 
@@ -492,8 +499,19 @@ private:
                     showingProgress_ = false;
                     details_->setPlainText(item ? item->data(DetailRole).toString() : QString{});
                 });
-        connect(refreshButton_, &QPushButton::clicked, this, [this] { startCheck(); });
-        connect(updateButton_, &QPushButton::clicked, this, [this] { startUpdateAction(); });
+        connect(refreshButton_, &QPushButton::clicked, this, [this] {
+            if (isRefreshing())
+                cancelService(activeRefreshService(), "refresh");
+            else
+                startCheck();
+        });
+        connect(updateButton_, &QPushButton::clicked, this, [this] {
+            if (isBuilding())
+                cancelService(buildService(), "build");
+            else
+                startUpdateAction();
+        });
+        connect(bootButton_, &QPushButton::clicked, this, [this] { confirmBoot(); });
         updateButtons();
     }
 
@@ -567,6 +585,19 @@ private:
         startService(applyService(), "update");
     }
 
+    void confirmBoot()
+    {
+        if (!canApply() || serviceBusy())
+            return;
+        const auto answer = QMessageBox::question(this, "Install for Next Boot?",
+            "This will update the real flake.lock and make the verified system the "
+            "default for the next boot. It will not switch the running system.\n\nContinue?");
+        if (answer != QMessageBox::Yes)
+            return;
+
+        startService(bootService(), "boot");
+    }
+
     QString checkerService() const
     {
         return environment("NIXOS_UPDATE_CHECKER_SERVICE", "nixos-update-checker.service");
@@ -584,10 +615,21 @@ private:
             "NIXOS_UPDATE_CHECKER_APPLY_SERVICE", "nixos-update-checker-apply.service");
     }
 
+    QString bootService() const
+    {
+        return environment(
+            "NIXOS_UPDATE_CHECKER_BOOT_SERVICE", "nixos-update-checker-boot.service");
+    }
+
     QString buildService() const
     {
         return environment("NIXOS_UPDATE_CHECKER_BUILD_SERVICE",
             "nixos-update-checker-build.service");
+    }
+
+    QString activeRefreshService() const
+    {
+        return backgroundRunning_ ? backgroundService() : checkerService();
     }
 
     void startService(const QString &service, const QString &action)
@@ -597,12 +639,17 @@ private:
 
         activeAction_ = action;
         operationError_.clear();
+        operationState_.clear();
+        operationMessage_.clear();
+        operationDiagnostics_.clear();
         showingProgress_ = true;
         details_->clear();
         if (action == "refresh")
             appendOutput(QStringLiteral("Starting update preview…\n"));
         else if (action == "build")
             appendOutput(QStringLiteral("Starting reviewed update build…\n"));
+        else if (action == "boot")
+            appendOutput(QStringLiteral("Installing the verified update for next boot…\n"));
         else
             appendOutput(QStringLiteral("Starting system update…\n"));
         startJournal(service, false);
@@ -619,26 +666,23 @@ private:
                     if (activeProcess_ == process)
                         activeProcess_ = nullptr;
                     activeAction_.clear();
-                    if (action == "refresh")
-                        checkerRunning_ = false;
-                    else if (action == "build")
-                        buildRunning_ = false;
-                    else
-                        applyRunning_ = false;
                     process->deleteLater();
-                    stopJournalSoon(service);
                     if (exitCode == 0) {
-                        if (action == "update") {
-                            markReportStale("The update finished. Waiting for the refreshed report.");
-                            updatePresentation();
-                            restartApplication();
-                        } else {
-                            loadReport(true);
-                            refreshLiveSystemState();
-                            updatePresentation();
-                        }
+                        startGraceUntil_ = QDateTime::currentDateTime().addSecs(3);
+                        if (action == "refresh")
+                            checkerRunning_ = true;
+                        else if (action == "build")
+                            buildRunning_ = true;
+                        else if (action == "boot")
+                            bootRunning_ = true;
+                        else
+                            applyRunning_ = true;
+                        pollServiceState();
+                        updatePresentation();
                         return;
                     }
+                    stopJournalSoon(service);
+                    startGraceUntil_ = {};
                     const QString diagnostics = QString::fromUtf8(output).trimmed();
                     const QString detail = diagnostics.isEmpty()
                         ? "Run journalctl -u " + service + " for details."
@@ -658,10 +702,56 @@ private:
                     operationError_ = "Could not run systemctl: " + process->errorString();
                     appendOutput("\n" + operationError_ + "\n");
                     process->deleteLater();
+                    startGraceUntil_ = {};
                     QMessageBox::critical(this, "Could not start " + action, operationError_);
                     updatePresentation();
                 });
-        process->start(systemctl, {"start", service});
+        process->start(systemctl, {"start", "--no-block", service});
+    }
+
+    void cancelService(const QString &service, const QString &action)
+    {
+        if (activeProcess_ || service.isEmpty())
+            return;
+
+        activeAction_ = "cancel-" + action;
+        operationError_.clear();
+        appendOutput("\nCancelling " + action + "…\n");
+        auto *process = new QProcess(this);
+        activeProcess_ = process;
+        process->setProcessChannelMode(QProcess::MergedChannels);
+        updatePresentation();
+        const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, process, service, action](int exitCode, QProcess::ExitStatus) {
+                    const QString output = QString::fromUtf8(process->readAll()).trimmed();
+                    if (activeProcess_ == process)
+                        activeProcess_ = nullptr;
+                    activeAction_.clear();
+                    startGraceUntil_ = {};
+                    process->deleteLater();
+                    if (exitCode != 0) {
+                        operationError_ = output.isEmpty()
+                            ? "Could not cancel " + action + "."
+                            : "Could not cancel " + action + ": " + output;
+                        appendOutput(operationError_ + "\n");
+                    }
+                    pollServiceState();
+                    stopJournalSoon(service);
+                    updatePresentation();
+                });
+        connect(process, &QProcess::errorOccurred, this,
+                [this, process, action](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart || activeProcess_ != process)
+                        return;
+                    activeProcess_ = nullptr;
+                    activeAction_.clear();
+                    operationError_ = "Could not cancel " + action + ": " + process->errorString();
+                    appendOutput(operationError_ + "\n");
+                    process->deleteLater();
+                    updatePresentation();
+                });
+        process->start(systemctl, {"stop", service});
     }
 
     bool canApply() const
@@ -678,12 +768,26 @@ private:
 
     void updateButtons()
     {
-        const bool busy = serviceBusy();
-        refreshButton_->setEnabled(!busy);
-        updateButton_->setText(analysisMode_ == "preview" ? "Build Update" : "Update");
-        updateButton_->setEnabled(!busy && (canBuild() || canApply()));
+        const bool refreshing = isRefreshing();
+        const bool building = isBuilding();
+        const bool installing = isUpdating() || isBooting();
+        const bool controlling = activeProcess_ != nullptr;
+
+        refreshButton_->setText(refreshing ? "Cancel Refresh" : "Refresh");
+        refreshButton_->setEnabled(!controlling && !building && !installing);
+
+        if (building) {
+            updateButton_->setText("Cancel Build");
+            updateButton_->setEnabled(!controlling && !refreshing && !installing);
+        } else {
+            updateButton_->setText(analysisMode_ == "preview" ? "Build Update" : "Update Now");
+            updateButton_->setEnabled(!controlling && !refreshing && !installing
+                && (canBuild() || canApply()));
+        }
+        bootButton_->setVisible(canApply() || isBooting());
+        bootButton_->setEnabled(!controlling && canApply() && !serviceBusy());
         if (trayRefreshAction_)
-            trayRefreshAction_->setEnabled(!busy);
+            trayRefreshAction_->setEnabled(!serviceBusy() && !controlling);
     }
 
     void addRow(const QString &name, const QString &version, const QString &size,
@@ -798,6 +902,7 @@ private:
         if (liveBoot.isEmpty())
             liveBoot = liveRunning;
 
+        readyForBoot_ = !liveRunning.isEmpty() && liveBoot != liveRunning;
         if (!liveRunning.isEmpty() && liveBoot != liveRunning) {
             generationStatus_->setText(generationName(liveBoot, "The default boot system")
                 + " is ready for next boot; currently running "
@@ -889,15 +994,41 @@ private:
         populate(report);
     }
 
+    void loadOperationStatus(bool initial)
+    {
+        const QFileInfo info(statusPath_);
+        if (!info.exists() || (!initial && info.lastModified() == statusMtime_))
+            return;
+
+        QFile file(statusPath_);
+        if (!file.open(QIODevice::ReadOnly))
+            return;
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject())
+            return;
+
+        const QJsonObject status = document.object();
+        if (status.value("schemaVersion").toInt() != 1)
+            return;
+        statusMtime_ = info.lastModified();
+        operationState_ = status.value("state").toString();
+        operationMessage_ = status.value("message").toString();
+        operationDiagnostics_ = status.value("diagnostics").toString();
+        if ((operationState_ == "failed" || operationState_ == "cancelled")
+            && showingProgress_) {
+            if (!operationMessage_.isEmpty())
+                appendOutput("\n" + operationMessage_ + "\n");
+            if (!operationDiagnostics_.isEmpty())
+                appendOutput(operationDiagnostics_ + "\n");
+        }
+        updatePresentation();
+    }
+
     void markReportStale(const QString &message)
     {
         reportStale_ = true;
-        analysisMode_.clear();
-        updatesAvailable_ = false;
         reportError_ = false;
-        updates_->setRowCount(0);
-        if (!showingProgress_)
-            details_->clear();
         summary_->setText("Report is stale");
         reportStatus_ = message;
     }
@@ -913,6 +1044,11 @@ private:
         return applyRunning_ || (activeProcess_ && activeAction_ == "update");
     }
 
+    bool isBooting() const
+    {
+        return bootRunning_ || (activeProcess_ && activeAction_ == "boot");
+    }
+
     bool isBuilding() const
     {
         return buildRunning_ || (activeProcess_ && activeAction_ == "build");
@@ -920,7 +1056,7 @@ private:
 
     bool serviceBusy() const
     {
-        return isRefreshing() || isBuilding() || isUpdating();
+        return isRefreshing() || isBuilding() || isUpdating() || isBooting();
     }
 
     void appendOutput(const QByteArray &data)
@@ -1015,10 +1151,12 @@ private:
                     bool backgroundSeen = false;
                     bool buildSeen = false;
                     bool applySeen = false;
+                    bool bootSeen = false;
                     bool checkerActive = false;
                     bool backgroundActive = false;
                     bool buildActive = false;
                     bool applyActive = false;
+                    bool bootActive = false;
                     for (const QString &block : output.split("\n\n", Qt::SkipEmptyParts)) {
                         QString id;
                         QString active;
@@ -1042,13 +1180,17 @@ private:
                         } else if (id == applyService()) {
                             applySeen = true;
                             applyActive = running;
+                        } else if (id == bootService()) {
+                            bootSeen = true;
+                            bootActive = running;
                         }
                     }
-                    if (checkerSeen || backgroundSeen || buildSeen || applySeen)
+                    if (checkerSeen || backgroundSeen || buildSeen || applySeen || bootSeen)
                         setServiceActivity(checkerSeen ? checkerActive : checkerRunning_,
                             backgroundSeen ? backgroundActive : backgroundRunning_,
                             buildSeen ? buildActive : buildRunning_,
-                            applySeen ? applyActive : applyRunning_);
+                            applySeen ? applyActive : applyRunning_,
+                            bootSeen ? bootActive : bootRunning_);
                 });
         connect(process, &QProcess::errorOccurred, this,
                 [this, process](QProcess::ProcessError error) {
@@ -1060,20 +1202,31 @@ private:
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
         process->start(systemctl,
             {"show", "--property=Id", "--property=ActiveState", "--property=SubState",
-                checkerService(), backgroundService(), buildService(), applyService()});
+                checkerService(), backgroundService(), buildService(), applyService(),
+                bootService()});
     }
 
     void setServiceActivity(
-        bool checkerActive, bool backgroundActive, bool buildActive, bool applyActive)
+        bool checkerActive, bool backgroundActive, bool buildActive, bool applyActive,
+        bool bootActive)
     {
+        if (QDateTime::currentDateTime() < startGraceUntil_) {
+            checkerActive = checkerActive || checkerRunning_;
+            backgroundActive = backgroundActive || backgroundRunning_;
+            buildActive = buildActive || buildRunning_;
+            applyActive = applyActive || applyRunning_;
+            bootActive = bootActive || bootRunning_;
+        }
         const bool checkerFinished = checkerRunning_ && !checkerActive;
         const bool backgroundFinished = backgroundRunning_ && !backgroundActive;
         const bool buildFinished = buildRunning_ && !buildActive;
         const bool applyFinished = applyRunning_ && !applyActive;
+        const bool bootFinished = bootRunning_ && !bootActive;
         checkerRunning_ = checkerActive;
         backgroundRunning_ = backgroundActive;
         buildRunning_ = buildActive;
         applyRunning_ = applyActive;
+        bootRunning_ = bootActive;
 
         if (applyRunning_) {
             if (journalService_ != applyService()) {
@@ -1081,6 +1234,13 @@ private:
                 details_->clear();
                 appendOutput(QStringLiteral("System update in progress…\n"));
                 startJournal(applyService(), false);
+            }
+        } else if (bootRunning_) {
+            if (journalService_ != bootService()) {
+                showingProgress_ = true;
+                details_->clear();
+                appendOutput(QStringLiteral("Installing update for next boot…\n"));
+                startJournal(bootService(), false);
             }
         } else if (buildRunning_) {
             if (journalService_ != buildService()) {
@@ -1103,15 +1263,21 @@ private:
                 appendOutput(QStringLiteral("Automatic update check in progress…\n"));
                 startJournal(backgroundService(), false);
             }
-        } else if (checkerFinished || backgroundFinished || buildFinished || applyFinished) {
+        } else if (checkerFinished || backgroundFinished || buildFinished || applyFinished
+            || bootFinished) {
             stopJournalSoon(journalService_);
             loadReport(true);
+            loadOperationStatus(true);
             refreshLiveSystemState();
             if (applyFinished && !activeProcess_) {
                 markReportStale("The update finished. Waiting for the refreshed report.");
                 updatePresentation();
                 restartApplication();
                 return;
+            }
+            if (bootFinished) {
+                markReportStale("The update is installed and ready for the next boot.");
+                refreshLiveSystemState();
             }
         }
         updatePresentation();
@@ -1123,6 +1289,9 @@ private:
         if (isUpdating()) {
             busyText = "Updating…";
             status_->setText("Updating the system…");
+        } else if (isBooting()) {
+            busyText = "Installing…";
+            status_->setText("Installing the update for next boot…");
         } else if (isBuilding()) {
             busyText = "Building…";
             status_->setText("Building and verifying the reviewed update…");
@@ -1131,6 +1300,12 @@ private:
             status_->setText("Refreshing the update report…");
         } else if (!operationError_.isEmpty()) {
             status_->setText(operationError_);
+        } else if (operationState_ == "failed") {
+            status_->setText(operationMessage_.isEmpty() ? "The last operation failed."
+                                                         : operationMessage_);
+        } else if (operationState_ == "cancelled") {
+            status_->setText(operationMessage_.isEmpty() ? "The operation was cancelled."
+                                                         : operationMessage_);
         } else {
             status_->setText(reportStatus_);
         }
@@ -1149,12 +1324,24 @@ private:
         if (isUpdating()) {
             iconName = "system-software-update";
             message = "Updating the system…";
+        } else if (isBooting()) {
+            iconName = "system-reboot";
+            message = "Installing the update for next boot…";
         } else if (isBuilding()) {
             iconName = "view-refresh";
             message = "Building and verifying the reviewed update…";
         } else if (isRefreshing()) {
             iconName = "view-refresh";
             message = "Refreshing the update report…";
+        } else if (readyForBoot_) {
+            iconName = "system-reboot";
+            message = generationStatus_->text();
+            if (schemaSupported_ && updatesAvailable_)
+                message += "\nRemaining beyond next boot: " + summaryText_;
+        } else if (operationState_ == "failed") {
+            iconName = "dialog-error";
+            message = operationMessage_.isEmpty() ? "The last operation failed"
+                                                   : operationMessage_;
         } else if (reportStale_) {
             iconName = "dialog-warning";
             message = "The report is stale; waiting for a refresh";
@@ -1194,6 +1381,7 @@ private:
     }
 
     QString reportPath_;
+    QString statusPath_;
     bool trayEnabled_ = true;
     bool quitRequested_ = false;
     bool schemaSupported_ = false;
@@ -1205,15 +1393,22 @@ private:
     bool backgroundRunning_ = false;
     bool buildRunning_ = false;
     bool applyRunning_ = false;
+    bool bootRunning_ = false;
+    bool readyForBoot_ = false;
     bool showingProgress_ = false;
     QString summaryText_;
     QString analysisMode_;
     QString reportStatus_ = "Waiting for a report";
     QString reportErrorMessage_;
     QString operationError_;
+    QString operationState_;
+    QString operationMessage_;
+    QString operationDiagnostics_;
     QString activeAction_;
     QString journalService_;
     QDateTime reportMtime_;
+    QDateTime statusMtime_;
+    QDateTime startGraceUntil_;
     QJsonObject lastReport_;
     QTimer pollTimer_;
     QProcess *activeProcess_ = nullptr;
@@ -1227,6 +1422,7 @@ private:
     UpdateTable *updates_ = nullptr;
     QPlainTextEdit *details_ = nullptr;
     QPushButton *refreshButton_ = nullptr;
+    QPushButton *bootButton_ = nullptr;
     QPushButton *updateButton_ = nullptr;
 };
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
 
 mode=preview
 report_path=""
 candidate_lock_path=""
+status_path=${NIXOS_UPDATE_CHECKER_STATUS:-}
 repository=""
 temporary_directory=""
+started_at=""
 state_path=${NIXOS_UPDATE_CHECKER_STATE:-/var/lib/nixos-update-checker/system-lock.json}
 running_link=${NIXOS_UPDATE_CHECKER_RUNNING_SYSTEM:-/run/current-system}
 boot_link=${NIXOS_UPDATE_CHECKER_BOOT_SYSTEM:-/nix/var/nix/profiles/system}
@@ -18,7 +20,8 @@ discovery_file=${NIXOS_UPDATE_CHECKER_DISCOVERY:-$(dirname "$0")/../nix/discover
 usage() {
   cat <<'EOF'
 Usage: nixos-update-checker-service [--build] [--report PATH]
-                                    [--candidate-lock PATH] REPOSITORY
+                                    [--candidate-lock PATH] [--status PATH]
+                                    REPOSITORY
 
 Without --build, evaluate an updated NixOS candidate without realizing it and
 publish a schema-3 preview report. --build realizes the exact saved candidate
@@ -34,11 +37,21 @@ cleanup() {
 
 stop_checker() {
   trap - TERM INT
+  write_operation_status cancelled "Operation cancelled" ""
   exit 143
+}
+
+unexpected_error() {
+  local exit_status=$?
+  trap - ERR
+  write_operation_status failed "Operation failed unexpectedly." \
+    "See the system journal for the command that failed."
+  exit "$exit_status"
 }
 
 trap cleanup EXIT
 trap stop_checker TERM INT
+trap unexpected_error ERR
 
 write_json_file() {
   local source=$1
@@ -59,6 +72,39 @@ write_report() {
   fi
 }
 
+operation_name() {
+  if [[ "$mode" == build ]]; then
+    printf 'build\n'
+  else
+    printf 'refresh\n'
+  fi
+}
+
+write_operation_status() {
+  local state=$1
+  local message=${2:-}
+  local diagnostics=${3:-}
+  [[ -n "$status_path" && -n "$temporary_directory" ]] || return
+  jq -n \
+    --arg state "$state" \
+    --arg operation "$(operation_name)" \
+    --arg startedAt "$started_at" \
+    --arg updatedAt "$(date --iso-8601=seconds)" \
+    --arg message "$message" \
+    --arg diagnostics "$diagnostics" '
+    {
+      schemaVersion: 1,
+      state: $state,
+      operation: $operation,
+      startedAt: (if $startedAt == "" then null else $startedAt end),
+      updatedAt: $updatedAt,
+      message: $message,
+      diagnostics: $diagnostics
+    }
+  ' >"$temporary_directory/operation-status.json"
+  write_json_file "$temporary_directory/operation-status.json" "$status_path"
+}
+
 log() {
   printf 'INFO: %s\n' "$*" >&2
 }
@@ -66,34 +112,14 @@ log() {
 fail() {
   local message=$1
   local diagnostics=${2:-}
+  local exit_status=${3:-1}
   printf 'ERROR: %s\n' "$message" >&2
   if [[ -n "$diagnostics" ]]; then
     printf '%s\n' "$diagnostics" >&2
   fi
 
-  # A failed manual build leaves the valid preview in place so it can be
-  # retried. A failed preview replaces an older result with an honest error.
-  if [[ "$mode" == preview && -n "$report_path" && -n "$temporary_directory" ]]; then
-    jq -n \
-      --arg generatedAt "$(date --iso-8601=seconds)" \
-      --arg repository "$repository" \
-      --arg message "$message" \
-      --arg diagnostics "$diagnostics" '
-      {
-        schemaVersion: 3,
-        generatedAt: $generatedAt,
-        status: "error",
-        analysis: {mode: "preview"},
-        repository: $repository,
-        error: {message: $message, diagnostics: $diagnostics}
-      }
-    ' >"$temporary_directory/error.json"
-    write_report "$temporary_directory/error.json"
-    if [[ -n "$candidate_lock_path" ]]; then
-      rm -f "$candidate_lock_path"
-    fi
-  fi
-  exit 1
+  write_operation_status failed "$message" "$diagnostics"
+  exit "$exit_status"
 }
 
 resolved_path() {
@@ -465,7 +491,8 @@ select_configuration() {
   if ! configurations=$(nix --store "$store" eval --json --no-write-lock-file \
     --apply "$discovery_expression" "$flake#nixosConfigurations" \
     2>"$temporary_directory/configurations.log"); then
-    fail "Could not enumerate NixOS configurations." "$({ cat "$temporary_directory/configurations.log"; } 2>/dev/null)"
+    fail "Could not enumerate NixOS configurations." \
+      "$({ cat "$temporary_directory/configurations.log"; } 2>/dev/null)" 2
   fi
   configuration=$(jq -r --arg hostname "$hostname" '
     if length == 1 then .[0].name
@@ -474,7 +501,7 @@ select_configuration() {
   ' <<<"$configurations")
   [[ -n "$configuration" ]] || fail \
     "Could not select one NixOS configuration for host $hostname." \
-    "Available configurations: $(jq -c '.' <<<"$configurations")"
+    "Available configurations: $(jq -c '.' <<<"$configurations")" 2
 }
 
 make_input_changes() {
@@ -558,7 +585,7 @@ run_preview() {
     fail "Could not resolve updated configuration inputs." "$({ cat "$temporary_directory/update.log"; } 2>/dev/null)"
   fi
   [[ "$working_lock_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-    fail "flake.lock changed while the preview was running."
+    fail "flake.lock changed while the preview was running." "" 2
 
   log "Selecting the NixOS configuration."
   select_configuration "$flake"
@@ -567,7 +594,8 @@ run_preview() {
   local declared_deriver
   if ! declared_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
     "$system_installable.drvPath" 2>"$temporary_directory/declared.log"); then
-    fail "Could not evaluate the configured NixOS system." "$({ cat "$temporary_directory/declared.log"; } 2>/dev/null)"
+    fail "Could not evaluate the configured NixOS system." \
+      "$({ cat "$temporary_directory/declared.log"; } 2>/dev/null)" 2
   fi
   local baseline_deriver
   baseline_deriver=$(deriver_for "$baseline_system")
@@ -601,7 +629,8 @@ run_preview() {
   make_input_changes "$baseline_lock" "$candidate_lock" "$baseline_revision" \
     "$input_baseline_complete" "$temporary_directory/inputs.json"
 
-  [[ -f "$discovery_file" ]] || fail "Package discovery rules are missing at $discovery_file."
+  [[ -f "$discovery_file" ]] || \
+    fail "Package discovery rules are missing at $discovery_file." "" 2
   local discovery_expression
   discovery_expression=$(<"$discovery_file")
   log "Discovering configured packages in one candidate evaluation."
@@ -609,7 +638,8 @@ run_preview() {
     --reference-lock-file "$candidate_lock" --apply "$discovery_expression" \
     "$installable" >"$temporary_directory/discovery-raw.json" \
     2> >(tee "$temporary_directory/discovery.log" >&2); then
-    fail "Could not discover configured candidate packages." "$({ cat "$temporary_directory/discovery.log"; } 2>/dev/null)"
+    fail "Could not discover configured candidate packages." \
+      "$({ cat "$temporary_directory/discovery.log"; } 2>/dev/null)" 2
   fi
   normalise_discovery "$temporary_directory/discovery-raw.json" \
     "$temporary_directory/discovery.json"
@@ -665,7 +695,7 @@ run_preview() {
       >"$temporary_directory/dry-run.json" 2>"$temporary_directory/dry-run.log" || dry_run_status=$?
     if ((dry_run_status != 0)); then
       fail "Nix could not calculate the candidate build plan." \
-        "$({ cat "$temporary_directory/dry-run.log"; } 2>/dev/null)"
+        "$({ cat "$temporary_directory/dry-run.log"; } 2>/dev/null)" 2
     fi
     grep -Eo '/nix/store/[a-z0-9]{32}-[^[:space:]]+\.drv' \
       "$temporary_directory/dry-run.log" | sort -u >"$temporary_directory/local-builds.txt" || true
@@ -775,11 +805,12 @@ run_preview() {
   ' >"$temporary_directory/report.json"
 
   [[ "$working_lock_hash" == "$(sha256_file "$repository/flake.lock")" ]] || \
-    fail "flake.lock changed while the preview was running."
+    fail "flake.lock changed while the preview was running." "" 2
   if [[ -n "$candidate_lock_path" ]]; then
     write_json_file "$candidate_lock" "$candidate_lock_path"
   fi
   write_report "$temporary_directory/report.json"
+  write_operation_status succeeded "Update report refreshed" ""
   if [[ "$analysis_mode" == verified ]]; then
     log "Exact report published in ${elapsed}s; the candidate was already realized."
   else
@@ -873,6 +904,7 @@ run_build() {
       + ($diff.rebuilds.count // 0) > 0)
   ' "$preview" >"$temporary_directory/verified-report.json"
   write_report "$temporary_directory/verified-report.json"
+  write_operation_status succeeded "Candidate build verified" ""
   log "Verified closure report published after a ${elapsed}s manual build."
 }
 
@@ -892,12 +924,17 @@ while (($#)); do
       candidate_lock_path=$2
       shift 2
       ;;
+    --status)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      status_path=$2
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.0.1"
+      echo "nixos-update-checker-service 4.1.0"
       exit 0
       ;;
     --*)
@@ -925,8 +962,11 @@ if [[ -n "${NIXOS_UPDATE_CHECKER_LOCK:-}" ]]; then
   fi
 fi
 
-[[ -f "$repository/flake.nix" ]] || fail "No flake.nix exists in $repository."
-[[ -f "$repository/flake.lock" ]] || fail "This checker requires a flake.lock baseline."
+started_at=$(date --iso-8601=seconds)
+write_operation_status running "Operation started" ""
+
+[[ -f "$repository/flake.nix" ]] || fail "No flake.nix exists in $repository." "" 2
+[[ -f "$repository/flake.lock" ]] || fail "This checker requires a flake.lock baseline." "" 2
 
 if [[ "$mode" == build ]]; then
   run_build

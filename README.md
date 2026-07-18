@@ -17,8 +17,8 @@ The application has a deliberately narrow boundary:
   a verified closure report.
 - `nixos-update-checker` reads that JSON and asks systemd to start the service
   when **Refresh** is selected.
-- `nixos-update-checker-apply` installs the reviewed candidate lock and switches
-  the verified configuration when the GUI starts the privileged apply service.
+- `nixos-update-checker-apply` installs the reviewed candidate lock and either
+  switches immediately or makes the verified configuration the next boot target.
 
 The GUI itself does not run Nix, modify the configuration, or collect garbage.
 Preview, build, and update operations remain root-owned systemd services. The
@@ -49,9 +49,10 @@ Import and enable the module:
 ```
 
 The module installs the app, starts it from desktop autostart, and enables a
-persistent timer that checks ten minutes after boot and then daily. A systemd
-path unit also starts the same low-priority check whenever the default system
-profile changes outside this application.
+persistent timer that checks within about ten minutes after boot and then every
+six hours, with up to five minutes of randomized delay. A systemd path unit also
+starts the same low-priority check whenever the default system profile changes
+outside this application.
 
 Only four module options are exposed:
 
@@ -90,8 +91,9 @@ window contains only:
 - a generation line describing a system that is ready for the next boot;
 - report time and configuration;
 - the application version at the bottom-left;
-- **Refresh** and one state-dependent update button above the table. A preview
-  offers **Build Update**; a verified report offers **Update**.
+- state-dependent controls above the table. A preview offers **Build Update**;
+  a verified report offers **Update Now** and **Install for Next Boot**. Active
+  refreshes and builds expose **Cancel Refresh** or **Cancel Build**.
 
 The application and tray use standard desktop-theme update, refresh, warning,
 error, and success icons. The tooltip follows the live service state and shows
@@ -111,10 +113,11 @@ trayEnabled=true
 reportPath=/var/lib/nixos-update-checker/report.json
 ```
 
-An active local desktop user may start the preview and explicit build services
-without authentication. Updating the active system is a separate service and
-still requires administrator authentication. After a successful update, the GUI
-restarts from the newly activated system so an updated checker is loaded too.
+An active local desktop user may start or cancel preview and explicit build
+services without authentication. Installing either kind of system update is a
+separate service and still requires administrator authentication. After a
+successful immediate update, the GUI restarts from the newly activated system
+so an updated checker is loaded too.
 
 Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
@@ -126,7 +129,11 @@ minus paths no longer referenced by it. Preview reports leave size unknown and
 never infer removals. Closure change is a comparison metric, not an exact disk
 space prediction; old generations can retain removed paths.
 
-The report is stored at `/var/lib/nixos-update-checker/report.json`.
+The last successful report is stored at
+`/var/lib/nixos-update-checker/report.json`. Live operation state and the most
+recent failure or cancellation are stored separately at
+`/var/lib/nixos-update-checker/status.json`, so a bad configuration cannot erase
+the last useful report.
 
 Service diagnostics remain in the system journal:
 
@@ -140,11 +147,20 @@ journalctl -u nixos-update-checker.service
 journalctl -u nixos-update-checker-background.service
 journalctl -u nixos-update-checker-build.service
 journalctl -u nixos-update-checker-apply.service
+journalctl -u nixos-update-checker-boot.service
 systemctl start nixos-update-checker.service
 systemctl start nixos-update-checker-build.service
 sudo systemctl start nixos-update-checker-apply.service
+sudo systemctl start nixos-update-checker-boot.service
 jq . /var/lib/nixos-update-checker/report.json
+jq . /var/lib/nixos-update-checker/status.json
 ```
+
+For a destructive end-to-end regression using an older lock, see
+`scripts/live-regression-test.sh`. It preserves the current updater input and
+lock backup, creates an old-content generation, deletes other system
+generations, runs garbage collection, and validates the resulting report before
+leaving it ready for the GUI's Build Update and install flow.
 
 ## Safety and scope
 
@@ -152,8 +168,12 @@ jq . /var/lib/nixos-update-checker/report.json
 - A preview never treats missing cache metadata as a removal or as a complete
   runtime closure. Exact removals and closure sizes require a realized candidate.
 - A manual build realizes the exact saved candidate but never activates it.
-- Applying requires confirmation, installs the exact reviewed `flake.lock`, and runs
-  `nixos-rebuild switch` for the configuration recorded in the report.
+- Installing requires confirmation, installs the exact reviewed `flake.lock`,
+  and runs either `nixos-rebuild switch` or `nixos-rebuild boot` for the
+  configuration recorded in the report.
+- Failed and cancelled operations leave the last successful report and reviewed
+  candidate untouched. Manual operations do not restart automatically;
+  automatic previews retry only transient failures and stop after bounded retries.
 - When the default boot profile differs from the running system, both package
   and input comparisons use that newer boot generation. This avoids reporting
   work already present after `nixos-rebuild boot` or while manually running an

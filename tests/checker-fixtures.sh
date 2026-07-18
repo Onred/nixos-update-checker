@@ -44,8 +44,11 @@ run_checker() {
     FAKE_CANDIDATE_SYSTEM="${FAKE_CANDIDATE_SYSTEM_OVERRIDE:-$work/systems/candidate}" \
     FAKE_DECLARED_DERIVER="${FAKE_DECLARED_DERIVER:-/nix/store/different.drv}" \
     FAKE_METADATA_FAILURE="${FAKE_METADATA_FAILURE:-}" \
+    FAKE_DISCOVERY_FAILURE="${FAKE_DISCOVERY_FAILURE:-}" \
+    FAKE_DISCOVERY_BLOCK="${FAKE_DISCOVERY_BLOCK:-}" \
+    FAKE_DISCOVERY_MARKER="$work/discovery-blocked" \
     FAKE_INVOCATIONS="$work/nix-invocations" \
-    "$checker" "$@"
+    "$checker" --status "$work/status.json" "$@"
 }
 
 report="$work/report.json"
@@ -73,6 +76,55 @@ jq -e '
   (.packages.changes[] | select(.name == "firefox") | .confidence) == "confirmed"
 ' "$report" >/dev/null
 [[ -s "$candidate_lock" ]]
+jq -e '
+  .schemaVersion == 1 and .state == "succeeded" and
+  .operation == "refresh" and .message == "Update report refreshed"
+' "$work/status.json" >/dev/null
+
+# Configuration errors are terminal for this invocation. They are recorded
+# separately and must leave the last successful report and candidate untouched.
+report_hash=$(sha256sum "$report")
+candidate_hash=$(sha256sum "$candidate_lock")
+if FAKE_DISCOVERY_FAILURE=1 run_checker --report "$report" \
+  --candidate-lock "$candidate_lock" "$work/repository" >/dev/null 2>&1; then
+  echo "Expected invalid configuration discovery to fail" >&2
+  exit 1
+fi
+[[ "$report_hash" == "$(sha256sum "$report")" ]]
+[[ "$candidate_hash" == "$(sha256sum "$candidate_lock")" ]]
+jq -e '
+  .state == "failed" and .operation == "refresh" and
+  .message == "Could not discover configured candidate packages."
+' "$work/status.json" >/dev/null
+
+# Cancellation also preserves the published state and reaches a terminal
+# operation status instead of leaving the GUI stuck on "running".
+rm -f "$work/discovery-blocked"
+FAKE_DISCOVERY_BLOCK=1 run_checker --report "$report" \
+  --candidate-lock "$candidate_lock" "$work/repository" >/dev/null 2>&1 &
+cancelled_checker=$!
+for _ in {1..100}; do
+  [[ -e "$work/discovery-blocked" ]] && break
+  sleep 0.02
+done
+[[ -e "$work/discovery-blocked" ]] || {
+  echo "Cancellation fixture never reached package discovery" >&2
+  exit 1
+}
+checker_children=$(<"/proc/$cancelled_checker/task/$cancelled_checker/children")
+checker_process=${checker_children%% *}
+[[ -n "$checker_process" ]] || {
+  echo "Could not locate the cancellable checker process" >&2
+  exit 1
+}
+kill "$checker_process"
+cancel_status=0
+wait "$cancelled_checker" || cancel_status=$?
+[[ $cancel_status == 143 ]]
+[[ "$report_hash" == "$(sha256sum "$report")" ]]
+[[ "$candidate_hash" == "$(sha256sum "$candidate_lock")" ]]
+jq -e '.state == "cancelled" and .operation == "refresh"' \
+  "$work/status.json" >/dev/null
 
 # Garbage collection or cache misses must never turn unknown paths into
 # removals, inferred versions, or known closure sizes.
@@ -120,6 +172,7 @@ jq -e '
   .packages.rebuilds.count == 1 and
   .packages.rebuilds.deltaBytes == 1
 ' "$report" >/dev/null
+jq -e '.state == "succeeded" and .operation == "build"' "$work/status.json" >/dev/null
 
 # A newer default generation is selected as the baseline and reports ready-to-boot.
 ln -sfn "$work/systems/boot" "$work/boot-link"

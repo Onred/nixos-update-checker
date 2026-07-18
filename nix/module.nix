@@ -10,6 +10,7 @@ let
   package = import ./package.nix { inherit pkgs; };
   report = "/var/lib/nixos-update-checker/report.json";
   candidateLock = "/var/lib/nixos-update-checker/candidate.lock";
+  status = "/var/lib/nixos-update-checker/status.json";
   lock = "/var/lib/nixos-update-checker/operation.lock";
   previewService =
     { description, constrained }:
@@ -34,18 +35,18 @@ let
           report
           "--candidate-lock"
           candidateLock
+          "--status"
+          status
           cfg.repository
         ];
         User = "root";
         StateDirectory = "nixos-update-checker";
         StateDirectoryMode = "0755";
         UMask = "0022";
-        Restart = "on-failure";
-        RestartSec = "10m";
         KillMode = "control-group";
         TimeoutStopSec = "30s";
         SendSIGKILL = true;
-        TimeoutStartSec = "24h";
+        TimeoutStartSec = "30m";
         ReadWritePaths = [
           "/nix/store"
           "/nix/var/nix"
@@ -57,6 +58,16 @@ let
         NoNewPrivileges = true;
       }
       // lib.optionalAttrs constrained {
+        Restart = "on-failure";
+        RestartSec = "10m";
+        RestartPreventExitStatus = [
+          "2"
+          "75"
+          "143"
+        ];
+        # A user stop reaches the script as SIGTERM and exits 143, so it is not
+        # retried. A hard timeout is killed instead and remains restartable.
+        TimeoutStartFailureMode = "kill";
         CPUWeight = 1;
         IOWeight = 1;
         Nice = 19;
@@ -68,11 +79,49 @@ let
         CPUQuota = cfg.cpuQuota;
         CPUQuotaPeriodSec = "10ms";
       };
+      unitConfig = lib.optionalAttrs constrained {
+        StartLimitIntervalSec = "1h";
+        StartLimitBurst = 3;
+      };
+    };
+
+  applyService =
+    { description, boot }:
+    {
+      inherit description;
+      documentation = [ "https://github.com/Onred/nixos-update-checker" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+
+      environment = {
+        NIXOS_UPDATE_CHECKER_LOCK = lock;
+        NIXOS_UPDATE_CHECKER_STATUS = status;
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = lib.escapeShellArgs (
+          [ "${package}/bin/nixos-update-checker-apply" ]
+          ++ lib.optional boot "--boot"
+          ++ [
+            report
+            candidateLock
+            cfg.repository
+          ]
+        );
+        User = "root";
+        StateDirectory = "nixos-update-checker";
+        StateDirectoryMode = "0755";
+        KillMode = "control-group";
+        TimeoutStopSec = "30s";
+        SendSIGKILL = true;
+        TimeoutStartSec = "infinity";
+      };
     };
 in
 {
   options.programs.nixos-update-checker = {
-    enable = lib.mkEnableOption "quiet daily NixOS update checks";
+    enable = lib.mkEnableOption "low-impact periodic NixOS update checks";
 
     repository = lib.mkOption {
       type = lib.types.strMatching "/.*";
@@ -110,14 +159,20 @@ in
 
     # Previewing and explicitly building the fixed, root-owned configuration do
     # not alter the active system. Applying an update is deliberately excluded.
+    # Stopping an operation is always safe and must remain available without an
+    # authentication prompt so the GUI cannot become trapped behind a bad eval.
     security.polkit = {
       enable = true;
       extraConfig = ''
         polkit.addRule(function(action, subject) {
           if (action.id == "org.freedesktop.systemd1.manage-units" &&
-              (action.lookup("unit") == "nixos-update-checker.service" ||
-               action.lookup("unit") == "nixos-update-checker-build.service") &&
-              action.lookup("verb") == "start" &&
+              (((action.lookup("unit") == "nixos-update-checker.service" ||
+                 action.lookup("unit") == "nixos-update-checker-build.service") &&
+                action.lookup("verb") == "start") ||
+               ((action.lookup("unit") == "nixos-update-checker.service" ||
+                 action.lookup("unit") == "nixos-update-checker-background.service" ||
+                 action.lookup("unit") == "nixos-update-checker-build.service") &&
+                action.lookup("verb") == "stop")) &&
               subject.active && subject.local) {
             return polkit.Result.YES;
           }
@@ -156,6 +211,8 @@ in
           report
           "--candidate-lock"
           candidateLock
+          "--status"
+          status
           cfg.repository
         ];
         User = "root";
@@ -169,27 +226,14 @@ in
       };
     };
 
-    systemd.services.nixos-update-checker-apply = {
-      description = "Apply the latest reported NixOS update";
-      documentation = [ "https://github.com/Onred/nixos-update-checker" ];
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
+    systemd.services.nixos-update-checker-apply = applyService {
+      description = "Apply the latest verified NixOS update now";
+      boot = false;
+    };
 
-      environment.NIXOS_UPDATE_CHECKER_LOCK = lock;
-
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = lib.escapeShellArgs [
-          "${package}/bin/nixos-update-checker-apply"
-          report
-          candidateLock
-          cfg.repository
-        ];
-        User = "root";
-        StateDirectory = "nixos-update-checker";
-        StateDirectoryMode = "0755";
-        TimeoutStartSec = "infinity";
-      };
+    systemd.services.nixos-update-checker-boot = applyService {
+      description = "Install the latest verified NixOS update for the next boot";
+      boot = true;
     };
 
     systemd.paths.nixos-update-checker = {
@@ -202,11 +246,12 @@ in
     };
 
     systemd.timers.nixos-update-checker = {
-      description = "Run NixOS update checks after boot and daily";
+      description = "Run NixOS update checks after boot and every six hours";
       wantedBy = [ "timers.target" ];
       timerConfig = {
-        OnBootSec = "10m";
-        OnCalendar = "daily";
+        OnBootSec = "5m";
+        OnCalendar = "*-*-* 00/6:00:00";
+        RandomizedDelaySec = "5m";
         Persistent = true;
         Unit = "nixos-update-checker-background.service";
       };
