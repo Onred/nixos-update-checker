@@ -32,6 +32,7 @@
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QTextCursor>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -461,26 +462,22 @@ private:
         updates_->horizontalHeader()->setSectionsMovable(false);
         updates_->horizontalHeader()->setSectionsClickable(false);
         updates_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-        updates_->horizontalHeader()->setStretchLastSection(false);
+        updates_->horizontalHeader()->setStretchLastSection(true);
         updates_->setColumnWidth(0, 500);
         updates_->setColumnWidth(1, 190);
         updates_->setColumnWidth(2, 110);
 
-        auto *detailsPanel = new QWidget(splitter);
-        auto *detailsLayout = new QVBoxLayout(detailsPanel);
-        detailsLayout->setContentsMargins(0, 4, 0, 0);
-        detailsLayout->setSpacing(6);
-        auto *detailsLabel = new QLabel("Details and progress", detailsPanel);
-        QFont detailsFont = detailsLabel->font();
-        detailsFont.setBold(true);
-        detailsLabel->setFont(detailsFont);
-        details_ = new QPlainTextEdit(detailsPanel);
+        infoTabs_ = new QTabWidget(splitter);
+        details_ = new QPlainTextEdit(infoTabs_);
         details_->setReadOnly(true);
         details_->setPlaceholderText("Select an update to see its details.");
-        detailsLayout->addWidget(detailsLabel);
-        detailsLayout->addWidget(details_, 1);
+        progress_ = new QPlainTextEdit(infoTabs_);
+        progress_->setReadOnly(true);
+        progress_->setPlaceholderText("Service output will appear here.");
+        infoTabs_->addTab(details_, "Details");
+        infoTabs_->addTab(progress_, "Progress");
         splitter->addWidget(updates_);
-        splitter->addWidget(detailsPanel);
+        splitter->addWidget(infoTabs_);
         splitter->setStretchFactor(0, 3);
         splitter->setStretchFactor(1, 1);
         splitter->setSizes({460, 150});
@@ -491,13 +488,11 @@ private:
 
         setCentralWidget(central);
 
-        connect(updates_, &QTableWidget::currentCellChanged, this,
-                [this](int row, int, int, int) {
-                    if (serviceBusy())
-                        return;
+        connect(updates_, &QTableWidget::cellClicked, this,
+                [this](int row, int) {
                     const QTableWidgetItem *item = row >= 0 ? updates_->item(row, 0) : nullptr;
-                    showingProgress_ = false;
                     details_->setPlainText(item ? item->data(DetailRole).toString() : QString{});
+                    infoTabs_->setCurrentWidget(details_);
                 });
         connect(refreshButton_, &QPushButton::clicked, this, [this] {
             if (isRefreshing())
@@ -642,8 +637,7 @@ private:
         operationState_.clear();
         operationMessage_.clear();
         operationDiagnostics_.clear();
-        showingProgress_ = true;
-        details_->clear();
+        showProgress(true);
         if (action == "refresh")
             appendOutput(QStringLiteral("Starting update preview…\n"));
         else if (action == "build")
@@ -814,8 +808,7 @@ private:
         const int rebuildCount = rebuilds.value("count").toInt();
 
         updates_->setRowCount(0);
-        if (!showingProgress_)
-            details_->clear();
+        details_->clear();
         for (const QJsonValue &value : inputs) {
             const QJsonObject change = value.toObject();
             addRow("Input: " + change.value("name").toString(),
@@ -983,10 +976,8 @@ private:
             reportStatus_ = reportErrorMessage_;
             reportError_ = true;
             const QString diagnostics = error.value("diagnostics").toString();
-            if (showingProgress_)
-                appendOutput("\n" + diagnostics + "\n");
-            else
-                details_->setPlainText(diagnostics);
+            showProgress(false);
+            appendOutput("\n" + diagnostics + "\n");
             updates_->setRowCount(0);
             updatePresentation();
             return;
@@ -1015,8 +1006,8 @@ private:
         operationState_ = status.value("state").toString();
         operationMessage_ = status.value("message").toString();
         operationDiagnostics_ = status.value("diagnostics").toString();
-        if ((operationState_ == "failed" || operationState_ == "cancelled")
-            && showingProgress_) {
+        if (operationState_ == "failed" || operationState_ == "cancelled") {
+            showProgress(false);
             if (!operationMessage_.isEmpty())
                 appendOutput("\n" + operationMessage_ + "\n");
             if (!operationDiagnostics_.isEmpty())
@@ -1068,11 +1059,18 @@ private:
     {
         if (text.isEmpty())
             return;
-        QTextCursor cursor = details_->textCursor();
+        QTextCursor cursor = progress_->textCursor();
         cursor.movePosition(QTextCursor::End);
         cursor.insertText(text);
-        details_->setTextCursor(cursor);
-        details_->verticalScrollBar()->setValue(details_->verticalScrollBar()->maximum());
+        progress_->setTextCursor(cursor);
+        progress_->verticalScrollBar()->setValue(progress_->verticalScrollBar()->maximum());
+    }
+
+    void showProgress(bool clear)
+    {
+        if (clear)
+            progress_->clear();
+        infoTabs_->setCurrentWidget(progress_);
     }
 
     void startJournal(const QString &service, bool clear)
@@ -1081,7 +1079,7 @@ private:
             return;
         stopJournal();
         if (clear)
-            details_->clear();
+            progress_->clear();
         journalService_ = service;
 
         auto *process = new QProcess(this);
@@ -1230,36 +1228,31 @@ private:
 
         if (applyRunning_) {
             if (journalService_ != applyService()) {
-                showingProgress_ = true;
-                details_->clear();
+                showProgress(true);
                 appendOutput(QStringLiteral("System update in progress…\n"));
                 startJournal(applyService(), false);
             }
         } else if (bootRunning_) {
             if (journalService_ != bootService()) {
-                showingProgress_ = true;
-                details_->clear();
+                showProgress(true);
                 appendOutput(QStringLiteral("Installing update for next boot…\n"));
                 startJournal(bootService(), false);
             }
         } else if (buildRunning_) {
             if (journalService_ != buildService()) {
-                showingProgress_ = true;
-                details_->clear();
+                showProgress(true);
                 appendOutput(QStringLiteral("Reviewed update build in progress…\n"));
                 startJournal(buildService(), false);
             }
         } else if (checkerRunning_) {
             if (journalService_ != checkerService()) {
-                showingProgress_ = true;
-                details_->clear();
+                showProgress(true);
                 appendOutput(QStringLiteral("Update check in progress…\n"));
                 startJournal(checkerService(), false);
             }
         } else if (backgroundRunning_) {
             if (journalService_ != backgroundService()) {
-                showingProgress_ = true;
-                details_->clear();
+                showProgress(true);
                 appendOutput(QStringLiteral("Automatic update check in progress…\n"));
                 startJournal(backgroundService(), false);
             }
@@ -1395,7 +1388,6 @@ private:
     bool applyRunning_ = false;
     bool bootRunning_ = false;
     bool readyForBoot_ = false;
-    bool showingProgress_ = false;
     QString summaryText_;
     QString analysisMode_;
     QString reportStatus_ = "Waiting for a report";
@@ -1420,7 +1412,9 @@ private:
     QLabel *generationStatus_ = nullptr;
     QLabel *status_ = nullptr;
     UpdateTable *updates_ = nullptr;
+    QTabWidget *infoTabs_ = nullptr;
     QPlainTextEdit *details_ = nullptr;
+    QPlainTextEdit *progress_ = nullptr;
     QPushButton *refreshButton_ = nullptr;
     QPushButton *bootButton_ = nullptr;
     QPushButton *updateButton_ = nullptr;

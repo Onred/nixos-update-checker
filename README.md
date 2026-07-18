@@ -86,8 +86,8 @@ Open **NixOS Update Checker** from the application launcher or system tray. The
 window contains only:
 
 - a flat table showing package name, new version or removal, and closure delta;
-- a vertically draggable text area with complete versions, closure sizes, and
-  store paths for the selected row, plus live service output;
+- a vertically draggable tabbed area: **Details** shows complete versions,
+  closure sizes, and store paths, while **Progress** shows live service output;
 - a generation line describing a system that is ready for the next boot;
 - report time and configuration;
 - the application version at the bottom-left;
