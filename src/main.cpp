@@ -710,6 +710,7 @@ private:
 
         activeAction_ = "cancel-" + action;
         operationError_.clear();
+        showProgress(false);
         appendOutput("\nCancelling " + action + "…\n");
         auto *process = new QProcess(this);
         activeProcess_ = process;
@@ -976,7 +977,6 @@ private:
             reportStatus_ = reportErrorMessage_;
             reportError_ = true;
             const QString diagnostics = error.value("diagnostics").toString();
-            showProgress(false);
             appendOutput("\n" + diagnostics + "\n");
             updates_->setRowCount(0);
             updatePresentation();
@@ -1007,7 +1007,6 @@ private:
         operationMessage_ = status.value("message").toString();
         operationDiagnostics_ = status.value("diagnostics").toString();
         if (operationState_ == "failed" || operationState_ == "cancelled") {
-            showProgress(false);
             if (!operationMessage_.isEmpty())
                 appendOutput("\n" + operationMessage_ + "\n");
             if (!operationDiagnostics_.isEmpty())
@@ -1228,31 +1227,31 @@ private:
 
         if (applyRunning_) {
             if (journalService_ != applyService()) {
-                showProgress(true);
+                progress_->clear();
                 appendOutput(QStringLiteral("System update in progress…\n"));
                 startJournal(applyService(), false);
             }
         } else if (bootRunning_) {
             if (journalService_ != bootService()) {
-                showProgress(true);
+                progress_->clear();
                 appendOutput(QStringLiteral("Installing update for next boot…\n"));
                 startJournal(bootService(), false);
             }
         } else if (buildRunning_) {
             if (journalService_ != buildService()) {
-                showProgress(true);
+                progress_->clear();
                 appendOutput(QStringLiteral("Reviewed update build in progress…\n"));
                 startJournal(buildService(), false);
             }
         } else if (checkerRunning_) {
             if (journalService_ != checkerService()) {
-                showProgress(true);
+                progress_->clear();
                 appendOutput(QStringLiteral("Update check in progress…\n"));
                 startJournal(checkerService(), false);
             }
         } else if (backgroundRunning_) {
             if (journalService_ != backgroundService()) {
-                showProgress(true);
+                progress_->clear();
                 appendOutput(QStringLiteral("Automatic update check in progress…\n"));
                 startJournal(backgroundService(), false);
             }
