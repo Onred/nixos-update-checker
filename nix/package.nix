@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "4.0.0";
+  version = "4.0.1";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -39,8 +39,6 @@ pkgs.stdenv.mkDerivation {
     install -Dm755 src/apply.sh "$out/bin/nixos-update-checker-apply"
     install -Dm644 nix/discovery.nix \
       "$out/share/nixos-update-checker/discovery.nix"
-    install -Dm644 assets/nixos-update-checker.svg \
-      "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
     install -Dm644 assets/nixos-update-checker.desktop \
       "$out/share/applications/nixos-update-checker.desktop"
     install -Dm644 assets/nixos-update-checker-autostart.desktop \
@@ -74,12 +72,12 @@ pkgs.stdenv.mkDerivation {
 
   postFixup = ''
     qtWrapperArgs+=(
-      --set NIXOS_UPDATE_CHECKER_ICON \
-        "$out/share/icons/hicolor/scalable/apps/nixos-update-checker.svg"
       --set NIXOS_UPDATE_CHECKER_SYSTEMCTL "${pkgs.systemd}/bin/systemctl"
       --set NIXOS_UPDATE_CHECKER_JOURNALCTL "${pkgs.systemd}/bin/journalctl"
       --set NIXOS_UPDATE_CHECKER_REPORT "/var/lib/nixos-update-checker/report.json"
       --set NIXOS_UPDATE_CHECKER_SERVICE "nixos-update-checker.service"
+      --set NIXOS_UPDATE_CHECKER_BACKGROUND_SERVICE \
+        "nixos-update-checker-background.service"
       --set NIXOS_UPDATE_CHECKER_BUILD_SERVICE \
         "nixos-update-checker-build.service"
       --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"

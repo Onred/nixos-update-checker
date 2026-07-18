@@ -16,7 +16,7 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
-  echo "nixos-update-checker-apply 4.0.0"
+  echo "nixos-update-checker-apply 4.0.1"
   exit 0
 fi
 [[ $# == 3 ]] || { usage >&2; exit 2; }

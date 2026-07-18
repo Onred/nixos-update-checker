@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr auto Version = "4.0.0";
+constexpr auto Version = "4.0.1";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -479,6 +479,9 @@ private:
         splitter->setSizes({460, 150});
         layout->addWidget(splitter, 1);
 
+        auto *versionLabel = new QLabel("Version " + QString::fromUtf8(Version), central);
+        layout->addWidget(versionLabel, 0, Qt::AlignLeft);
+
         setCentralWidget(central);
 
         connect(updates_, &QTableWidget::currentCellChanged, this,
@@ -496,32 +499,8 @@ private:
 
     QIcon applicationIcon() const
     {
-        const QString path = environment("NIXOS_UPDATE_CHECKER_ICON");
-        if (!path.isEmpty() && QFileInfo::exists(path))
-            return QIcon(path);
-        return style()->standardIcon(QStyle::SP_ComputerIcon);
-    }
-
-    QIcon statusIcon(const QColor &color, const QString &symbol) const
-    {
-        QPixmap image = applicationIcon().pixmap(64, 64);
-        if (image.isNull()) {
-            image = QPixmap(64, 64);
-            image.fill(Qt::transparent);
-        }
-
-        QPainter painter(&image);
-        painter.setRenderHint(QPainter::Antialiasing);
-        const QRectF badge(image.width() - 25, image.height() - 25, 23, 23);
-        painter.setPen(QPen(Qt::white, 2));
-        painter.setBrush(color);
-        painter.drawEllipse(badge);
-        QFont font = painter.font();
-        font.setBold(true);
-        font.setPixelSize(15);
-        painter.setFont(font);
-        painter.drawText(badge, Qt::AlignCenter, symbol);
-        return QIcon(image);
+        return QIcon::fromTheme("system-software-update",
+            style()->standardIcon(QStyle::SP_BrowserReload));
     }
 
     void buildTray()
@@ -591,6 +570,12 @@ private:
     QString checkerService() const
     {
         return environment("NIXOS_UPDATE_CHECKER_SERVICE", "nixos-update-checker.service");
+    }
+
+    QString backgroundService() const
+    {
+        return environment("NIXOS_UPDATE_CHECKER_BACKGROUND_SERVICE",
+            "nixos-update-checker-background.service");
     }
 
     QString applyService() const
@@ -919,7 +904,8 @@ private:
 
     bool isRefreshing() const
     {
-        return checkerRunning_ || (activeProcess_ && activeAction_ == "refresh");
+        return checkerRunning_ || backgroundRunning_
+            || (activeProcess_ && activeAction_ == "refresh");
     }
 
     bool isUpdating() const
@@ -1026,9 +1012,11 @@ private:
                     process->deleteLater();
 
                     bool checkerSeen = false;
+                    bool backgroundSeen = false;
                     bool buildSeen = false;
                     bool applySeen = false;
                     bool checkerActive = false;
+                    bool backgroundActive = false;
                     bool buildActive = false;
                     bool applyActive = false;
                     for (const QString &block : output.split("\n\n", Qt::SkipEmptyParts)) {
@@ -1045,6 +1033,9 @@ private:
                         if (id == checkerService()) {
                             checkerSeen = true;
                             checkerActive = running;
+                        } else if (id == backgroundService()) {
+                            backgroundSeen = true;
+                            backgroundActive = running;
                         } else if (id == buildService()) {
                             buildSeen = true;
                             buildActive = running;
@@ -1053,8 +1044,9 @@ private:
                             applyActive = running;
                         }
                     }
-                    if (checkerSeen || buildSeen || applySeen)
+                    if (checkerSeen || backgroundSeen || buildSeen || applySeen)
                         setServiceActivity(checkerSeen ? checkerActive : checkerRunning_,
+                            backgroundSeen ? backgroundActive : backgroundRunning_,
                             buildSeen ? buildActive : buildRunning_,
                             applySeen ? applyActive : applyRunning_);
                 });
@@ -1068,15 +1060,18 @@ private:
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
         process->start(systemctl,
             {"show", "--property=Id", "--property=ActiveState", "--property=SubState",
-                checkerService(), buildService(), applyService()});
+                checkerService(), backgroundService(), buildService(), applyService()});
     }
 
-    void setServiceActivity(bool checkerActive, bool buildActive, bool applyActive)
+    void setServiceActivity(
+        bool checkerActive, bool backgroundActive, bool buildActive, bool applyActive)
     {
         const bool checkerFinished = checkerRunning_ && !checkerActive;
+        const bool backgroundFinished = backgroundRunning_ && !backgroundActive;
         const bool buildFinished = buildRunning_ && !buildActive;
         const bool applyFinished = applyRunning_ && !applyActive;
         checkerRunning_ = checkerActive;
+        backgroundRunning_ = backgroundActive;
         buildRunning_ = buildActive;
         applyRunning_ = applyActive;
 
@@ -1101,7 +1096,14 @@ private:
                 appendOutput(QStringLiteral("Update check in progress…\n"));
                 startJournal(checkerService(), false);
             }
-        } else if (checkerFinished || buildFinished || applyFinished) {
+        } else if (backgroundRunning_) {
+            if (journalService_ != backgroundService()) {
+                showingProgress_ = true;
+                details_->clear();
+                appendOutput(QStringLiteral("Automatic update check in progress…\n"));
+                startJournal(backgroundService(), false);
+            }
+        } else if (checkerFinished || backgroundFinished || buildFinished || applyFinished) {
             stopJournalSoon(journalService_);
             loadReport(true);
             refreshLiveSystemState();
@@ -1142,41 +1144,33 @@ private:
         if (!tray_)
             return;
 
-        QColor color("#6b7280");
-        QString symbol = "?";
+        QString iconName = "system-software-update";
         QString message = "No update report is available";
         if (isUpdating()) {
-            color = QColor("#2563eb");
-            symbol = QString::fromUtf8("↑");
+            iconName = "system-software-update";
             message = "Updating the system…";
         } else if (isBuilding()) {
-            color = QColor("#2563eb");
-            symbol = QString::fromUtf8("↓");
+            iconName = "view-refresh";
             message = "Building and verifying the reviewed update…";
         } else if (isRefreshing()) {
-            color = QColor("#2563eb");
-            symbol = QString::fromUtf8("↻");
+            iconName = "view-refresh";
             message = "Refreshing the update report…";
         } else if (reportStale_) {
-            color = QColor("#d97706");
-            symbol = "!";
+            iconName = "dialog-warning";
             message = "The report is stale; waiting for a refresh";
         } else if (reportError_) {
-            color = QColor("#dc2626");
-            symbol = QString::fromUtf8("×");
+            iconName = "dialog-error";
             message = "Last check failed: " + reportErrorMessage_;
         } else if (schemaSupported_ && updatesAvailable_) {
-            color = QColor("#d97706");
-            symbol = "!";
+            iconName = "software-update-available";
             message = summaryText_;
             if (analysisMode_ == "preview")
                 message += " (preview; build to verify)";
         } else if (schemaSupported_) {
-            color = QColor("#16a34a");
-            symbol = QString::fromUtf8("✓");
+            iconName = "emblem-default";
             message = "System is up to date";
         }
-        tray_->setIcon(statusIcon(color, symbol));
+        tray_->setIcon(QIcon::fromTheme(iconName, applicationIcon()));
         tray_->setToolTip("NixOS Update Checker\n" + message);
     }
 
@@ -1208,6 +1202,7 @@ private:
     bool updatesAvailable_ = false;
     bool reportError_ = false;
     bool checkerRunning_ = false;
+    bool backgroundRunning_ = false;
     bool buildRunning_ = false;
     bool applyRunning_ = false;
     bool showingProgress_ = false;

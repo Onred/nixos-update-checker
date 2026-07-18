@@ -9,6 +9,9 @@ The application has a deliberately narrow boundary:
 - `nixos-update-checker-service` resolves a temporary candidate `flake.lock`,
   evaluates configured packages, queries local and configured binary caches,
   and atomically writes a schema-3 preview without realizing the candidate.
+- `nixos-update-checker-background.service` runs that preview automatically
+  with the configured quota and low scheduling priority. Manual **Refresh**
+  uses the unrestricted `nixos-update-checker.service` instead.
 - `nixos-update-checker-build.service` is started explicitly to run a normal,
   unrestricted Nix build of that exact candidate and replace the preview with
   a verified closure report.
@@ -61,15 +64,14 @@ Only four module options are exposed:
 
 The quota applies only to automatic previews, which can still contain Nix
 evaluation work. Set `cpuQuota = null` to disable that throttle while retaining
-low CPU/I/O weights and idle I/O scheduling. The explicit build service has no
-quota: it uses normal Nix scheduling because a heavily throttled source build
-can otherwise take hours.
+low CPU/I/O weights and idle I/O scheduling. Manual refreshes and explicit
+builds have no quota.
 
 Discovery starts with the kernel, Nix, systemd, active NVIDIA driver, Ollama,
 system/user/font packages, systemd service paths, and active package-valued
-module options. It then uses the candidate derivation graph to fill gaps for
-packages already present in the baseline. Site-specific packages can be added
-without changing this project:
+module options. Cache metadata expands coverage without being treated as a
+complete candidate closure. Site-specific packages can be added without
+changing this project:
 
 ```nix
 programs.nixos-update-checker.extraPackages = {
@@ -87,13 +89,13 @@ window contains only:
   store paths for the selected row, plus live service output;
 - a generation line describing a system that is ready for the next boot;
 - report time and configuration;
+- the application version at the bottom-left;
 - **Refresh** and one state-dependent update button above the table. A preview
   offers **Build Update**; a verified report offers **Update**.
 
-The tray icon uses a colored status badge: orange means updates are pending,
-green means the report is current with no updates, blue means work is running,
-and red means the last check failed. Its tooltip follows the live service state
-and shows the cached update counts while idle.
+The application and tray use standard desktop-theme update, refresh, warning,
+error, and success icons. The tooltip follows the live service state and shows
+the cached update counts while idle.
 
 The GUI reads optional user settings from
 `$XDG_CONFIG_HOME/nixos-update-checker/nixos-update-checker.conf` (normally
@@ -119,11 +121,10 @@ and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
 area.
 
-The size column is the signed net closure change: paths added to the candidate
-minus paths no longer referenced by it. This is a comparison metric, not an
-exact prediction of freed or consumed disk space. Candidate paths may already
-exist in the Nix store, and old generations may continue to retain removed
-paths.
+Verified reports show signed net closure change: paths added to the candidate
+minus paths no longer referenced by it. Preview reports leave size unknown and
+never infer removals. Closure change is a comparison metric, not an exact disk
+space prediction; old generations can retain removed paths.
 
 The report is stored at `/var/lib/nixos-update-checker/report.json`.
 
@@ -133,8 +134,10 @@ Service diagnostics remain in the system journal:
 systemctl status nixos-update-checker.timer
 systemctl status nixos-update-checker.path
 systemctl status nixos-update-checker.service
+systemctl status nixos-update-checker-background.service
 systemctl status nixos-update-checker-build.service
 journalctl -u nixos-update-checker.service
+journalctl -u nixos-update-checker-background.service
 journalctl -u nixos-update-checker-build.service
 journalctl -u nixos-update-checker-apply.service
 systemctl start nixos-update-checker.service
@@ -146,6 +149,8 @@ jq . /var/lib/nixos-update-checker/report.json
 ## Safety and scope
 
 - A preview never modifies the working `flake.lock` or realizes the candidate.
+- A preview never treats missing cache metadata as a removal or as a complete
+  runtime closure. Exact removals and closure sizes require a realized candidate.
 - A manual build realizes the exact saved candidate but never activates it.
 - Applying requires confirmation, installs the exact reviewed `flake.lock`, and runs
   `nixos-rebuild switch` for the configuration recorded in the report.

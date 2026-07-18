@@ -5,6 +5,9 @@ set -euo pipefail
 arguments=" $* "
 last=${!#}
 fixtures=${NIXOS_UPDATE_CHECKER_FIXTURES:?}
+if [[ -n "${FAKE_INVOCATIONS:-}" ]]; then
+  printf '%s\n' "$*" >>"$FAKE_INVOCATIONS"
+fi
 
 if [[ "$arguments" == *" flake update "* ]]; then
   while (($#)); do
@@ -30,14 +33,11 @@ elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
   else
     echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
   fi
-elif [[ "$arguments" == *" derivation show "* ]]; then
-  cat <<'EOF'
-{"derivations":{"/nix/store/candidate.drv":{"env":{"pname":"candidate","version":"1"},"outputs":{"out":{"path":"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0"}}}}}
-EOF
 elif [[ "$arguments" == *" build "* && "$arguments" == *" --dry-run "* ]]; then
   echo 'this path will be built: /nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-firefox.drv' >&2
   echo '[]'
 elif [[ "$arguments" == *" build "* ]]; then
+  mkdir -p "${FAKE_CANDIDATE_SYSTEM:?}"
   echo "${FAKE_CANDIDATE_SYSTEM:?}"
 elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]; then
   if [[ "$last" == "${FAKE_BOOT_SYSTEM:-}" ]]; then
@@ -50,6 +50,9 @@ elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]
 elif [[ "$arguments" == *" path-info "* ]]; then
   if [[ "$last" == "${FAKE_BOOT_SYSTEM:-}" || "$last" == "${FAKE_RUNNING_SYSTEM:-}" ]]; then
     cat "$fixtures/baseline-closure.json"
+  elif [[ ${FAKE_METADATA_FAILURE:-} == 1 ]]; then
+    echo '{"/nix/store/ffffffffffffffffffffffffffffffff-firefox-2.0":null}'
+    exit 1
   else
     cat "$fixtures/candidate-closure.json"
   fi

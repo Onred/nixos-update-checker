@@ -20,7 +20,7 @@ trap cleanup_test EXIT
 mkdir -p "$work/repository" "$work/profiles" "$work/state"
 install -m 0644 "$fixtures/flake.nix" "$work/repository/flake.nix"
 install -m 0644 "$fixtures/flake.lock" "$work/repository/flake.lock"
-mkdir -p "$work/systems/running" "$work/systems/boot" "$work/systems/candidate"
+mkdir -p "$work/systems/running" "$work/systems/boot"
 ln -s "$work/systems/running" "$work/profiles/system-38-link"
 ln -s "$work/systems/boot" "$work/profiles/system-39-link"
 ln -s "$work/systems/running" "$work/running-link"
@@ -41,8 +41,10 @@ run_checker() {
     NIXOS_UPDATE_CHECKER_BASELINE_NIXPKGS_REVISION=old-nixpkgs-revision \
     FAKE_RUNNING_SYSTEM="$(readlink -f "$work/running-link")" \
     FAKE_BOOT_SYSTEM="$(readlink -f "$work/boot-link")" \
-    FAKE_CANDIDATE_SYSTEM="$work/systems/candidate" \
+    FAKE_CANDIDATE_SYSTEM="${FAKE_CANDIDATE_SYSTEM_OVERRIDE:-$work/systems/candidate}" \
     FAKE_DECLARED_DERIVER="${FAKE_DECLARED_DERIVER:-/nix/store/different.drv}" \
+    FAKE_METADATA_FAILURE="${FAKE_METADATA_FAILURE:-}" \
+    FAKE_INVOCATIONS="$work/nix-invocations" \
     "$checker" "$@"
 }
 
@@ -65,9 +67,46 @@ jq -e '
     .before.revision == "old-nixpkgs-revision" and
     .after.revision == "new-nixpkgs-revision"
   )) | length) == 1 and
-  (.packages.changes[] | select(.name == "firefox") | .deltaBytes) == 0
+  (.packages.changes | map(.kind) | index("removed") | not) and
+  all(.packages.changes[]; .sizeKnown == false) and
+  .packages.rebuilds.sizeKnown == false and
+  (.packages.changes[] | select(.name == "firefox") | .confidence) == "confirmed"
 ' "$report" >/dev/null
 [[ -s "$candidate_lock" ]]
+
+# Garbage collection or cache misses must never turn unknown paths into
+# removals, inferred versions, or known closure sizes.
+FAKE_METADATA_FAILURE=1 \
+  run_checker --report "$work/cache-miss-report.json" \
+    --candidate-lock "$work/cache-miss.lock" "$work/repository"
+jq -e '
+  .analysis.mode == "preview" and
+  .analysis.candidateClosureComplete == false and
+  .build.candidateClosureBytes == null and
+  .build.closureDeltaBytes == null and
+  (.packages.changes | map(.kind) | index("removed") | not) and
+  all(.packages.changes[]; .confidence == "configured" and .sizeKnown == false) and
+  .packages.rebuilds.sizeKnown == false
+' "$work/cache-miss-report.json" >/dev/null
+
+# An identical candidate is already exact. It must short-circuit metadata and
+# dry-run work and publish an empty verified package comparison.
+: >"$work/nix-invocations"
+FAKE_CANDIDATE_SYSTEM_OVERRIDE="$(readlink -f "$work/running-link")" \
+  run_checker --report "$work/identical-report.json" \
+    --candidate-lock "$work/identical.lock" "$work/repository"
+jq -e '
+  .analysis.mode == "verified" and
+  .analysis.candidateClosureComplete == true and
+  .system.baselinePath == .system.candidate and
+  (.packages.changes | length) == 0 and
+  .packages.rebuilds.count == 0 and
+  .build.closureDeltaBytes == 0 and .build.sizeKnown == true
+' "$work/identical-report.json" >/dev/null
+if grep -Eq 'config show|build .*--dry-run|derivation show' "$work/nix-invocations"; then
+  echo "Identical candidate performed speculative preview work" >&2
+  exit 1
+fi
 
 # Building is explicit and replaces the preview with an exact closure report.
 run_checker --build --report "$report" --candidate-lock "$candidate_lock" "$work/repository"

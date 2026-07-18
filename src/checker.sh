@@ -142,8 +142,16 @@ query_path_info() {
     --recursive --size "$@" >"$destination" 2>"$diagnostics"; then
     return
   fi
-  nix --store "$query_store" path-info --json --recursive --size \
-    "$@" >"$destination" 2>"$diagnostics"
+  # Nix can return a useful object containing valid entries and nulls for
+  # missing paths while still exiting non-zero. Keep that partial result.
+  if jq -e 'type == "object"' "$destination" >/dev/null 2>&1; then
+    return
+  fi
+  if nix --store "$query_store" path-info --json --recursive --size \
+    "$@" >"$destination" 2>"$diagnostics"; then
+    return
+  fi
+  jq -e 'type == "object"' "$destination" >/dev/null 2>&1
 }
 
 normalise_discovery() {
@@ -214,62 +222,15 @@ query_candidate_metadata() {
   ' "$directory"/*.json >"$destination"
 }
 
-add_preview_fallbacks() {
-  local baseline=$1
-  local graph=$2
-  local discovery=$3
-  local metadata=$4
-  local destination=$5
+build_preview_candidates() {
+  local discovery=$1
+  local metadata=$2
+  local destination=$3
 
   jq -n \
-    --slurpfile baseline "$baseline" \
-    --slurpfile graph "$graph" \
     --slurpfile discovery "$discovery" \
     --slurpfile metadata "$metadata" '
-    def storePath:
-      if startswith("/") then . else "/nix/store/" + . end;
-    def identity($path):
-      ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
-      try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$"))
-      catch {name: $base, version: ""};
-    def graphEntries:
-      ($graph[0] | if has("derivations") then .derivations else . end) |
-      to_entries |
-      map(. as $entry |
-        ($entry.value.env // {}) as $env |
-        [($entry.value.outputs // {}) | to_entries[]? |
-          (.value.path // .value) as $path |
-          select($path | type == "string") |
-          ($path | storePath) as $storePath |
-          (identity($storePath)) as $parsed |
-          {
-            path: $storePath,
-            name: ($env.pname // $parsed.name),
-            version: (($env.version // $parsed.version) | tostring)
-          }
-        ]) | add // [];
-    ($metadata[0]) as $confirmed |
-    ($baseline[0] | keys | map(identity(.).name) | unique) as $baselineNames |
-    ($confirmed | keys | map(identity(.).name) | unique) as $confirmedNames |
-    (graphEntries |
-      map(. as $item | select(
-        ($baselineNames | index($item.name)) != null and
-        ($confirmedNames | index($item.name)) == null
-      )) |
-      unique_by(.path)
-    ) as $inferred |
-    reduce $inferred[] as $item ($confirmed;
-      if has($item.path) then . else
-        .[$item.path] = {
-          narSize: null,
-          references: [$item.path],
-          previewSource: "inferred",
-          inferredName: $item.name,
-          inferredVersion: $item.version
-        }
-      end
-    ) |
-    reduce $discovery[0].packages[] as $package (.;
+    reduce $discovery[0].packages[] as $package ($metadata[0];
       if has($package.storePath) then . else
         .[$package.storePath] = {
           narSize: null,
@@ -278,6 +239,99 @@ add_preview_fallbacks() {
         }
       end
     )
+  ' >"$destination"
+}
+
+compare_preview() {
+  local baseline=$1
+  local candidate=$2
+  local discovery=$3
+  local destination=$4
+
+  jq -n \
+    --slurpfile baseline "$baseline" \
+    --slurpfile candidate "$candidate" \
+    --slurpfile discovery "$discovery" '
+    def parsedIdentity($path):
+      ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
+      try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$"))
+      catch {name: $base, version: ""};
+    def rootMap:
+      reduce $discovery[0].packages[] as $package ({};
+        .[$package.storePath] = $package
+      );
+    rootMap as $roots |
+    def identity($path):
+      if $roots[$path] != null then
+        {name: $roots[$path].name, version: $roots[$path].version}
+      else parsedIdentity($path) end;
+    def packages($closure):
+      $closure | to_entries |
+      map(.key as $path | (identity($path)) + {
+        path: $path,
+        narSize: .value.narSize,
+        previewSource: (.value.previewSource // "confirmed")
+      }) |
+      sort_by(.name) | group_by(.name) |
+      map({
+        key: .[0].name,
+        value: {
+          versions: (map(if .version == "" then "unversioned" else .version end) | unique | sort),
+          entries: (map({path, narSize, previewSource}) | sort_by(.path)),
+          narSize: ([.[].narSize | select(type == "number")] | add // 0),
+          confidence: (if any(.[]; .previewSource == "configured")
+            then "configured" else "confirmed" end)
+        }
+      }) | from_entries;
+    def public($package):
+      if $package == null then null else {
+        versions: $package.versions,
+        paths: ($package.entries | map(.path)),
+        narSize: $package.narSize,
+        sizeKnown: false,
+        confidence: $package.confidence
+      } end;
+    packages($baseline[0]) as $before |
+    packages($candidate[0]) as $after |
+    [($after | keys[]) as $name |
+      (($before[$name].entries // []) | map(.path)) as $beforePaths |
+      [$after[$name].entries[] |
+        select(.path as $path | ($beforePaths | index($path) | not))] as $newEntries |
+      select($newEntries | length > 0) |
+      (($after[$name].versions // []) - ($before[$name].versions // [])) as $introducedVersions |
+      {
+        name: $name,
+        kind: (if $before[$name] == null then "added"
+               elif ($introducedVersions | length) > 0 then "version"
+               else "rebuild" end),
+        confidence: $after[$name].confidence,
+        sizeKnown: false,
+        before: public($before[$name]),
+        after: public($after[$name]),
+        addedBytes: ([$newEntries[].narSize | select(type == "number")] | add // 0),
+        removedBytes: 0,
+        deltaBytes: ([$newEntries[].narSize | select(type == "number")] | add // 0)
+      }
+    ] as $changes |
+    ($changes | map(select(.kind != "rebuild"))) as $packages |
+    ($changes | map(select(.kind == "rebuild"))) as $rebuildChanges |
+    {
+      changes: $packages,
+      rebuilds: {
+        count: ($rebuildChanges | length),
+        addedBytes: 0,
+        removedBytes: 0,
+        deltaBytes: 0,
+        sizeKnown: false,
+        items: ($rebuildChanges | map({
+          name,
+          versions: (.after.versions // .before.versions // []),
+          confidence
+        }))
+      },
+      baselineClosureBytes: ($baseline[0] | to_entries | map(.value.narSize // 0) | add // 0),
+      candidateClosureBytes: null
+    }
   ' >"$destination"
 }
 
@@ -303,12 +357,9 @@ compare_closures() {
     def identity($path; $value):
       if $roots[$path] != null then
         {name: $roots[$path].name, version: $roots[$path].version}
-      elif $value.inferredName != null then
-        {name: $value.inferredName, version: ($value.inferredVersion // "")}
       else parsedIdentity($path) end;
     def confidence($entries):
-      if any($entries[]; .previewSource == "inferred") then "inferred"
-      elif any($entries[]; .previewSource == "configured") then "configured"
+      if any($entries[]; .previewSource == "configured") then "configured"
       else "confirmed" end;
     def packages($closure):
       $closure | to_entries |
@@ -355,7 +406,8 @@ compare_closures() {
                elif $before[$name].versions != $after[$name].versions then "version"
                else "rebuild" end),
         confidence: ($after[$name].confidence // "confirmed"),
-        sizeKnown: (($before[$name].sizeKnown // true) and ($after[$name].sizeKnown // true)),
+        sizeKnown: (($before[$name] == null or $before[$name].sizeKnown == true)
+          and ($after[$name] == null or $after[$name].sizeKnown == true)),
         before: public($before[$name]),
         after: public($after[$name]),
         addedBytes: $added,
@@ -571,36 +623,53 @@ run_preview() {
     fail "Could not inspect the realized baseline closure." \
       "$({ cat "$temporary_directory/baseline-path-info.log"; } 2>/dev/null)"
 
-  jq -r '.packages[].storePath' "$temporary_directory/discovery.json" | sort -u \
-    >"$temporary_directory/candidate-roots.txt"
-  query_candidate_metadata "$temporary_directory/candidate-roots.txt" \
-    "$temporary_directory/candidate-metadata.json"
+  local analysis_mode=preview
+  local candidate_closure_complete=false
+  local build_size_known=false
+  local candidate_data="$temporary_directory/candidate-preview.json"
+  if [[ "$candidate_system" == "$baseline_system" ]]; then
+    log "The candidate is the current baseline; reusing its exact closure."
+    install -m 0644 "$temporary_directory/baseline.json" "$candidate_data"
+    compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
+      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+    analysis_mode=verified
+    candidate_closure_complete=true
+    build_size_known=true
+    : >"$temporary_directory/local-builds.txt"
+  elif [[ -e "$candidate_system" ]]; then
+    log "The candidate is already realized; inspecting its exact closure."
+    query_path_info "$store" "$candidate_data" \
+      "$temporary_directory/candidate-path-info.log" "$candidate_system" || \
+      fail "Could not inspect the realized candidate closure." \
+        "$({ cat "$temporary_directory/candidate-path-info.log"; } 2>/dev/null)"
+    compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
+      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+    analysis_mode=verified
+    candidate_closure_complete=true
+    build_size_known=true
+    : >"$temporary_directory/local-builds.txt"
+  else
+    jq -r '.packages[].storePath' "$temporary_directory/discovery.json" | sort -u \
+      >"$temporary_directory/candidate-roots.txt"
+    query_candidate_metadata "$temporary_directory/candidate-roots.txt" \
+      "$temporary_directory/candidate-metadata.json"
+    build_preview_candidates "$temporary_directory/discovery.json" \
+      "$temporary_directory/candidate-metadata.json" "$candidate_data"
+    compare_preview "$temporary_directory/baseline.json" "$candidate_data" \
+      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
 
-  log "Inspecting the candidate derivation graph without realizing it."
-  if ! nix --store "$store" derivation show --recursive "$candidate_deriver" \
-    >"$temporary_directory/candidate-graph.json" \
-    2>"$temporary_directory/candidate-graph.log"; then
-    fail "Could not inspect the candidate derivation graph." \
-      "$({ cat "$temporary_directory/candidate-graph.log"; } 2>/dev/null)"
+    log "Asking Nix which derivations would require local builds."
+    local dry_run_status=0
+    nix --store "$store" build --dry-run --json --no-link --no-write-lock-file \
+      --reference-lock-file "$candidate_lock" "$system_installable" \
+      >"$temporary_directory/dry-run.json" 2>"$temporary_directory/dry-run.log" || dry_run_status=$?
+    if ((dry_run_status != 0)); then
+      fail "Nix could not calculate the candidate build plan." \
+        "$({ cat "$temporary_directory/dry-run.log"; } 2>/dev/null)"
+    fi
+    grep -Eo '/nix/store/[a-z0-9]{32}-[^[:space:]]+\.drv' \
+      "$temporary_directory/dry-run.log" | sort -u >"$temporary_directory/local-builds.txt" || true
   fi
-  add_preview_fallbacks "$temporary_directory/baseline.json" \
-    "$temporary_directory/candidate-graph.json" "$temporary_directory/discovery.json" \
-    "$temporary_directory/candidate-metadata.json" "$temporary_directory/candidate-preview.json"
-  compare_closures "$temporary_directory/baseline.json" \
-    "$temporary_directory/candidate-preview.json" "$temporary_directory/discovery.json" \
-    "$temporary_directory/comparison.json"
-
-  log "Asking Nix which derivations would require local builds."
-  local dry_run_status=0
-  nix --store "$store" build --dry-run --json --no-link --no-write-lock-file \
-    --reference-lock-file "$candidate_lock" "$system_installable" \
-    >"$temporary_directory/dry-run.json" 2>"$temporary_directory/dry-run.log" || dry_run_status=$?
-  if ((dry_run_status != 0)); then
-    fail "Nix could not calculate the candidate build plan." \
-      "$({ cat "$temporary_directory/dry-run.log"; } 2>/dev/null)"
-  fi
-  grep -Eo '/nix/store/[a-z0-9]{32}-[^[:space:]]+\.drv' \
-    "$temporary_directory/dry-run.log" | sort -u >"$temporary_directory/local-builds.txt" || true
   jq -Rn '[inputs | select(. != "") | {
     drvPath: .,
     name: (split("/")[-1] | sub("^[^-]+-"; "") | sub("\\.drv$"; ""))
@@ -638,15 +707,18 @@ run_preview() {
     --arg candidateDeriver "$candidate_deriver" \
     --arg workingLockHash "$working_lock_hash" \
     --arg candidateLockHash "$candidate_lock_hash" \
+    --arg analysisMode "$analysis_mode" \
     --arg inputBaselineSource "$input_baseline_source" \
     --argjson readyForBoot "$ready_for_boot" \
     --argjson inputBaselineComplete "$input_baseline_complete" \
+    --argjson candidateClosureComplete "$candidate_closure_complete" \
+    --argjson buildSizeKnown "$build_size_known" \
     --argjson elapsed "$elapsed" \
     --slurpfile inputs "$temporary_directory/inputs.json" \
     --slurpfile comparison "$temporary_directory/comparison.json" \
     --slurpfile discovery "$temporary_directory/discovery.json" \
     --slurpfile localBuilds "$temporary_directory/local-builds.json" \
-    --slurpfile candidatePreview "$temporary_directory/candidate-preview.json" '
+    --slurpfile candidatePreview "$candidate_data" '
     def numberOrNull($value): if $value == "" then null else ($value | tonumber) end;
     ($comparison[0]) as $diff |
     {
@@ -656,8 +728,8 @@ run_preview() {
       repository: $repository,
       configuration: $configuration,
       analysis: {
-        mode: "preview",
-        candidateClosureComplete: false,
+        mode: $analysisMode,
+        candidateClosureComplete: $candidateClosureComplete,
         configuredPackages: ($discovery[0].packages | length),
         describedCandidatePaths: ($candidatePreview[0] | length)
       },
@@ -693,8 +765,9 @@ run_preview() {
         elapsedSeconds: $elapsed,
         baselineClosureBytes: $diff.baselineClosureBytes,
         candidateClosureBytes: $diff.candidateClosureBytes,
-        closureDeltaBytes: ($diff.candidateClosureBytes - $diff.baselineClosureBytes),
-        sizeKnown: false
+        closureDeltaBytes: (if ($diff.candidateClosureBytes | type) == "number"
+          then $diff.candidateClosureBytes - $diff.baselineClosureBytes else null end),
+        sizeKnown: $buildSizeKnown
       },
       updatesAvailable: (($inputs[0] | length) + ($diff.changes | length)
         + ($diff.rebuilds.count // 0) > 0)
@@ -707,7 +780,11 @@ run_preview() {
     write_json_file "$candidate_lock" "$candidate_lock_path"
   fi
   write_report "$temporary_directory/report.json"
-  log "Preview report published in ${elapsed}s without realizing the candidate."
+  if [[ "$analysis_mode" == verified ]]; then
+    log "Exact report published in ${elapsed}s; the candidate was already realized."
+  else
+    log "Conservative preview published in ${elapsed}s without realizing the candidate."
+  fi
 }
 
 run_build() {
@@ -820,7 +897,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.0.0"
+      echo "nixos-update-checker-service 4.0.1"
       exit 0
       ;;
     --*)
