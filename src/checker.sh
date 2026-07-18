@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 mode=preview
+finalizing=${NIXOS_UPDATE_CHECKER_FINALIZING:-false}
 report_path=""
 candidate_lock_path=""
 status_path=${NIXOS_UPDATE_CHECKER_STATUS:-}
@@ -74,6 +75,8 @@ write_report() {
 operation_name() {
   if [[ "$mode" == build ]]; then
     printf 'build\n'
+  elif [[ "$finalizing" == true ]]; then
+    printf 'finalize\n'
   else
     printf 'refresh\n'
   fi
@@ -835,7 +838,11 @@ run_preview() {
     write_json_file "$candidate_lock" "$candidate_lock_path"
   fi
   write_report "$temporary_directory/report.json"
-  write_operation_status succeeded "Update check finished" ""
+  if [[ "$finalizing" == true ]]; then
+    write_operation_status succeeded "Update finished" ""
+  else
+    write_operation_status succeeded "Update check finished" ""
+  fi
   if [[ "$analysis_mode" == verified ]]; then
     log "Complete update information saved in ${elapsed}s; the update was already built."
   else
@@ -959,7 +966,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.5"
+      echo "nixos-update-checker-service 4.1.6"
       exit 0
       ;;
     --*)

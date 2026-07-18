@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "4.1.5";
+  version = "4.1.6";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -81,6 +81,8 @@ pkgs.stdenv.mkDerivation {
       --set NIXOS_UPDATE_CHECKER_SERVICE "nixos-update-checker.service"
       --set NIXOS_UPDATE_CHECKER_BACKGROUND_SERVICE \
         "nixos-update-checker-background.service"
+      --set NIXOS_UPDATE_CHECKER_FINALIZE_SERVICE \
+        "nixos-update-checker-finalize.service"
       --set NIXOS_UPDATE_CHECKER_BUILD_SERVICE \
         "nixos-update-checker-build.service"
       --set NIXOS_UPDATE_CHECKER_APPLY_SERVICE "nixos-update-checker-apply.service"

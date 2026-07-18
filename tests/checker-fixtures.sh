@@ -36,6 +36,7 @@ run_checker() {
     NIXOS_UPDATE_CHECKER_BOOT_SYSTEM="$work/boot-link" \
     NIXOS_UPDATE_CHECKER_PROFILE_DIRECTORY="$work/profiles" \
     NIXOS_UPDATE_CHECKER_STATE="$work/state/system-lock.json" \
+    NIXOS_UPDATE_CHECKER_FINALIZING="${NIXOS_UPDATE_CHECKER_FINALIZING:-false}" \
     NIXOS_UPDATE_CHECKER_HOSTNAME=fixture \
     NIXOS_UPDATE_CHECKER_LOCK="${NIXOS_UPDATE_CHECKER_LOCK:-}" \
     NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT="${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}" \
@@ -90,6 +91,16 @@ fi
 jq -e '
   .schemaVersion == 1 and .state == "succeeded" and
   .operation == "refresh" and .message == "Update check finished"
+' "$work/status.json" >/dev/null
+
+# The post-install refresh has its own operation state so the GUI can present
+# it as the final phase of installation, even after the GUI restarts.
+NIXOS_UPDATE_CHECKER_FINALIZING=true \
+  run_checker --report "$work/final-report.json" \
+    --candidate-lock "$work/final-candidate.lock" "$work/repository"
+jq -e '
+  .state == "succeeded" and .operation == "finalize" and
+  .message == "Update finished"
 ' "$work/status.json" >/dev/null
 
 # Configuration errors are terminal for this invocation. They are recorded

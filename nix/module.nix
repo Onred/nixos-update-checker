@@ -23,7 +23,11 @@ let
     ]
     ++ command;
   previewService =
-    { description, constrained }:
+    {
+      description,
+      constrained,
+      finalizing ? false,
+    }:
     {
       inherit description;
       documentation = [ "https://github.com/Onred/nixos-update-checker" ];
@@ -32,6 +36,7 @@ let
       environment = {
         HOME = "/var/lib/nixos-update-checker";
         NIX_REMOTE = "local";
+        NIXOS_UPDATE_CHECKER_FINALIZING = lib.boolToString finalizing;
         NIXOS_UPDATE_CHECKER_LOCK = lock;
         NIXOS_UPDATE_CHECKER_STATE = "/var/lib/nixos-update-checker/system-lock.json";
       };
@@ -105,7 +110,7 @@ let
       # is still running. Let the current invocation finish its cleanup.
       restartIfChanged = false;
       stopIfChanged = false;
-      unitConfig.OnSuccess = "nixos-update-checker-background.service";
+      unitConfig.OnSuccess = "nixos-update-checker-finalize.service";
 
       environment = {
         NIXOS_UPDATE_CHECKER_LOCK = lock;
@@ -211,6 +216,12 @@ in
     systemd.services.nixos-update-checker-background = previewService {
       description = "Automatically preview available NixOS updates";
       constrained = true;
+    };
+
+    systemd.services.nixos-update-checker-finalize = previewService {
+      description = "Finish an installed NixOS update";
+      constrained = true;
+      finalizing = true;
     };
 
     systemd.services.nixos-update-checker-build = {

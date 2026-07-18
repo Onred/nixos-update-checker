@@ -19,6 +19,8 @@ The application has a deliberately narrow boundary:
   when **Refresh** is selected.
 - `nixos-update-checker-apply` installs the reviewed candidate lock and either
   switches immediately or makes the verified configuration the next boot target.
+  A dedicated low-impact finalize service then refreshes the displayed state as
+  the last phase of that installation.
 
 The GUI itself does not run Nix, modify the configuration, or collect garbage.
 Preview, build, and update operations remain root-owned systemd services. The
@@ -125,8 +127,9 @@ All preview, build, and install services share one operation lock. A timed or
 profile-triggered preview cannot run concurrently with or interrupt a manual
 build or install. Explicit builds and both install actions also hold a systemd
 inhibitor against sleep, hibernation, reboot, and shutdown until they finish or
-are cancelled. Refreshes remain uninhibited. A successful install explicitly
-starts a fresh background report after releasing the shared lock.
+are cancelled. Refreshes remain uninhibited. A successful install starts a
+dedicated low-impact finishing check after releasing the shared lock. The GUI
+presents this as part of the installation rather than a separate refresh.
 
 Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
@@ -152,9 +155,11 @@ systemctl status nixos-update-checker.path
 systemctl status nixos-update-checker.service
 systemctl status nixos-update-checker-background.service
 systemctl status nixos-update-checker-build.service
+systemctl status nixos-update-checker-finalize.service
 journalctl -u nixos-update-checker.service
 journalctl -u nixos-update-checker-background.service
 journalctl -u nixos-update-checker-build.service
+journalctl -u nixos-update-checker-finalize.service
 journalctl -u nixos-update-checker-apply.service
 journalctl -u nixos-update-checker-boot.service
 systemctl start nixos-update-checker.service

@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.5";
+constexpr auto Version = "4.1.6";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -400,8 +400,20 @@ public:
 
     void setBusy(bool busy, const QString &text = {})
     {
+        if (busy)
+            clearVisualState();
         busy_->setRunning(busy, text);
         positionBusyIndicator();
+    }
+
+    void clearVisualState()
+    {
+        hoveredRow_ = -1;
+        if (selectionModel()) {
+            selectionModel()->clearSelection();
+            selectionModel()->clearCurrentIndex();
+        }
+        viewport()->update();
     }
 
 protected:
@@ -579,6 +591,7 @@ private:
         updates_->setSelectionMode(QAbstractItemView::SingleSelection);
         updates_->setTextElideMode(Qt::ElideRight);
         updates_->setStyleSheet(
+            "QTableView { outline: 0; }"
             "QTableView::item { border: 0; padding-left: 8px; padding-right: 8px; }");
         updates_->verticalHeader()->hide();
         updates_->verticalHeader()->setDefaultSectionSize(40);
@@ -719,6 +732,12 @@ private:
     {
         return environment("NIXOS_UPDATE_CHECKER_BACKGROUND_SERVICE",
             "nixos-update-checker-background.service");
+    }
+
+    QString finalizeService() const
+    {
+        return environment("NIXOS_UPDATE_CHECKER_FINALIZE_SERVICE",
+            "nixos-update-checker-finalize.service");
     }
 
     QString applyService() const
@@ -884,7 +903,7 @@ private:
     {
         const bool refreshing = isRefreshing();
         const bool building = isBuilding();
-        const bool installing = isUpdating() || isBooting();
+        const bool installing = isUpdating() || isBooting() || isFinalizing();
         const bool controlling = activeProcess_ != nullptr;
 
         refreshButton_->setText(refreshing ? "Cancel Refresh" : "Refresh");
@@ -927,6 +946,7 @@ private:
         const QJsonObject rebuilds = packages.value("rebuilds").toObject();
         const int rebuildCount = rebuilds.value("count").toInt();
 
+        updates_->clearVisualState();
         updates_->setRowCount(0);
         details_->clear();
         for (const QJsonValue &value : inputs) {
@@ -1073,6 +1093,7 @@ private:
             schemaSupported_ = false;
             analysisMode_.clear();
             updatesAvailable_ = false;
+            updates_->clearVisualState();
             updates_->setRowCount(0);
             details_->clear();
             summary_->setText("Refresh needed");
@@ -1092,6 +1113,7 @@ private:
             reportError_ = true;
             const QString diagnostics = error.value("diagnostics").toString();
             appendOutput("\n" + diagnostics + "\n");
+            updates_->clearVisualState();
             updates_->setRowCount(0);
             updatePresentation();
             return;
@@ -1160,7 +1182,12 @@ private:
 
     bool serviceBusy() const
     {
-        return isRefreshing() || isBuilding() || isUpdating() || isBooting();
+        return isRefreshing() || isFinalizing() || isBuilding() || isUpdating() || isBooting();
+    }
+
+    bool isFinalizing() const
+    {
+        return finalizeRunning_;
     }
 
     void appendOutput(const QByteArray &data)
@@ -1260,11 +1287,13 @@ private:
 
                     bool checkerSeen = false;
                     bool backgroundSeen = false;
+                    bool finalizeSeen = false;
                     bool buildSeen = false;
                     bool applySeen = false;
                     bool bootSeen = false;
                     bool checkerActive = false;
                     bool backgroundActive = false;
+                    bool finalizeActive = false;
                     bool buildActive = false;
                     bool applyActive = false;
                     bool bootActive = false;
@@ -1285,6 +1314,9 @@ private:
                         } else if (id == backgroundService()) {
                             backgroundSeen = true;
                             backgroundActive = running;
+                        } else if (id == finalizeService()) {
+                            finalizeSeen = true;
+                            finalizeActive = running;
                         } else if (id == buildService()) {
                             buildSeen = true;
                             buildActive = running;
@@ -1296,9 +1328,11 @@ private:
                             bootActive = running;
                         }
                     }
-                    if (checkerSeen || backgroundSeen || buildSeen || applySeen || bootSeen)
+                    if (checkerSeen || backgroundSeen || finalizeSeen || buildSeen || applySeen
+                        || bootSeen)
                         setServiceActivity(checkerSeen ? checkerActive : checkerRunning_,
                             backgroundSeen ? backgroundActive : backgroundRunning_,
+                            finalizeSeen ? finalizeActive : finalizeRunning_,
                             buildSeen ? buildActive : buildRunning_,
                             applySeen ? applyActive : applyRunning_,
                             bootSeen ? bootActive : bootRunning_);
@@ -1313,28 +1347,31 @@ private:
         const QString systemctl = environment("NIXOS_UPDATE_CHECKER_SYSTEMCTL", "systemctl");
         process->start(systemctl,
             {"show", "--property=Id", "--property=ActiveState", "--property=SubState",
-                checkerService(), backgroundService(), buildService(), applyService(),
-                bootService()});
+                checkerService(), backgroundService(), finalizeService(), buildService(),
+                applyService(), bootService()});
     }
 
     void setServiceActivity(
-        bool checkerActive, bool backgroundActive, bool buildActive, bool applyActive,
-        bool bootActive)
+        bool checkerActive, bool backgroundActive, bool finalizeActive, bool buildActive,
+        bool applyActive, bool bootActive)
     {
         if (QDateTime::currentDateTime() < startGraceUntil_) {
             checkerActive = checkerActive || checkerRunning_;
             backgroundActive = backgroundActive || backgroundRunning_;
+            finalizeActive = finalizeActive || finalizeRunning_;
             buildActive = buildActive || buildRunning_;
             applyActive = applyActive || applyRunning_;
             bootActive = bootActive || bootRunning_;
         }
         const bool checkerFinished = checkerRunning_ && !checkerActive;
         const bool backgroundFinished = backgroundRunning_ && !backgroundActive;
+        const bool finalizeFinished = finalizeRunning_ && !finalizeActive;
         const bool buildFinished = buildRunning_ && !buildActive;
         const bool applyFinished = applyRunning_ && !applyActive;
         const bool bootFinished = bootRunning_ && !bootActive;
         checkerRunning_ = checkerActive;
         backgroundRunning_ = backgroundActive;
+        finalizeRunning_ = finalizeActive;
         buildRunning_ = buildActive;
         applyRunning_ = applyActive;
         bootRunning_ = bootActive;
@@ -1350,6 +1387,11 @@ private:
                 progress_->clear();
                 appendOutput(QStringLiteral("Installing update for next boot…\n"));
                 startJournal(bootService(), false);
+            }
+        } else if (finalizeRunning_) {
+            if (journalService_ != finalizeService()) {
+                appendOutput(QStringLiteral("\nFinishing the update…\n"));
+                startJournal(finalizeService(), false);
             }
         } else if (buildRunning_) {
             if (journalService_ != buildService()) {
@@ -1369,21 +1411,18 @@ private:
                 appendOutput(QStringLiteral("Automatic update check in progress…\n"));
                 startJournal(backgroundService(), false);
             }
-        } else if (checkerFinished || backgroundFinished || buildFinished || applyFinished
-            || bootFinished) {
+        } else if (checkerFinished || backgroundFinished || finalizeFinished || buildFinished
+            || applyFinished || bootFinished) {
             stopJournalSoon(journalService_);
             loadReport(true);
             loadOperationStatus(true);
             refreshLiveSystemState();
-            if (applyFinished && !activeProcess_) {
-                markReportStale("The update finished. Checking the updated system…");
-                checkForReplacement();
+            if ((applyFinished || bootFinished) && !activeProcess_) {
+                markReportStale("Finishing the update…");
+                if (applyFinished)
+                    checkForReplacement();
                 updatePresentation();
                 return;
-            }
-            if (bootFinished) {
-                markReportStale("The update is installed and ready for the next boot.");
-                refreshLiveSystemState();
             }
         }
         updatePresentation();
@@ -1398,6 +1437,9 @@ private:
         } else if (isBooting()) {
             busyText = "Installing…";
             status_->setText("Installing the update for next boot…");
+        } else if (isFinalizing()) {
+            busyText = "Finishing…";
+            status_->setText("Finishing the update…");
         } else if (isBuilding()) {
             busyText = "Building…";
             status_->setText("Building the update…");
@@ -1433,6 +1475,9 @@ private:
         } else if (isBooting()) {
             iconName = "system-reboot";
             message = "Installing the update for next boot…";
+        } else if (isFinalizing()) {
+            iconName = "view-refresh";
+            message = "Finishing the update…";
         } else if (isBuilding()) {
             iconName = "view-refresh";
             message = "Building the update…";
@@ -1504,7 +1549,7 @@ private:
         const QString installedPackage = nixStorePackage(executable);
         const bool replacementAvailable = !runningPackage_.isEmpty()
             && !installedPackage.isEmpty() && runningPackage_ != installedPackage
-            && !isUpdating();
+            && !isUpdating() && !isFinalizing();
         if (restartBanner_->isVisible() != replacementAvailable) {
             restartBanner_->setVisible(replacementAvailable);
             updateTray();
@@ -1522,6 +1567,7 @@ private:
     bool reportError_ = false;
     bool checkerRunning_ = false;
     bool backgroundRunning_ = false;
+    bool finalizeRunning_ = false;
     bool buildRunning_ = false;
     bool applyRunning_ = false;
     bool bootRunning_ = false;
