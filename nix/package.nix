@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "3.1.6";
+  version = "3.1.7";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
@@ -88,9 +88,10 @@ pkgs.stdenv.mkDerivation {
   ];
   installCheckPhase = ''
     runHook preInstallCheck
-    patchShebangs src/checker.sh tests/checker-fixtures.sh tests/fixtures/bin/nix
+    patchShebangs src/checker.sh tests/checker-fixtures.sh \
+      tests/fixtures/bin/nix tests/fixtures/bin/nix-store
     shellcheck src/checker.sh src/apply.sh \
-      tests/checker-fixtures.sh tests/fixtures/bin/nix
+      tests/checker-fixtures.sh tests/fixtures/bin/nix tests/fixtures/bin/nix-store
     tests/checker-fixtures.sh ./src/checker.sh
     QT_QPA_PLATFORM=offscreen "$out/bin/nixos-update-checker" --version
     "$out/bin/nixos-update-checker-service" --help

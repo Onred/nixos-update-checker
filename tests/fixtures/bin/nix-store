@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+arguments=" $* "
+work=${FAKE_WORK_DIRECTORY:?}
+
+if [[ "$arguments" == *" --query "* && "$arguments" == *" --requisites "* ]]; then
+  for number in {1..8}; do
+    printf '/nix/store/fixture-worker-%d.drv\n' "$number"
+  done
+  echo /nix/store/candidate.drv
+  exit 0
+fi
+
+if [[ "$arguments" != *" --realise "* ]]; then
+  echo "Unexpected nix-store invocation: $*" >&2
+  exit 1
+fi
+
+deriver=${!#}
+counter_lock="$work/worker-counter.lock"
+active_file="$work/worker-active"
+maximum_file="$work/worker-maximum"
+exec 9>"$counter_lock"
+
+flock 9
+active=0
+[[ ! -f "$active_file" ]] || active=$(<"$active_file")
+active=$((active + 1))
+printf '%s\n' "$active" >"$active_file"
+maximum=0
+[[ ! -f "$maximum_file" ]] || maximum=$(<"$maximum_file")
+if ((active > maximum)); then
+  printf '%s\n' "$active" >"$maximum_file"
+fi
+flock -u 9
+
+if [[ ${FAKE_VERIFY_WORKERS:-} == 1 ]]; then
+  sleep 0.2
+fi
+
+flock 9
+active=$(<"$active_file")
+active=$((active - 1))
+printf '%s\n' "$active" >"$active_file"
+flock -u 9
+
+printf '%s\n' "${deriver%.drv}"

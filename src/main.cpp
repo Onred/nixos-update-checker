@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr auto Version = "3.1.6";
+constexpr auto Version = "3.1.7";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -174,7 +174,7 @@ QString inputDetails(const QJsonObject &change)
     const QJsonObject before = change.value("before").toObject();
     const QJsonObject after = change.value("after").toObject();
     QStringList lines{
-        "Flake input: " + change.value("name").toString(),
+        "Input: " + change.value("name").toString(),
         "",
         "Baseline: " + before.value("display").toString("missing"),
         "Candidate: " + after.value("display").toString("missing"),
@@ -687,7 +687,7 @@ private:
             details_->clear();
         for (const QJsonValue &value : inputs) {
             const QJsonObject change = value.toObject();
-            addRow("Flake: " + change.value("name").toString(),
+            addRow("Input: " + change.value("name").toString(),
                 change.value("after").toObject().value("display").toString("missing"),
                 "—", inputDetails(change));
         }
@@ -705,7 +705,7 @@ private:
         if (updates_->rowCount() == 0)
             addRow("No updates available", "", "", "");
 
-        const QString text = plural(inputs.size(), "flake input") + "  ·  "
+        const QString text = plural(inputs.size(), "input") + "  ·  "
             + plural(changes.size(), "package change") + "  ·  "
             + plural(rebuildCount, "rebuilt package");
         summaryText_ = text;
@@ -721,7 +721,7 @@ private:
         QString checked = "Checked " + timestamp(report.value("generatedAt")) + "  ·  "
             + report.value("configuration").toString();
         if (!inputBaselineComplete_)
-            checked += "  ·  partial flake history";
+            checked += "  ·  partial input history";
         reportStatus_ = checked;
         updatePresentation();
     }

@@ -43,6 +43,7 @@ run_check() {
     NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT="${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}" \
     FAKE_WORK_DIRECTORY="$work" \
     FAKE_VERIFY_PARALLEL="${FAKE_VERIFY_PARALLEL:-}" \
+    FAKE_VERIFY_WORKERS="${FAKE_VERIFY_WORKERS:-}" \
     FAKE_FAIL_PATH_INFO="${FAKE_FAIL_PATH_INFO:-}" \
     NIXOS_UPDATE_CHECKER_BASELINE_NIXPKGS_REVISION=old-nixpkgs-revision \
     FAKE_RUNNING_SYSTEM="$(readlink -f "$work/running-link")" \
@@ -54,8 +55,11 @@ run_check() {
 
 # No system-bound lock: recover nixpkgs only and mark the input history partial.
 FAKE_VERIFY_PARALLEL=1
+FAKE_VERIFY_WORKERS=1
 run_check incomplete /nix/store/different.drv "$work/state/incomplete.json"
 unset FAKE_VERIFY_PARALLEL
+unset FAKE_VERIFY_WORKERS
+[[ $(<"$work/worker-maximum") == 8 ]]
 jq -e '
   .schemaVersion == 2 and
   .inputBaseline == {
@@ -69,8 +73,10 @@ jq -e '
   .system.readyForBoot == false and
   .build.logicalCpus == 32 and
   .build.workerBudget == 32 and
-  .build.maxJobs == 5 and
-  .build.coresPerJob == 6 and
+  .build.maxJobs == 32 and
+  .build.coresPerJob == 1 and
+  .build.workerCount == 8 and
+  .build.workerDerivations == 9 and
   (.inputs | map(select(
     .name == "nixpkgs" and
     .before.revision == "old-nixpkgs-revision" and
@@ -108,6 +114,17 @@ jq -e '
   .system.baseline == "boot" and
   .system.readyForBoot == true
 ' "$work/report-manual-old.json" >/dev/null
+
+# Root inputs may follow another root input instead of naming a node directly.
+jq '.lock.nodes.tool.locked.rev = "tool-old"' "$work/state/system-lock.json" \
+  >"$work/state/system-lock-old-tool.json"
+run_check followed-input /nix/store/different.drv "$work/state/system-lock-old-tool.json"
+jq -e '
+  ([.inputs[] | select(.name == "tool")][0] |
+    .before.revision == "tool-old" and .after.revision == "tool-current") and
+  ([.inputs[] | select(.name == "followed-tool")][0] |
+    .before.revision == "tool-old" and .after.revision == "tool-current")
+' "$work/report-followed-input.json" >/dev/null
 
 # Once switched, the same profile becomes the running baseline.
 ln -sfn "$work/systems/boot" "$work/running-link"

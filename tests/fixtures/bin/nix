@@ -25,7 +25,11 @@ if [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
   fi
   echo '[{"name":"desktop","hostName":"fixture"}]'
 elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
-  echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
+  if [[ "$arguments" == *" --reference-lock-file "* ]]; then
+    echo /nix/store/candidate.drv
+  else
+    echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"
+  fi
 elif [[ "$arguments" == *" flake update "* ]]; then
   if [[ ${FAKE_VERIFY_PARALLEL:-} == 1 ]]; then
     touch "$work/update-started"
@@ -38,6 +42,24 @@ elif [[ "$arguments" == *" flake update "* ]]; then
     fi
     shift
   done
+elif [[ "$arguments" == *" derivation show "* ]]; then
+  printf '{"derivations":{'
+  for number in {1..8}; do
+    if ((number > 1)); then
+      printf ','
+    fi
+    printf '"fixture-worker-%d.drv":{"outputs":{"out":{"path":"fixture-worker-%d"}}}' \
+      "$number" "$number"
+  done
+  printf ',"candidate.drv":{"inputs":{"drvs":{'
+  for number in {1..8}; do
+    if ((number > 1)); then
+      printf ','
+    fi
+    printf '"fixture-worker-%d.drv":{}' "$number"
+  done
+  printf '}},"outputs":{"out":{"path":"fixture-candidate"}}}'
+  printf '},"version":4}\n'
 elif [[ "$arguments" == *" build "* ]]; then
   echo "${FAKE_CANDIDATE_SYSTEM:?}"
 elif [[ "$arguments" == *" path-info "* && "$arguments" == *" --derivation "* ]]; then

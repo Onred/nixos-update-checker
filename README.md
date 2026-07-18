@@ -54,24 +54,23 @@ Only three module options are exposed:
 | `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
 | `cpuQuota` | `50%` | Aggregate CPU quota for background checks; `null` disables it. |
 
-For example, `cpuQuota = "25%"` limits both single-threaded evaluation and
-parallel builds to one quarter of a CPU's total throughput. Nix workers and
-their cores are still split with the following bounded square allocation:
+For example, `cpuQuota = "25%"` limits evaluation and all build workers together
+to one quarter of a CPU's total throughput. The checker explicitly queues
+uncached derivations across independent, single-job Nix processes:
 
-| Available CPUs | Nix jobs | Cores per job | Worker budget |
+| Available CPUs | Worker processes | Cores per worker | Worker budget |
 |---:|---:|---:|---:|
 | 1 | 1 | 1 | 1 |
-| 4 | 2 | 2 | 4 |
-| 8 | 2 | 4 | 8 |
-| 16 | 4 | 4 | 16 |
-| 32 or more | 5 | 6 | 32 |
+| 4 | 4 | 1 | 4 |
+| 8 | 8 | 1 | 8 |
+| 16 | 16 | 1 | 16 |
+| 32 or more | 32 | 1 | 32 |
 
-This lets independent builds and multithreaded build phases share the available
-CPUs instead of forcing all work through one builder. No Nix job setting can
-guarantee that an individual compiler thread never briefly uses a complete core.
-Cached checks also overlap candidate-lock resolution with baseline evaluation
-and query differing system closures concurrently. All work still shares the
-same service-wide CPU quota.
+The queue is dependency-first and contains only derivations whose outputs are
+not already in the store. Each worker realises one derivation at a time, while
+Nix's store locks prevent duplicate work. Cached checks also overlap
+candidate-lock resolution with baseline evaluation and query differing system
+closures concurrently. All workers still share the same service-wide CPU quota.
 
 The service uses the direct local Nix store. This is intentional: work delegated
 to `nix-daemon.service` would leave the checker's cgroup and escape its CPU
@@ -80,6 +79,11 @@ interactive work.
 
 Set `cpuQuota = null` to leave CPU time unrestricted while retaining the low
 CPU and I/O scheduling priorities.
+
+`CPUQuota` is an aggregate systemd limit, not a per-worker limit. For example,
+`cpuQuota = "800%"` permits eight CPUs of total work; with 32 runnable workers,
+the scheduler will usually spread that to roughly 25% per worker. It does not
+guarantee that an individual worker cannot briefly use a complete core.
 
 ## Use
 
@@ -117,7 +121,7 @@ without authentication. Updating the system is a separate service and still
 requires administrator authentication. After a successful update, the GUI
 restarts from the newly activated system so an updated checker is loaded too.
 
-Top-level flake inputs appear first, changed packages are sorted alphabetically,
+Root configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
 area.
@@ -158,7 +162,9 @@ sudo systemctl start nixos-update-checker.service
 - Apply is disabled for stale reports, incomplete input history, schema-1
   reports, and reports with no remaining updates. The root apply helper repeats
   the live profile check before modifying anything.
-- Only changed top-level flake inputs are reported.
+- Only changed inputs declared directly by the root flake are reported. Inputs
+  may themselves be flakes or non-flake sources, and root-level `follows`
+  references are resolved before comparison.
 - The service currently requires `flake.nix` and `flake.lock`.
 
 Supporting arbitrary non-flake configurations would require a separate answer

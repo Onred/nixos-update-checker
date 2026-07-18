@@ -8,11 +8,15 @@ temporary_directory=""
 candidate_lock_pid=""
 baseline_query_pid=""
 candidate_query_pid=""
+worker_pool_pid=""
+worker_count_used=0
+worker_derivation_count=0
 state_path=${NIXOS_UPDATE_CHECKER_STATE:-/var/lib/nixos-update-checker/system-lock.json}
 running_link=${NIXOS_UPDATE_CHECKER_RUNNING_SYSTEM:-/run/current-system}
 boot_link=${NIXOS_UPDATE_CHECKER_BOOT_SYSTEM:-/nix/var/nix/profiles/system}
 profile_directory=${NIXOS_UPDATE_CHECKER_PROFILE_DIRECTORY:-/nix/var/nix/profiles}
 lock_timeout=${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}
+store=${NIXOS_UPDATE_CHECKER_STORE:-local}
 
 usage() {
   cat <<'EOF'
@@ -25,12 +29,14 @@ EOF
 
 cleanup() {
   local pid
-  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid"; do
+  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid" \
+    "$worker_pool_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
   done
-  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid"; do
+  for pid in "$candidate_lock_pid" "$baseline_query_pid" "$candidate_query_pid" \
+    "$worker_pool_pid"; do
     if [[ -n "$pid" ]]; then
       wait "$pid" 2>/dev/null || true
     fi
@@ -154,7 +160,152 @@ logical_cpu_count() {
 
 deriver_for() {
   local system=$1
-  nix --store local path-info --derivation "$system" 2>/dev/null | head -n 1 || true
+  nix --store "$store" path-info --derivation "$system" 2>/dev/null | head -n 1 || true
+}
+
+realise_with_workers() {
+  local deriver=$1
+  local worker_limit=$2
+  local graph="$temporary_directory/candidate-derivations.json"
+  local graph_log="$temporary_directory/candidate-derivations.log"
+  local derivations="$temporary_directory/candidate-derivations.txt"
+  local requisites="$temporary_directory/candidate-requisites.txt"
+  local requisites_log="$temporary_directory/candidate-requisites.log"
+  local queue="$temporary_directory/worker-queue.txt"
+  local remaining="$temporary_directory/worker-remaining.txt"
+  local ready="$temporary_directory/worker-ready.txt"
+  local blocked="$temporary_directory/worker-blocked.txt"
+  local worker_log="$temporary_directory/workers.log"
+  local worker_roots="$temporary_directory/worker-roots"
+
+  log "Finding uncached candidate derivations."
+  if ! nix --store "$store" derivation show --recursive "$deriver" \
+    >"$graph" 2>"$graph_log"; then
+    fail "Could not inspect the candidate derivation graph." "$(<"$graph_log")"
+  fi
+
+  jq -r '
+    def storePath:
+      if startswith("/") then . else "/nix/store/" + . end;
+    if has("derivations") then
+      .derivations | to_entries[] |
+      [(.key | storePath),
+       ([((.value.inputs.drvs // {}) | keys[]) | storePath] | join(" ")),
+       ([.value.outputs[]?.path? | select(type == "string") | storePath] | join(" "))]
+    else
+      to_entries[] | select(.key | endswith(".drv")) |
+      [(.key | storePath),
+       ([((.value.inputDrvs // {}) | keys[]) | storePath] | join(" ")),
+       ([.value.outputs[]?.path? | select(type == "string") | storePath] | join(" "))]
+    end | join("\u001f")
+  ' "$graph" >"$derivations"
+
+  declare -A missing=()
+  declare -A dependencies=()
+  local separator=$'\x1f'
+  local drv dependency_paths output_paths output dependency
+  local output_missing
+  while IFS="$separator" read -r drv dependency_paths output_paths; do
+    dependencies["$drv"]=$dependency_paths
+    output_missing=false
+    if [[ -z "$output_paths" ]]; then
+      output_missing=true
+    else
+      for output in $output_paths; do
+        if [[ ! -e "$output" ]]; then
+          output_missing=true
+          break
+        fi
+      done
+    fi
+    if [[ "$output_missing" == true ]]; then
+      missing["$drv"]=1
+    fi
+  done <"$derivations"
+
+  if ! nix-store --store "$store" --query --requisites "$deriver" \
+    >"$requisites" 2>"$requisites_log"; then
+    fail "Could not order the candidate derivations." "$(<"$requisites_log")"
+  fi
+
+  : >"$queue"
+  while IFS= read -r drv; do
+    if [[ "$drv" == *.drv && -n "${missing[$drv]:-}" ]]; then
+      printf '%s\n' "$drv" >>"$queue"
+    fi
+  done <"$requisites"
+
+  worker_derivation_count=$(wc -l <"$queue")
+  if ((worker_derivation_count == 0)); then
+    log "Every candidate derivation is already available in the store."
+    return
+  fi
+
+  log "Realising $worker_derivation_count uncached derivations with up to $worker_limit independent workers."
+  install -m 0644 "$queue" "$remaining"
+  : >"$worker_log"
+  mkdir -p "$worker_roots"
+
+  local wave=0 ready_count wave_workers worker_status
+  while [[ -s "$remaining" ]]; do
+    : >"$ready"
+    : >"$blocked"
+    while IFS= read -r drv; do
+      output_missing=false
+      for dependency in ${dependencies[$drv]:-}; do
+        if [[ -n "${missing[$dependency]:-}" ]]; then
+          output_missing=true
+          break
+        fi
+      done
+      if [[ "$output_missing" == true ]]; then
+        printf '%s\n' "$drv" >>"$blocked"
+      else
+        printf '%s\n' "$drv" >>"$ready"
+      fi
+    done <"$remaining"
+
+    ready_count=$(wc -l <"$ready")
+    if ((ready_count == 0)); then
+      fail "Could not find a buildable candidate derivation." \
+        "The remaining derivation graph contains a dependency cycle or an unresolved output."
+    fi
+
+    wave_workers=$worker_limit
+    if ((wave_workers > ready_count)); then
+      wave_workers=$ready_count
+    fi
+    if ((wave_workers > worker_count_used)); then
+      worker_count_used=$wave_workers
+    fi
+    ((wave += 1))
+    log "Starting worker wave $wave with $ready_count derivations and $wave_workers workers."
+
+    # The variables in this string intentionally expand in each worker shell.
+    # shellcheck disable=SC2016
+    xargs -r -P "$wave_workers" -I '{}' \
+      "$BASH" -c '
+        drv=$1
+        roots=$2
+        store=$3
+        nix-store --store "$store" --realise \
+          --option max-jobs 1 --option cores 1 --option max-substitution-jobs 1 \
+          --add-root "$roots/${drv##*/}" "$drv"
+      ' nixos-update-checker-worker '{}' "$worker_roots" "$store" \
+      <"$ready" > >(tee -a "$worker_log" >&2) 2>&1 &
+    worker_pool_pid=$!
+    worker_status=0
+    wait "$worker_pool_pid" || worker_status=$?
+    worker_pool_pid=""
+    if ((worker_status != 0)); then
+      fail "One or more candidate build workers failed." "$(<"$worker_log")"
+    fi
+
+    while IFS= read -r drv; do
+      unset "missing[$drv]"
+    done <"$ready"
+    install -m 0644 "$blocked" "$remaining"
+  done
 }
 
 query_path_info() {
@@ -164,7 +315,7 @@ query_path_info() {
   local command_pid=""
   trap 'if [[ -n "$command_pid" ]]; then kill "$command_pid" 2>/dev/null || true; fi' TERM INT
 
-  nix --store local path-info --json --json-format 1 --recursive --size \
+  nix --store "$store" path-info --json --json-format 1 --recursive --size \
     "$system" >"$destination" 2>"$diagnostics" &
   command_pid=$!
   if wait "$command_pid"; then
@@ -174,7 +325,7 @@ query_path_info() {
   fi
   command_pid=""
 
-  nix --store local path-info --json --recursive --size \
+  nix --store "$store" path-info --json --recursive --size \
     "$system" >"$destination" 2>"$diagnostics" &
   command_pid=$!
   local status=0
@@ -196,7 +347,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 3.1.6"
+      echo "nixos-update-checker-service 3.1.7"
       exit 0
       ;;
     --*)
@@ -254,8 +405,8 @@ candidate_lock="$temporary_directory/candidate.lock"
 
 # Lock resolution is independent of selecting and evaluating the current
 # configuration. Run both within the same service-wide CPU quota.
-log "Resolving updated flake inputs."
-nix --store local flake update --flake "$flake" \
+log "Resolving updated configuration inputs."
+nix --store "$store" flake update --flake "$flake" \
   --output-lock-file "$candidate_lock" \
   2> >(tee "$temporary_directory/update.log" >&2) &
 candidate_lock_pid=$!
@@ -264,7 +415,7 @@ candidate_lock_pid=$!
 # shellcheck disable=SC2016
 discovery_expression='configs: map (name: let value = builtins.tryEval configs.${name}.config.networking.hostName; in { inherit name; hostName = if value.success then value.value else ""; }) (builtins.attrNames configs)'
 log "Evaluating the current NixOS configuration."
-if ! configurations=$(nix --store local eval --json --no-write-lock-file \
+if ! configurations=$(nix --store "$store" eval --json --no-write-lock-file \
   --apply "$discovery_expression" "$flake#nixosConfigurations" 2>"$temporary_directory/discovery.log"); then
   fail "Could not enumerate NixOS configurations." "$(<"$temporary_directory/discovery.log")"
 fi
@@ -279,7 +430,7 @@ configuration=$(jq -r --arg hostname "$hostname" '
   "Available configurations: $(jq -c '.' <<<"$configurations")"
 
 installable="$flake#nixosConfigurations.\"$configuration\".config.system.build.toplevel"
-if ! declared_deriver=$(nix --store local eval --raw --no-write-lock-file \
+if ! declared_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
   "$installable.drvPath" 2>"$temporary_directory/declared.log"); then
   fail "Could not evaluate the configured NixOS system." "$(<"$temporary_directory/declared.log")"
 fi
@@ -316,7 +467,7 @@ if wait "$candidate_lock_pid"; then
   candidate_lock_pid=""
 else
   candidate_lock_pid=""
-  fail "Could not resolve updated flake inputs." "$(<"$temporary_directory/update.log")"
+  fail "Could not resolve updated configuration inputs." "$(<"$temporary_directory/update.log")"
 fi
 
 [[ "$lock_hash" == "$(sha256sum "$repository/flake.lock" | cut -d ' ' -f 1)" ]] || \
@@ -327,9 +478,23 @@ jq -n \
   --slurpfile candidateLock "$candidate_lock" \
   --arg fallbackRevision "$baseline_revision" \
   --argjson complete "$input_baseline_complete" '
+  def followPath($lock; $current; $path):
+    if ($path | length) == 0 then $current
+    else
+      ($current.inputs[$path[0]] // null) as $reference |
+      if ($reference | type) == "string" then
+        followPath($lock; ($lock.nodes[$reference] // {}); $path[1:])
+      elif ($reference | type) == "array" then
+        followPath($lock; ($lock.nodes[$lock.root] // {}); $reference) as $followed |
+        followPath($lock; $followed; $path[1:])
+      else {} end
+    end;
   def node($lock; $name):
     ($lock.nodes[$lock.root].inputs[$name] // null) as $reference |
-    if ($reference | type) == "string" then ($lock.nodes[$reference] // {}) else {} end;
+    if ($reference | type) == "string" then ($lock.nodes[$reference] // {})
+    elif ($reference | type) == "array" then
+      followPath($lock; ($lock.nodes[$lock.root] // {}); $reference)
+    else {} end;
   def detail($lock; $name):
     (node($lock; $name).locked // {}) as $value |
     {
@@ -366,20 +531,26 @@ if ((worker_budget > 32)); then
   worker_budget=32
 fi
 
-# Use several builders with several threads each. This is the same square
-# allocation used by the original Python backend, written out plainly.
-max_jobs=1
-while (((max_jobs + 1) * (max_jobs + 1) <= worker_budget)); do
-  ((max_jobs += 1))
-done
-cores_per_job=$((worker_budget / max_jobs))
+# Each independent Nix process builds one derivation with one declared core.
+# This makes concurrency explicit instead of relying on one coordinator to
+# happen to have several buildable derivations at the same time.
+max_jobs=$worker_budget
+cores_per_job=1
 substitution_jobs=$max_jobs
 if ((substitution_jobs > 4)); then
   substitution_jobs=4
 fi
 
+if ! candidate_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
+  --reference-lock-file "$candidate_lock" \
+  "$installable.drvPath" 2>"$temporary_directory/candidate-deriver.log"); then
+  fail "Could not evaluate the candidate NixOS derivation." \
+    "$(<"$temporary_directory/candidate-deriver.log")"
+fi
+realise_with_workers "$candidate_deriver" "$max_jobs"
+
 log "Building the candidate with $max_jobs jobs and $cores_per_job cores per job."
-if ! candidate_system=$(nix --store local \
+if ! candidate_system=$(nix --store "$store" \
   --option max-substitution-jobs "$substitution_jobs" \
   build --no-link --print-out-paths --print-build-logs --no-write-lock-file \
   --reference-lock-file "$candidate_lock" \
@@ -524,6 +695,8 @@ jq -n \
   --argjson maxJobs "$max_jobs" \
   --argjson coresPerJob "$cores_per_job" \
   --argjson substitutionJobs "$substitution_jobs" \
+  --argjson workerCount "$worker_count_used" \
+  --argjson workerDerivations "$worker_derivation_count" \
   --slurpfile inputs "$temporary_directory/inputs.json" \
   --slurpfile changes "$temporary_directory/closure-changes.json" \
   --slurpfile baseline "$temporary_directory/baseline.json" \
@@ -575,6 +748,8 @@ jq -n \
       maxJobs: $maxJobs,
       coresPerJob: $coresPerJob,
       substitutionJobs: $substitutionJobs,
+      workerCount: $workerCount,
+      workerDerivations: $workerDerivations,
       baselineClosureBytes: $baselineSize,
       candidateClosureBytes: $candidateSize,
       closureDeltaBytes: ($candidateSize - $baselineSize)
