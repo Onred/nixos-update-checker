@@ -134,7 +134,8 @@ presents this as part of the installation rather than a separate refresh.
 Direct configuration inputs appear first, changed packages are sorted alphabetically,
 and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
-area.
+area. Generated unversioned outputs such as NixOS documentation and indexes are
+grouped into one **NixOS system data** row instead of being presented as packages.
 
 Verified reports show signed net closure change: paths added to the candidate
 minus paths no longer referenced by it. Preview reports leave size unknown and
@@ -145,7 +146,10 @@ The last successful report is stored at
 `/var/lib/nixos-update-checker/report.json`. Live operation state and the most
 recent failure or cancellation are stored separately at
 `/var/lib/nixos-update-checker/status.json`, so a bad configuration cannot erase
-the last useful report.
+the last useful report. Each successful explicit build also keeps one bounded
+diagnostic pair at `last-build-preview.json` and `last-build-verified.json` in
+the same directory. The verified copy records names missed by the preview and
+preview-only names; a later refresh does not overwrite this pair.
 
 Service diagnostics remain in the system journal:
 
@@ -168,6 +172,8 @@ sudo systemctl start nixos-update-checker-apply.service
 sudo systemctl start nixos-update-checker-boot.service
 jq . /var/lib/nixos-update-checker/report.json
 jq . /var/lib/nixos-update-checker/status.json
+jq . /var/lib/nixos-update-checker/last-build-preview.json
+jq . /var/lib/nixos-update-checker/last-build-verified.json
 ```
 
 For a destructive end-to-end regression using an older lock, see
@@ -182,9 +188,9 @@ leaving it ready for the GUI's Build Update and install flow.
 - A preview never treats missing cache metadata as a removal or as a complete
   runtime closure. Exact removals and closure sizes require a realized candidate.
 - Package-valued module options are discovery hints, not proof of closure
-  membership. A preview includes those hints only when their exact store path
-  is present in the realized baseline; explicit configured packages remain
-  eligible as additions.
+  membership. A preview accepts an updated option package only when the same
+  option source supplied a package proven present in the realized baseline.
+  Explicit configured packages remain eligible as additions.
 - A manual build realizes the exact saved candidate but never activates it.
 - Installing is privileged, installs the exact reviewed `flake.lock`, and runs
   either `nixos-rebuild switch` or `nixos-rebuild boot` for the configuration
@@ -196,7 +202,7 @@ leaving it ready for the GUI's Build Update and install flow.
   and input comparisons use that newer boot generation. This avoids reporting
   work already present after `nixos-rebuild boot` or while manually running an
   older generation.
-- The checker stores one system-bound lock snapshot in
+- The checker stores one system-bound lock and package-discovery snapshot in
   `/var/lib/nixos-update-checker/system-lock.json`. If no complete lock can be
   matched to the baseline system, it recovers only nixpkgs history from that
   system and marks the report incomplete.

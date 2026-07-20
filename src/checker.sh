@@ -6,6 +6,8 @@ mode=preview
 finalizing=${NIXOS_UPDATE_CHECKER_FINALIZING:-false}
 report_path=""
 candidate_lock_path=""
+preview_snapshot_path=""
+verified_snapshot_path=""
 status_path=${NIXOS_UPDATE_CHECKER_STATUS:-}
 repository=""
 temporary_directory=""
@@ -22,6 +24,8 @@ usage() {
   cat <<'EOF'
 Usage: nixos-update-checker-service [--build] [--report PATH]
                                     [--candidate-lock PATH] [--status PATH]
+                                    [--preview-snapshot PATH]
+                                    [--verified-snapshot PATH]
                                     REPOSITORY
 
 Without --build, check for updates without building them. --build builds the
@@ -273,18 +277,24 @@ build_preview_candidates() {
 filter_preview_discovery() {
   local baseline=$1
   local discovery=$2
-  local destination=$3
+  local baseline_discovery=$3
+  local destination=$4
 
   jq -n \
     --slurpfile baseline "$baseline" \
-    --slurpfile discovery "$discovery" '
+    --slurpfile discovery "$discovery" \
+    --slurpfile baselineDiscovery "$baseline_discovery" '
     ($baseline[0] | keys) as $baselinePaths |
+    ([$baselineDiscovery[0].packages[]? |
+      select(.storePath as $path | ($baselinePaths | index($path)) != null) |
+      .sources[]] | unique) as $activeSources |
     $discovery[0] |
     .packages |= map(
       . as $package |
       select(
         any($package.sources[]; startswith("option:") | not)
         or ($baselinePaths | index($package.storePath)) != null
+        or any($package.sources[]; . as $source | ($activeSources | index($source)) != null)
       )
     )
   ' >"$destination"
@@ -302,8 +312,8 @@ compare_preview() {
     --slurpfile discovery "$discovery" '
     def parsedIdentity($path):
       ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
-      try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$"))
-      catch {name: $base, version: ""};
+      (try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$")) catch null)
+        // {name: $base, version: ""};
     def rootMap:
       reduce $discovery[0].packages[] as $package ({};
         .[$package.storePath] = $package
@@ -318,15 +328,17 @@ compare_preview() {
       map(.key as $path | (identity($path)) + {
         path: $path,
         narSize: .value.narSize,
+        explicit: any($roots[$path].sources[]?; startswith("option:") | not),
         previewSource: (.value.previewSource // "confirmed")
       }) |
       sort_by(.name) | group_by(.name) |
       map({
         key: .[0].name,
         value: {
-          versions: (map(if .version == "" then "unversioned" else .version end) | unique | sort),
+          versions: (map(.version | select(. != "")) | unique | sort),
           entries: (map({path, narSize, previewSource}) | sort_by(.path)),
           narSize: ([.[].narSize | select(type == "number")] | add // 0),
+          userFacing: any(.[]; .explicit or .version != ""),
           confidence: (if any(.[]; .previewSource == "configured")
             then "configured" else "confirmed" end)
         }
@@ -349,6 +361,7 @@ compare_preview() {
       (($after[$name].versions // []) - ($before[$name].versions // [])) as $introducedVersions |
       {
         name: $name,
+        userFacing: (($after[$name].userFacing // false) or ($before[$name].userFacing // false)),
         kind: (if $before[$name] == null then "added"
                elif ($introducedVersions | length) > 0 then "version"
                else "rebuild" end),
@@ -361,8 +374,10 @@ compare_preview() {
         deltaBytes: ([$newEntries[].narSize | select(type == "number")] | add // 0)
       }
     ] as $changes |
-    ($changes | map(select(.kind != "rebuild"))) as $packages |
-    ($changes | map(select(.kind == "rebuild"))) as $rebuildChanges |
+    ($changes | map(select(.userFacing))) as $visibleChanges |
+    ($changes | map(select(.userFacing | not))) as $systemChanges |
+    ($visibleChanges | map(select(.kind != "rebuild"))) as $packages |
+    ($visibleChanges | map(select(.kind == "rebuild"))) as $rebuildChanges |
     {
       changes: $packages,
       rebuilds: {
@@ -376,6 +391,14 @@ compare_preview() {
           versions: (.after.versions // .before.versions // []),
           confidence
         }))
+      },
+      system: {
+        count: ($systemChanges | length),
+        addedBytes: ($systemChanges | map(.addedBytes) | add // 0),
+        removedBytes: 0,
+        deltaBytes: ($systemChanges | map(.addedBytes) | add // 0),
+        sizeKnown: false,
+        items: ($systemChanges | map({name, kind}) | sort_by(.name))
       },
       baselineClosureBytes: ($baseline[0] | to_entries | map(.value.narSize // 0) | add // 0),
       candidateClosureBytes: null
@@ -395,8 +418,8 @@ compare_closures() {
     --slurpfile discovery "$discovery" '
     def parsedIdentity($path):
       ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
-      try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$"))
-      catch {name: $base, version: ""};
+      (try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$")) catch null)
+        // {name: $base, version: ""};
     def rootMap:
       reduce $discovery[0].packages[] as $package ({};
         .[$package.storePath] = $package
@@ -414,16 +437,18 @@ compare_closures() {
       map(.key as $path | (identity($path; .value)) + {
         path: $path,
         narSize: .value.narSize,
+        explicit: any($roots[$path].sources[]?; startswith("option:") | not),
         previewSource: (.value.previewSource // "confirmed")
       }) |
       sort_by(.name) | group_by(.name) |
       map({
         key: .[0].name,
         value: {
-          versions: (map(if .version == "" then "unversioned" else .version end) | unique | sort),
+          versions: (map(.version | select(. != "")) | unique | sort),
           entries: (map({path, narSize, previewSource}) | sort_by(.path)),
           narSize: ([.[].narSize | select(type == "number")] | add // 0),
           sizeKnown: all(.[]; .narSize | type == "number"),
+          userFacing: any(.[]; .explicit or .version != ""),
           confidence: confidence(.)
         }
       }) | from_entries;
@@ -449,6 +474,7 @@ compare_closures() {
         .narSize | select(type == "number")] | add // 0) as $removed |
       {
         name: $name,
+        userFacing: (($after[$name].userFacing // false) or ($before[$name].userFacing // false)),
         kind: (if $before[$name] == null then "added"
                elif $after[$name] == null then "removed"
                elif $before[$name].versions != $after[$name].versions then "version"
@@ -463,8 +489,10 @@ compare_closures() {
         deltaBytes: ($added - $removed)
       }
     ] as $changes |
-    ($changes | map(select(.kind != "rebuild"))) as $packages |
-    ($changes | map(select(.kind == "rebuild"))) as $rebuildChanges |
+    ($changes | map(select(.userFacing))) as $visibleChanges |
+    ($changes | map(select(.userFacing | not))) as $systemChanges |
+    ($visibleChanges | map(select(.kind != "rebuild"))) as $packages |
+    ($visibleChanges | map(select(.kind == "rebuild"))) as $rebuildChanges |
     {
       changes: $packages,
       rebuilds: {
@@ -479,6 +507,15 @@ compare_closures() {
           versions: (.after.versions // .before.versions // []),
           confidence
         }))
+      },
+      system: {
+        count: ($systemChanges | length),
+        addedBytes: ($systemChanges | map(.addedBytes) | add // 0),
+        removedBytes: ($systemChanges | map(.removedBytes) | add // 0),
+        deltaBytes: (($systemChanges | map(.addedBytes) | add // 0)
+          - ($systemChanges | map(.removedBytes) | add // 0)),
+        sizeKnown: all($systemChanges[]; .sizeKnown),
+        items: ($systemChanges | map({name, kind}) | sort_by(.name))
       },
       baselineClosureBytes: ($baseline[0] | to_entries | map(.value.narSize // 0) | add // 0),
       candidateClosureBytes: ($candidate[0] | to_entries | map(.value.narSize // 0) | add // 0)
@@ -613,16 +650,29 @@ run_preview() {
   select_configuration "$flake"
   local installable="$flake#nixosConfigurations.\"$configuration\""
   local system_installable="$installable.config.system.build.toplevel"
-  local declared_deriver
-  if ! declared_deriver=$(nix --store "$store" eval --raw --no-write-lock-file \
-    "$system_installable.drvPath" 2>"$temporary_directory/declared.log"); then
+
+  [[ -f "$discovery_file" ]] || \
+    fail "Package discovery rules are missing at $discovery_file." "" 2
+  local discovery_expression
+  discovery_expression=$(<"$discovery_file")
+  log "Reading packages from the current configuration."
+  if ! nix --store "$store" eval --json --no-write-lock-file \
+    --apply "$discovery_expression" "$installable" \
+    >"$temporary_directory/working-discovery-raw.json" \
+    2>"$temporary_directory/declared.log"; then
     fail "Could not read your NixOS configuration." \
       "$({ cat "$temporary_directory/declared.log"; } 2>/dev/null)" 2
   fi
+  normalise_discovery "$temporary_directory/working-discovery-raw.json" \
+    "$temporary_directory/working-discovery.json"
+  local declared_deriver
+  declared_deriver=$(jq -er '.system.drvPath' "$temporary_directory/working-discovery.json")
   local baseline_deriver
   baseline_deriver=$(deriver_for "$baseline_system")
 
   local baseline_lock="$temporary_directory/baseline.lock"
+  local baseline_discovery="$temporary_directory/baseline-discovery.json"
+  printf '{"packages":[]}\n' >"$baseline_discovery"
   local input_baseline_source=runningNixpkgsFallback
   local input_baseline_complete=false
   local record_system_lock=false
@@ -631,12 +681,16 @@ run_preview() {
     input_baseline_source=workingConfiguration
     input_baseline_complete=true
     record_system_lock=true
+    install -m 0644 "$temporary_directory/working-discovery.json" "$baseline_discovery"
   elif [[ -f "$state_path" ]] && jq -e \
     --arg repository "$repository" --arg system "$baseline_system" '
       .schemaVersion == 1 and .repository == $repository and .system == $system
       and (.lock | type == "object")
     ' "$state_path" >/dev/null 2>&1; then
     jq '.lock' "$state_path" >"$baseline_lock"
+    if jq -e '.discovery.packages | type == "array"' "$state_path" >/dev/null 2>&1; then
+      jq '.discovery' "$state_path" >"$baseline_discovery"
+    fi
     input_baseline_source=savedSystemLock
     input_baseline_complete=true
   else
@@ -651,10 +705,6 @@ run_preview() {
   make_input_changes "$baseline_lock" "$candidate_lock" "$baseline_revision" \
     "$input_baseline_complete" "$temporary_directory/inputs.json"
 
-  [[ -f "$discovery_file" ]] || \
-    fail "Package discovery rules are missing at $discovery_file." "" 2
-  local discovery_expression
-  discovery_expression=$(<"$discovery_file")
   log "Reading packages from the updated configuration."
   if ! nix --store "$store" eval --json --no-write-lock-file \
     --reference-lock-file "$candidate_lock" --apply "$discovery_expression" \
@@ -702,7 +752,8 @@ run_preview() {
     : >"$temporary_directory/local-builds.txt"
   else
     filter_preview_discovery "$temporary_directory/baseline.json" \
-      "$temporary_directory/discovery.json" "$temporary_directory/preview-discovery.json"
+      "$temporary_directory/discovery.json" "$baseline_discovery" \
+      "$temporary_directory/preview-discovery.json"
     local discovered_count preview_count
     discovered_count=$(jq '.packages | length' "$temporary_directory/discovery.json")
     preview_count=$(jq '.packages | length' "$temporary_directory/preview-discovery.json")
@@ -736,12 +787,14 @@ run_preview() {
   if [[ "$record_system_lock" == true ]]; then
     jq -n --arg repository "$repository" --arg system "$baseline_system" \
       --arg recordedAt "$(date --iso-8601=seconds)" \
-      --slurpfile lock "$repository/flake.lock" '{
+      --slurpfile lock "$repository/flake.lock" \
+      --slurpfile discovery "$temporary_directory/working-discovery.json" '{
         schemaVersion: 1,
         repository: $repository,
         system: $system,
         recordedAt: $recordedAt,
-        lock: $lock[0]
+        lock: $lock[0],
+        discovery: $discovery[0]
       }' >"$temporary_directory/system-lock.json"
     write_json_file "$temporary_directory/system-lock.json" "$state_path"
   fi
@@ -805,7 +858,8 @@ run_preview() {
       discovery: $discovery[0],
       packages: {
         changes: $diff.changes,
-        rebuilds: $diff.rebuilds
+        rebuilds: $diff.rebuilds,
+        system: $diff.system
       },
       buildPlan: {
         localBuildCount: ($localBuilds[0] | length),
@@ -828,7 +882,7 @@ run_preview() {
         sizeKnown: $buildSizeKnown
       },
       updatesAvailable: (($inputs[0] | length) + ($diff.changes | length)
-        + ($diff.rebuilds.count // 0) > 0)
+        + ($diff.rebuilds.count // 0) + ($diff.system.count // 0) > 0)
     }
   ' >"$temporary_directory/report.json"
 
@@ -918,12 +972,24 @@ run_build() {
   verified_at=$(date --iso-8601=seconds)
   jq --arg generatedAt "$verified_at" --arg candidateSystem "$candidate_system" \
     --argjson elapsed "$elapsed" --slurpfile comparison "$temporary_directory/comparison.json" '
+    def packageNames($packages):
+      (([$packages.changes[].name] + [$packages.rebuilds.items[].name]
+        + [$packages.system.items[].name]) | unique | sort);
     ($comparison[0]) as $diff |
+    packageNames(.packages) as $previewNames |
+    packageNames($diff) as $verifiedNames |
     .previewGeneratedAt = .generatedAt |
     .generatedAt = $generatedAt |
     .analysis.mode = "verified" |
     .analysis.candidateClosureComplete = true |
-    .packages = {changes: $diff.changes, rebuilds: $diff.rebuilds} |
+    .analysis.previewComparison = {
+      previewCount: ($previewNames | length),
+      verifiedCount: ($verifiedNames | length),
+      matched: ($previewNames - ($previewNames - $verifiedNames)),
+      missedByPreview: ($verifiedNames - $previewNames),
+      previewOnly: ($previewNames - $verifiedNames)
+    } |
+    .packages = {changes: $diff.changes, rebuilds: $diff.rebuilds, system: $diff.system} |
     .system.candidate = $candidateSystem |
     .build = {
       elapsedSeconds: $elapsed,
@@ -933,8 +999,14 @@ run_build() {
       sizeKnown: true
     } |
     .updatesAvailable = ((.inputs | length) + ($diff.changes | length)
-      + ($diff.rebuilds.count // 0) > 0)
+      + ($diff.rebuilds.count // 0) + ($diff.system.count // 0) > 0)
   ' "$preview" >"$temporary_directory/verified-report.json"
+  if [[ -n "$preview_snapshot_path" ]]; then
+    write_json_file "$preview" "$preview_snapshot_path"
+  fi
+  if [[ -n "$verified_snapshot_path" ]]; then
+    write_json_file "$temporary_directory/verified-report.json" "$verified_snapshot_path"
+  fi
   write_report "$temporary_directory/verified-report.json"
   write_operation_status succeeded "Update is ready to install" ""
   log "The update is ready to install after a ${elapsed}s build."
@@ -956,6 +1028,16 @@ while (($#)); do
       candidate_lock_path=$2
       shift 2
       ;;
+    --preview-snapshot)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      preview_snapshot_path=$2
+      shift 2
+      ;;
+    --verified-snapshot)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      verified_snapshot_path=$2
+      shift 2
+      ;;
     --status)
       (($# >= 2)) || { usage >&2; exit 2; }
       status_path=$2
@@ -966,7 +1048,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.6"
+      echo "nixos-update-checker-service 4.1.7"
       exit 0
       ;;
     --*)

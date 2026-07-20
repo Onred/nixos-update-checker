@@ -4,5 +4,8 @@
   "/nix/store/dddddddddddddddddddddddddddddddd-multi-2": { "narSize": 10 },
   "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-multi-3": { "narSize": 15 },
   "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-multi-4": { "narSize": 15 },
-  "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-added-1": { "narSize": 50 }
+  "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-added-1": { "narSize": 50 },
+  "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-active-option-2.0": { "narSize": 13 },
+  "/nix/store/ssssssssssssssssssssssssssssssss-command-not-found": { "narSize": 5 },
+  "/nix/store/tttttttttttttttttttttttttttttttt-nixos-manual": { "narSize": 7 }
 }

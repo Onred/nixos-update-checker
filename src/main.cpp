@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.6";
+constexpr auto Version = "4.1.7";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -158,7 +158,7 @@ QString versionSummary(const QJsonObject &change)
     const QStringList current = versions(change.value("before"));
     const QStringList candidate = versions(change.value("after"));
     if (candidate.isEmpty())
-        return "Unversioned";
+        return "Changed";
     if (candidate.size() == 1)
         return candidate.first();
 
@@ -174,11 +174,12 @@ QString versionSummary(const QJsonObject &change)
     return first + " +" + QString::number(candidate.size() - 1) + " more";
 }
 
-QString versionLines(const QString &title, const QStringList &values)
+QString versionLines(
+    const QString &title, const QStringList &values, const QString &emptyText)
 {
     QStringList lines{title + ":"};
     if (values.isEmpty())
-        lines << "  none";
+        lines << "  " + emptyText;
     else
         for (const QString &value : values)
             lines << "  " + value;
@@ -209,9 +210,11 @@ QString packageDetails(const QJsonObject &change)
     QStringList lines{
         change.value("name").toString(),
         "",
-        versionLines("Current versions", versions(before)),
+        versionLines("Current versions", versions(before),
+            before.isObject() ? "version not provided" : "not installed"),
         "",
-        versionLines("New versions", versions(after)),
+        versionLines("New versions", versions(after),
+            after.isObject() ? "version not provided" : "removed"),
         "",
     };
     if (change.value("sizeKnown").toBool()) {
@@ -258,7 +261,32 @@ QString rebuildDetails(const QJsonObject &rebuilds)
         QStringList itemVersions;
         for (const QJsonValue &version : item.value("versions").toArray())
             itemVersions << version.toString();
-        lines << item.value("name").toString() + " — " + itemVersions.join(", ");
+        const QString version = itemVersions.isEmpty()
+            ? QStringLiteral("version not provided")
+            : itemVersions.join(", ");
+        lines << item.value("name").toString() + " — " + version;
+    }
+    return lines.join('\n');
+}
+
+QString systemDetails(const QJsonObject &system)
+{
+    QStringList lines{
+        "NixOS system data",
+        "",
+        "Generated system files, documentation, and indexes changed.",
+        "These are maintained by NixOS and do not have useful package versions.",
+        "",
+    };
+    if (system.value("sizeKnown").toBool()) {
+        lines << "Estimated storage change: "
+                     + formatBytes(system.value("deltaBytes").toInteger(), true)
+              << "New files: " + formatBytes(system.value("addedBytes").toInteger())
+              << "Files no longer needed by this system: "
+                     + formatBytes(system.value("removedBytes").toInteger())
+              << "Actual disk use may differ because Nix can reuse or retain these files.";
+    } else {
+        lines << "Storage change will be available after the update is built.";
     }
     return lines.join('\n');
 }
@@ -945,6 +973,8 @@ private:
         const QJsonArray changes = packages.value("changes").toArray();
         const QJsonObject rebuilds = packages.value("rebuilds").toObject();
         const int rebuildCount = rebuilds.value("count").toInt();
+        const QJsonObject system = packages.value("system").toObject();
+        const int systemCount = system.value("count").toInt();
 
         updates_->clearVisualState();
         updates_->setRowCount(0);
@@ -970,12 +1000,20 @@ private:
             addRow("Rebuilt packages", QString::number(rebuildCount) + " unchanged",
                 size, rebuildDetails(rebuilds));
         }
+        if (systemCount > 0) {
+            const QString size = system.value("sizeKnown").toBool()
+                ? formatBytes(system.value("deltaBytes").toInteger(), true)
+                : QStringLiteral("—");
+            addRow("NixOS system data", plural(systemCount, "change"), size,
+                systemDetails(system));
+        }
         if (updates_->rowCount() == 0)
             addRow("No updates available", "", "", "");
 
         const QString text = plural(inputs.size(), "source update") + "  ·  "
             + plural(changes.size(), "package change") + "  ·  "
-            + plural(rebuildCount, "rebuilt package");
+            + plural(rebuildCount, "rebuilt package")
+            + (systemCount > 0 ? "  ·  " + plural(systemCount, "system change") : QString{});
         summaryText_ = text;
         summary_->setText(text);
         updatesAvailable_ = report.value("updatesAvailable").toBool();

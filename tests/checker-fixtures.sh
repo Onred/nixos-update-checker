@@ -77,6 +77,9 @@ jq -e '
   (.packages.changes | map(.name) | index("unused-option-package") | not) and
   all(.packages.changes[]; .sizeKnown == false) and
   .packages.rebuilds.sizeKnown == false and
+  .packages.system.count == 2 and .packages.system.sizeKnown == false and
+  ([.packages.changes[].after.versions[]?, .packages.rebuilds.items[].versions[]?]
+    | index("unversioned") | not) and
   (.packages.changes[] | select(.name == "firefox") | .confidence) == "confirmed"
 ' "$report" >/dev/null
 if grep -q 'unused-option-package' "$work/nix-invocations"; then
@@ -92,6 +95,18 @@ jq -e '
   .schemaVersion == 1 and .state == "succeeded" and
   .operation == "refresh" and .message == "Update check finished"
 ' "$work/status.json" >/dev/null
+
+# An option-derived package is safe to preview when the same option source
+# supplied a package that is proven to exist in the baseline closure.
+: >"$work/nix-invocations"
+FAKE_DECLARED_DERIVER=/nix/store/boot.drv \
+  run_checker --report "$work/active-option-report.json" \
+    --candidate-lock "$work/active-option.lock" "$work/repository"
+grep -q 'active-option-2.0' "$work/nix-invocations"
+if grep -q 'unused-option-package' "$work/nix-invocations"; then
+  echo "Preview queried an option source absent from the baseline closure" >&2
+  exit 1
+fi
 
 # The post-install refresh has its own operation state so the GUI can present
 # it as the final phase of installation, even after the GUI restarts.
@@ -199,7 +214,10 @@ if grep -Eq 'config show|build .*--dry-run|derivation show' "$work/nix-invocatio
 fi
 
 # Building is explicit and replaces the preview with an exact closure report.
-run_checker --build --report "$report" --candidate-lock "$candidate_lock" "$work/repository"
+# The latest preview/verified pair remains available for detection diagnostics.
+run_checker --build --report "$report" --candidate-lock "$candidate_lock" \
+  --preview-snapshot "$work/last-build-preview.json" \
+  --verified-snapshot "$work/last-build-verified.json" "$work/repository"
 jq -e '
   .schemaVersion == 3 and .status == "success" and
   .analysis.mode == "verified" and
@@ -209,8 +227,15 @@ jq -e '
   (.packages.changes[] | select(.name == "added") | .deltaBytes) == 50 and
   (.packages.changes[] | select(.name == "removed") | .deltaBytes) == -30 and
   .packages.rebuilds.count == 1 and
-  .packages.rebuilds.deltaBytes == 1
+  .packages.rebuilds.deltaBytes == 1 and
+  .packages.system.count == 2 and .packages.system.deltaBytes == 2 and
+  (.analysis.previewComparison.missedByPreview | index("removed")) != null
 ' "$report" >/dev/null
+jq -e '.analysis.mode == "preview"' "$work/last-build-preview.json" >/dev/null
+jq -e '
+  .analysis.mode == "verified" and
+  .analysis.previewComparison.verifiedCount >= .analysis.previewComparison.previewCount
+' "$work/last-build-verified.json" >/dev/null
 jq -e '.state == "succeeded" and .operation == "build"' "$work/status.json" >/dev/null
 
 # Incomplete historical source data must not reject an exact, verified build.

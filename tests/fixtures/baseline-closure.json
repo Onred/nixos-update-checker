@@ -3,5 +3,8 @@
   "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40": { "narSize": 20 },
   "/nix/store/cccccccccccccccccccccccccccccccc-multi-1": { "narSize": 10 },
   "/nix/store/dddddddddddddddddddddddddddddddd-multi-2": { "narSize": 10 },
-  "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-removed-1": { "narSize": 30 }
+  "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-removed-1": { "narSize": 30 },
+  "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-active-option-1.0": { "narSize": 12 },
+  "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-command-not-found": { "narSize": 4 },
+  "/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-nixos-manual": { "narSize": 6 }
 }

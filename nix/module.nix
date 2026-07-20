@@ -10,6 +10,8 @@ let
   package = import ./package.nix { inherit pkgs; };
   report = "/var/lib/nixos-update-checker/report.json";
   candidateLock = "/var/lib/nixos-update-checker/candidate.lock";
+  lastBuildPreview = "/var/lib/nixos-update-checker/last-build-preview.json";
+  lastBuildVerified = "/var/lib/nixos-update-checker/last-build-verified.json";
   status = "/var/lib/nixos-update-checker/status.json";
   lock = "/var/lib/nixos-update-checker/operation.lock";
   inhibit =
@@ -246,6 +248,10 @@ in
             report
             "--candidate-lock"
             candidateLock
+            "--preview-snapshot"
+            lastBuildPreview
+            "--verified-snapshot"
+            lastBuildVerified
             "--status"
             status
             cfg.repository
