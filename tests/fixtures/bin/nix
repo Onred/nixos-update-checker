@@ -45,14 +45,27 @@ elif [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
 {"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"$firefox_version","storePath":"$firefox_path","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"$glibc_path","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"$active_version","storePath":"$active_path","drvPath":"/nix/store/active-option.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"$firefox_version","storePath":"/nix/store/llllllllllllllllllllllllllllllll-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"}]}
 EOF
   elif [[ "$last" == *"#nixosConfigurations" ]]; then
-    echo '[{"name":"desktop","hostName":"fixture"}]'
+    echo "${FAKE_CONFIGURATIONS:-[\"desktop\",\"vm\"]}"
   else
+    if [[ ${FAKE_CURRENT_CONFIG_FAILURE:-} == 1 ]]; then
+      echo "The option programs.fixture does not exist." >&2
+      exit 2
+    fi
     cat <<EOF
 {"system":{"drvPath":"${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}","storePath":"${FAKE_RUNNING_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"1.0","storePath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-1.0","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"1.0","storePath":"/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-active-option-1.0","drvPath":"/nix/store/active-option.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/oooooooooooooooooooooooooooooooo-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"1.0","storePath":"/nix/store/pppppppppppppppppppppppppppppppp-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"}]}
 EOF
   fi
 elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then
-  if [[ "$arguments" == *" --reference-lock-file "* ]]; then
+  if [[ "$last" == *".config.networking.hostName" ]]; then
+    if [[ "$last" == *'"desktop"'* ]]; then
+      echo fixture
+    elif [[ "$last" == *'"vm"'* ]]; then
+      echo fixture-vm
+    else
+      echo "unknown fixture configuration" >&2
+      exit 2
+    fi
+  elif [[ "$arguments" == *" --reference-lock-file "* ]]; then
     echo /nix/store/candidate.drv
   else
     echo "${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}"

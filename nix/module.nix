@@ -14,6 +14,10 @@ let
   lastBuildVerified = "/var/lib/nixos-update-checker/last-build-verified.json";
   status = "/var/lib/nixos-update-checker/status.json";
   lock = "/var/lib/nixos-update-checker/operation.lock";
+  configurationArguments = lib.optionals (cfg.configuration != null) [
+    "--configuration"
+    cfg.configuration
+  ];
   inhibit =
     reason: command:
     [
@@ -45,16 +49,19 @@ let
 
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = lib.escapeShellArgs [
-          "${package}/bin/nixos-update-checker-service"
-          "--report"
-          report
-          "--candidate-lock"
-          candidateLock
-          "--status"
-          status
-          cfg.repository
-        ];
+        ExecStart = lib.escapeShellArgs (
+          [
+            "${package}/bin/nixos-update-checker-service"
+            "--report"
+            report
+            "--candidate-lock"
+            candidateLock
+            "--status"
+            status
+          ]
+          ++ configurationArguments
+          ++ [ cfg.repository ]
+        );
         User = "root";
         StateDirectory = "nixos-update-checker";
         StateDirectoryMode = "0755";
@@ -160,6 +167,17 @@ in
       description = "Absolute path to the flake-based NixOS configuration.";
     };
 
+    configuration = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching ".+");
+      default = null;
+      example = "desktop";
+      description = ''
+        Name of this machine in the flake's nixosConfigurations output. Leave
+        this unset to reuse the last successful selection or detect it from
+        the current hostname.
+      '';
+    };
+
     cpuQuota = lib.mkOption {
       type = lib.types.nullOr (lib.types.strMatching "[1-9][0-9]*%");
       default = "50%";
@@ -241,21 +259,24 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = lib.escapeShellArgs (
-          inhibit "Building the selected NixOS update" [
-            "${package}/bin/nixos-update-checker-service"
-            "--build"
-            "--report"
-            report
-            "--candidate-lock"
-            candidateLock
-            "--preview-snapshot"
-            lastBuildPreview
-            "--verified-snapshot"
-            lastBuildVerified
-            "--status"
-            status
-            cfg.repository
-          ]
+          inhibit "Building the selected NixOS update" (
+            [
+              "${package}/bin/nixos-update-checker-service"
+              "--build"
+              "--report"
+              report
+              "--candidate-lock"
+              candidateLock
+              "--preview-snapshot"
+              lastBuildPreview
+              "--verified-snapshot"
+              lastBuildVerified
+              "--status"
+              status
+            ]
+            ++ configurationArguments
+            ++ [ cfg.repository ]
+          )
         );
         User = "root";
         StateDirectory = "nixos-update-checker";

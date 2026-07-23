@@ -9,6 +9,8 @@ candidate_lock_path=""
 preview_snapshot_path=""
 verified_snapshot_path=""
 status_path=${NIXOS_UPDATE_CHECKER_STATUS:-}
+requested_configuration=${NIXOS_UPDATE_CHECKER_CONFIGURATION:-}
+configuration=""
 repository=""
 temporary_directory=""
 started_at=""
@@ -24,6 +26,7 @@ usage() {
   cat <<'EOF'
 Usage: nixos-update-checker-service [--build] [--report PATH]
                                     [--candidate-lock PATH] [--status PATH]
+                                    [--configuration NAME]
                                     [--preview-snapshot PATH]
                                     [--verified-snapshot PATH]
                                     REPOSITORY
@@ -542,25 +545,89 @@ current_system_state() {
 
 select_configuration() {
   local flake=$1
-  local discovery_expression
-  # ${name} must reach Nix literally.
-  # shellcheck disable=SC2016
-  discovery_expression='configs: map (name: let value = builtins.tryEval configs.${name}.config.networking.hostName; in { inherit name; hostName = if value.success then value.value else ""; }) (builtins.attrNames configs)'
-  local configurations
-  if ! configurations=$(nix --store "$store" eval --json --no-write-lock-file \
-    --apply "$discovery_expression" "$flake#nixosConfigurations" \
+  local names
+  if ! names=$(nix --store "$store" eval --json --no-write-lock-file \
+    --apply builtins.attrNames "$flake#nixosConfigurations" \
     2>"$temporary_directory/configurations.log"); then
     fail "Could not find NixOS configurations in the selected configuration folder." \
       "$({ cat "$temporary_directory/configurations.log"; } 2>/dev/null)" 2
   fi
+  [[ "$(jq 'length' <<<"$names")" -gt 0 ]] || \
+    fail "No NixOS configurations were found in the selected configuration folder." "" 2
+
+  if [[ -n "$requested_configuration" ]]; then
+    if jq -e --arg name "$requested_configuration" 'index($name) != null' \
+      <<<"$names" >/dev/null; then
+      configuration=$requested_configuration
+      return
+    fi
+    fail "The configured NixOS configuration ($requested_configuration) was not found." \
+      "Available configurations: $(jq -c '.' <<<"$names")" 2
+  fi
+
+  local saved_configuration=""
+  if [[ -n "$report_path" && -f "$report_path" ]]; then
+    saved_configuration=$(jq -r --arg repository "$repository" '
+      select(.repository == $repository) | .configuration // empty
+    ' "$report_path" 2>/dev/null || true)
+  fi
+  if [[ -n "$saved_configuration" ]] && \
+    jq -e --arg name "$saved_configuration" 'index($name) != null' \
+      <<<"$names" >/dev/null; then
+    configuration=$saved_configuration
+    return
+  fi
+
+  if jq -e --arg hostname "$hostname" 'index($hostname) != null' \
+    <<<"$names" >/dev/null; then
+    configuration=$hostname
+    return
+  fi
+
+  if [[ "$(jq 'length' <<<"$names")" -eq 1 ]]; then
+    configuration=$(jq -r '.[0]' <<<"$names")
+    return
+  fi
+
+  local configurations_file="$temporary_directory/configurations.jsonl"
+  local errors_file="$temporary_directory/configuration-errors.log"
+  local name value index=0
+  : >"$configurations_file"
+  : >"$errors_file"
+  while IFS= read -r name; do
+    if value=$(nix --store "$store" eval --raw --no-write-lock-file \
+      "$flake#nixosConfigurations.\"$name\".config.networking.hostName" \
+      2>"$temporary_directory/configuration-$index.log"); then
+      jq -nc --arg name "$name" --arg hostName "$value" \
+        '{name: $name, hostName: $hostName}' >>"$configurations_file"
+    else
+      jq -nc --arg name "$name" \
+        '{name: $name, hostName: null}' >>"$configurations_file"
+      {
+        printf 'Configuration %s:\n' "$name"
+        cat "$temporary_directory/configuration-$index.log"
+        printf '\n'
+      } >>"$errors_file"
+    fi
+    ((index += 1))
+  done < <(jq -r '.[]' <<<"$names")
+
+  local configurations
+  configurations=$(jq -s '.' "$configurations_file")
   configuration=$(jq -r --arg hostname "$hostname" '
-    if length == 1 then .[0].name
-    else ([.[] | select(.hostName == $hostname)] | if length == 1 then .[0].name else empty end)
-    end
+    [.[] | select(.hostName == $hostname)] |
+    if length == 1 then .[0].name else empty end
   ' <<<"$configurations")
-  [[ -n "$configuration" ]] || fail \
-    "Could not find a NixOS configuration for this computer ($hostname)." \
-    "Available configurations: $(jq -c '.' <<<"$configurations")" 2
+  [[ -n "$configuration" ]] && return
+
+  local diagnostics
+  diagnostics="Available configurations: $(jq -c '.' <<<"$configurations")"
+  if [[ -s "$errors_file" ]]; then
+    diagnostics+=$'\n\n'
+    diagnostics+=$(<"$errors_file")
+  fi
+  fail "Could not determine which NixOS configuration belongs to this computer." \
+    "$diagnostics"$'\nSet programs.nixos-update-checker.configuration when automatic selection is ambiguous.' 2
 }
 
 make_input_changes() {
@@ -660,7 +727,7 @@ run_preview() {
     --apply "$discovery_expression" "$installable" \
     >"$temporary_directory/working-discovery-raw.json" \
     2>"$temporary_directory/declared.log"; then
-    fail "Could not read your NixOS configuration." \
+    fail "Your NixOS configuration contains an error." \
       "$({ cat "$temporary_directory/declared.log"; } 2>/dev/null)" 2
   fi
   normalise_discovery "$temporary_directory/working-discovery-raw.json" \
@@ -1043,12 +1110,17 @@ while (($#)); do
       status_path=$2
       shift 2
       ;;
+    --configuration)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      requested_configuration=$2
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.7"
+      echo "nixos-update-checker-service 4.1.8"
       exit 0
       ;;
     --*)

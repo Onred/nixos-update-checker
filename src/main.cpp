@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.7";
+constexpr auto Version = "4.1.8";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {

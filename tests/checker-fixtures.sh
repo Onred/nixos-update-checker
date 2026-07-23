@@ -37,7 +37,7 @@ run_checker() {
     NIXOS_UPDATE_CHECKER_PROFILE_DIRECTORY="$work/profiles" \
     NIXOS_UPDATE_CHECKER_STATE="$work/state/system-lock.json" \
     NIXOS_UPDATE_CHECKER_FINALIZING="${NIXOS_UPDATE_CHECKER_FINALIZING:-false}" \
-    NIXOS_UPDATE_CHECKER_HOSTNAME=fixture \
+    NIXOS_UPDATE_CHECKER_HOSTNAME="${TEST_HOSTNAME:-fixture}" \
     NIXOS_UPDATE_CHECKER_LOCK="${NIXOS_UPDATE_CHECKER_LOCK:-}" \
     NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT="${NIXOS_UPDATE_CHECKER_LOCK_TIMEOUT:-30}" \
     NIXOS_UPDATE_CHECKER_BASELINE_NIXPKGS_REVISION=old-nixpkgs-revision \
@@ -82,6 +82,9 @@ jq -e '
     | index("unversioned") | not) and
   (.packages.changes[] | select(.name == "firefox") | .confidence) == "confirmed"
 ' "$report" >/dev/null
+jq -e '
+  .configuration == "desktop"
+' "$report" >/dev/null
 if grep -q 'unused-option-package' "$work/nix-invocations"; then
   echo "Preview queried an unconfirmed package-option hint" >&2
   exit 1
@@ -94,6 +97,22 @@ fi
 jq -e '
   .schemaVersion == 1 and .state == "succeeded" and
   .operation == "refresh" and .message == "Update check finished"
+' "$work/status.json" >/dev/null
+
+# An explicit output name avoids hostname discovery and supports flakes whose
+# output name does not match the machine hostname.
+run_checker --configuration desktop --report "$work/configured-report.json" \
+  --candidate-lock "$work/configured.lock" "$work/repository"
+jq -e '.configuration == "desktop"' "$work/configured-report.json" >/dev/null
+
+if run_checker --configuration missing --report "$work/missing-report.json" \
+  --candidate-lock "$work/missing.lock" "$work/repository" >/dev/null 2>&1; then
+  echo "Expected a missing configured output to fail" >&2
+  exit 1
+fi
+jq -e '
+  .state == "failed" and
+  .message == "The configured NixOS configuration (missing) was not found."
 ' "$work/status.json" >/dev/null
 
 # An option-derived package is safe to preview when the same option source
@@ -122,6 +141,42 @@ jq -e '
 # separately and must leave the last successful report and candidate untouched.
 report_hash=$(sha256sum "$report")
 candidate_hash=$(sha256sum "$candidate_lock")
+if FAKE_CURRENT_CONFIG_FAILURE=1 run_checker --configuration desktop \
+  --report "$report" --candidate-lock "$candidate_lock" \
+  "$work/repository" >/dev/null 2>&1; then
+  echo "Expected the invalid current configuration to fail" >&2
+  exit 1
+fi
+[[ "$report_hash" == "$(sha256sum "$report")" ]]
+[[ "$candidate_hash" == "$(sha256sum "$candidate_lock")" ]]
+jq -e '
+  .state == "failed" and .operation == "refresh" and
+  .message == "Your NixOS configuration contains an error." and
+  (.diagnostics | contains("programs.fixture"))
+' "$work/status.json" >/dev/null
+
+# A flake output named after the live host is selected without evaluating every
+# machine just to discover its hostname. Configuration errors then remain
+# visible as configuration errors.
+: >"$work/nix-invocations"
+if TEST_HOSTNAME=nixos FAKE_CONFIGURATIONS='["nixos","vm"]' \
+  FAKE_CURRENT_CONFIG_FAILURE=1 run_checker \
+  --report "$work/exact-name-error-report.json" \
+  --candidate-lock "$work/exact-name-error.lock" \
+  "$work/repository" >/dev/null 2>&1; then
+  echo "Expected the exact-name configuration error to fail" >&2
+  exit 1
+fi
+jq -e '
+  .state == "failed" and
+  .message == "Your NixOS configuration contains an error." and
+  (.diagnostics | contains("programs.fixture"))
+' "$work/status.json" >/dev/null
+if grep -q '.config.networking.hostName' "$work/nix-invocations"; then
+  echo "Exact-name selection evaluated unrelated configuration hostnames" >&2
+  exit 1
+fi
+
 if FAKE_DISCOVERY_FAILURE=1 run_checker --report "$report" \
   --candidate-lock "$candidate_lock" "$work/repository" >/dev/null 2>&1; then
   echo "Expected invalid configuration discovery to fail" >&2

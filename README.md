@@ -56,12 +56,13 @@ six hours, with up to five minutes of randomized delay. A systemd path unit also
 starts the same low-priority check whenever the default system profile changes
 outside this application.
 
-Only four module options are exposed:
+Only five module options are exposed:
 
 | Option | Default | Purpose |
 |---|---:|---|
 | `enable` | `false` | Install and enable the checker. |
 | `repository` | `/etc/nixos` | Absolute path to the NixOS flake. |
+| `configuration` | `null` | Optional name under `nixosConfigurations` when automatic selection is ambiguous. |
 | `cpuQuota` | `50%` | Aggregate CPU quota for background checks; `null` disables it. |
 | `extraPackages` | `{}` | Named packages to preview when automatic discovery cannot find them. |
 
@@ -69,6 +70,15 @@ The quota applies only to automatic previews, which can still contain Nix
 evaluation work. Set `cpuQuota = null` to disable that throttle while retaining
 low CPU/I/O weights and idle I/O scheduling. Manual refreshes and explicit
 builds have no quota.
+
+The checker remembers the last successfully selected NixOS configuration. It
+also recognizes a configuration whose output name or declared hostname matches
+the live hostname. Set `configuration` only when a multi-machine flake cannot
+be selected unambiguously:
+
+```nix
+programs.nixos-update-checker.configuration = "desktop";
+```
 
 Discovery starts with the kernel, Nix, systemd, active NVIDIA driver, Ollama,
 system/user/font packages, systemd service paths, and active package-valued
