@@ -79,7 +79,7 @@ if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
   exit 0
 fi
 if [[ ${1:-} == "--version" ]]; then
-  echo "nixos-update-checker-apply 4.1.8"
+  echo "nixos-update-checker-apply 4.1.9"
   exit 0
 fi
 if [[ ${1:-} == "--boot" ]]; then

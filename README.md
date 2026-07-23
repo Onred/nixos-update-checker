@@ -146,6 +146,8 @@ and unchanged-version rebuilds are represented by one aggregate row. Long
 version lists remain short in the table and are shown in full in the details
 area. Generated unversioned outputs such as NixOS documentation and indexes are
 grouped into one **NixOS system data** row instead of being presented as packages.
+Its Details view lists the individual generated changes. Rebuild and system-data
+counts stay out of the window summary and tray tooltip.
 
 Verified reports show signed net closure change: paths added to the candidate
 minus paths no longer referenced by it. Preview reports leave size unknown and

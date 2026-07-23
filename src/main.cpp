@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.8";
+constexpr auto Version = "4.1.9";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -287,6 +287,18 @@ QString systemDetails(const QJsonObject &system)
               << "Actual disk use may differ because Nix can reuse or retain these files.";
     } else {
         lines << "Storage change will be available after the update is built.";
+    }
+    lines << "" << "Included changes:";
+    for (const QJsonValue &value : system.value("items").toArray()) {
+        const QJsonObject item = value.toObject();
+        QString action = item.value("kind").toString();
+        if (action == "version")
+            action = "changed";
+        else if (action == "rebuild")
+            action = "rebuilt";
+        else if (action.isEmpty())
+            action = "changed";
+        lines << item.value("name").toString() + " — " + action;
     }
     return lines.join('\n');
 }
@@ -1010,13 +1022,19 @@ private:
         if (updates_->rowCount() == 0)
             addRow("No updates available", "", "", "");
 
-        const QString text = plural(inputs.size(), "source update") + "  ·  "
-            + plural(changes.size(), "package change") + "  ·  "
-            + plural(rebuildCount, "rebuilt package")
-            + (systemCount > 0 ? "  ·  " + plural(systemCount, "system change") : QString{});
+        const bool available = report.value("updatesAvailable").toBool();
+        QStringList summaryParts;
+        if (!inputs.isEmpty())
+            summaryParts << plural(inputs.size(), "source update");
+        if (!changes.isEmpty())
+            summaryParts << plural(changes.size(), "package change");
+        const QString text = summaryParts.isEmpty()
+            ? (available ? QStringLiteral("System update available")
+                         : QStringLiteral("System is up to date"))
+            : summaryParts.join("  ·  ");
         summaryText_ = text;
         summary_->setText(text);
-        updatesAvailable_ = report.value("updatesAvailable").toBool();
+        updatesAvailable_ = available;
         schemaSupported_ = true;
         reportStale_ = false;
         reportError_ = false;

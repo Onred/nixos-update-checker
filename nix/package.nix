@@ -2,7 +2,7 @@
 
 pkgs.stdenv.mkDerivation {
   pname = "nixos-update-checker";
-  version = "4.1.8";
+  version = "4.1.9";
 
   src = pkgs.lib.cleanSourceWith {
     src = ../.;
