@@ -34,15 +34,43 @@ elif [[ "$arguments" == *" eval "* && "$arguments" == *" --json "* ]]; then
     glibc_path=/nix/store/gggggggggggggggggggggggggggggggg-glibc-2.40
     active_version=2.0
     active_path=/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-active-option-2.0
+    libreoffice_path=/nix/store/9pyqnlv2r9qz2wlvpgda7zcp1k0ys971-libreoffice-25.8.5.2-wrapped
+    plasma_path=/nix/store/mr86mmghizv5fm6kn5d5wbhhii1ifi0r-plasma-workspace-6.7.3
+    plasma_sessions_path=/nix/store/ndw8m07pldhw8crxf9m5ndxpk4c1jl1w-plasma-workspace-6.7.3-sessions
+    nvidia_path=/nix/store/4xzs2h9c4km8vyb00ihlv9k85f11vwg4-nvidia-x11-610.43.03
+    nvidia_bin_path=/nix/store/9jivd9s9sgidwxraj5qldank4wvm5jsr-nvidia-x11-610.43.03-bin
+    nvidia_lib32_path=/nix/store/yys36d1h68ypcfjbzjl10vsrra2azfgk-nvidia-x11-610.43.03-lib32
+    nvidia_open_path=/nix/store/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd-nvidia-open-610.43.03-7.1.4
     if [[ ${FAKE_UNCHANGED_PACKAGES:-} == 1 ]]; then
       firefox_version=1.0
       firefox_path=/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-1.0
       glibc_path=/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40
       active_version=1.0
       active_path=/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-active-option-1.0
+      libreoffice_path=/nix/store/2akv85mki37vf527jzabd8a7p8kwnqf7-libreoffice-25.8.5.2-wrapped
+      plasma_path=/nix/store/1zrb8vx1al09dvk0rjylph0y7psbspwh-plasma-workspace-6.7.3
+      plasma_sessions_path=/nix/store/3xih9m9w3jdc0wckwqgagwcfgdckink1-plasma-workspace-6.7.3-sessions
+      nvidia_path=/nix/store/hzskfg26hi7nzf55yd5yyvivg53j86lj-nvidia-x11-610.43.03
+      nvidia_bin_path=/nix/store/2399zqfl0bcgcplmq0q26pmcgayyycgr-nvidia-x11-610.43.03-bin
+      nvidia_lib32_path=/nix/store/5ka60mra70vm4np5z2p7b887hn432hxb-nvidia-x11-610.43.03-lib32
+      nvidia_open_path=/nix/store/abababababababababababababababab-nvidia-open-610.43.03-7.1.4
     fi
     cat <<EOF
-{"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"$firefox_version","storePath":"$firefox_path","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"$glibc_path","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"$active_version","storePath":"$active_path","drvPath":"/nix/store/active-option.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"$firefox_version","storePath":"/nix/store/llllllllllllllllllllllllllllllll-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"}]}
+{"system":{"drvPath":"/nix/store/candidate.drv","storePath":"${FAKE_CANDIDATE_SYSTEM:?}"},"packages":[
+{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"$firefox_version","storePath":"$firefox_path","drvPath":"/nix/store/firefox.drv","position":"fixture"},
+{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"$glibc_path","drvPath":"/nix/store/glibc.drv","position":"fixture"},
+{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"$active_version","storePath":"$active_path","drvPath":"/nix/store/active-option.drv","position":"fixture"},
+{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},
+{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"$firefox_version","storePath":"/nix/store/llllllllllllllllllllllllllllllll-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"},
+{"source":"users.users.fixture.packages","label":"LibreOffice","name":"libreoffice","version":"25.8.5.2","storePath":"$libreoffice_path","drvPath":"/nix/store/libreoffice.drv","position":"fixture"},
+{"source":"environment.systemPackages","label":"Plasma Workspace","name":"plasma-workspace","version":"6.7.3","storePath":"$plasma_path","drvPath":"/nix/store/plasma-workspace.drv","position":"fixture"},
+{"source":"option:services.displayManager.sessionPackages","label":"Plasma session","name":"plasma-workspace","version":"6.7.3","storePath":"$plasma_sessions_path","drvPath":"/nix/store/plasma-workspace-sessions.drv","position":"fixture"},
+{"source":"option:hardware.nvidia.package","label":"hardware.nvidia.package","name":"nvidia-x11","version":"610.43.03","storePath":"$nvidia_path","drvPath":"/nix/store/nvidia-x11.drv","position":"fixture"},
+{"source":"environment.systemPackages","label":"NVIDIA binaries","name":"nvidia-x11","version":"610.43.03","storePath":"$nvidia_bin_path","drvPath":"/nix/store/nvidia-x11-bin.drv","position":"fixture"},
+{"source":"option:hardware.graphics.extraPackages32","label":"NVIDIA 32-bit libraries","name":"nvidia-x11","version":"610.43.03","storePath":"$nvidia_lib32_path","drvPath":"/nix/store/nvidia-x11-lib32.drv","position":"fixture"},
+{"source":"boot.extraModulePackages","label":"Kernel module","name":"nvidia-open","version":"610.43.03-7.1.4","storePath":"$nvidia_open_path","drvPath":"/nix/store/nvidia-open.drv","position":"fixture"},
+{"source":"option:services.selector.package","label":"Selector package","name":"selector-other","version":"1.0","storePath":"/nix/store/vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv-selector-other-1.0","drvPath":"/nix/store/selector-other.drv","position":"fixture"}
+]}
 EOF
   elif [[ "$last" == *"#nixosConfigurations" ]]; then
     echo "${FAKE_CONFIGURATIONS:-[\"desktop\",\"vm\"]}"
@@ -52,7 +80,21 @@ EOF
       exit 2
     fi
     cat <<EOF
-{"system":{"drvPath":"${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}","storePath":"${FAKE_RUNNING_SYSTEM:?}"},"packages":[{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"1.0","storePath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-1.0","drvPath":"/nix/store/firefox.drv","position":"fixture"},{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40","drvPath":"/nix/store/glibc.drv","position":"fixture"},{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"1.0","storePath":"/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-active-option-1.0","drvPath":"/nix/store/active-option.drv","position":"fixture"},{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/oooooooooooooooooooooooooooooooo-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"1.0","storePath":"/nix/store/pppppppppppppppppppppppppppppppp-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"}]}
+{"system":{"drvPath":"${FAKE_DECLARED_DERIVER:-/nix/store/declared.drv}","storePath":"${FAKE_RUNNING_SYSTEM:?}"},"packages":[
+{"source":"environment.systemPackages","label":"Firefox","name":"firefox","version":"1.0","storePath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-firefox-1.0","drvPath":"/nix/store/firefox.drv","position":"fixture"},
+{"source":"core:systemd","label":"systemd","name":"glibc","version":"2.40","storePath":"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40","drvPath":"/nix/store/glibc.drv","position":"fixture"},
+{"source":"option:services.active.package","label":"Active option package","name":"active-option","version":"1.0","storePath":"/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-active-option-1.0","drvPath":"/nix/store/active-option.drv","position":"fixture"},
+{"source":"option:services.fixture.package","label":"Unused option package","name":"unused-option-package","version":"","storePath":"/nix/store/oooooooooooooooooooooooooooooooo-unused-option-package","drvPath":"/nix/store/unused-option-package.drv","position":"fixture"},
+{"source":"option:programs.firefox.package","label":"Unused Firefox option","name":"firefox","version":"1.0","storePath":"/nix/store/pppppppppppppppppppppppppppppppp-firefox-option-hint","drvPath":"/nix/store/firefox-option-hint.drv","position":"fixture"},
+{"source":"users.users.fixture.packages","label":"LibreOffice","name":"libreoffice","version":"25.8.5.2","storePath":"/nix/store/2akv85mki37vf527jzabd8a7p8kwnqf7-libreoffice-25.8.5.2-wrapped","drvPath":"/nix/store/libreoffice.drv","position":"fixture"},
+{"source":"environment.systemPackages","label":"Plasma Workspace","name":"plasma-workspace","version":"6.7.3","storePath":"/nix/store/1zrb8vx1al09dvk0rjylph0y7psbspwh-plasma-workspace-6.7.3","drvPath":"/nix/store/plasma-workspace.drv","position":"fixture"},
+{"source":"option:services.displayManager.sessionPackages","label":"Plasma session","name":"plasma-workspace","version":"6.7.3","storePath":"/nix/store/3xih9m9w3jdc0wckwqgagwcfgdckink1-plasma-workspace-6.7.3-sessions","drvPath":"/nix/store/plasma-workspace-sessions.drv","position":"fixture"},
+{"source":"option:hardware.nvidia.package","label":"hardware.nvidia.package","name":"nvidia-x11","version":"610.43.03","storePath":"/nix/store/hzskfg26hi7nzf55yd5yyvivg53j86lj-nvidia-x11-610.43.03","drvPath":"/nix/store/nvidia-x11.drv","position":"fixture"},
+{"source":"environment.systemPackages","label":"NVIDIA binaries","name":"nvidia-x11","version":"610.43.03","storePath":"/nix/store/2399zqfl0bcgcplmq0q26pmcgayyycgr-nvidia-x11-610.43.03-bin","drvPath":"/nix/store/nvidia-x11-bin.drv","position":"fixture"},
+{"source":"option:hardware.graphics.extraPackages32","label":"NVIDIA 32-bit libraries","name":"nvidia-x11","version":"610.43.03","storePath":"/nix/store/5ka60mra70vm4np5z2p7b887hn432hxb-nvidia-x11-610.43.03-lib32","drvPath":"/nix/store/nvidia-x11-lib32.drv","position":"fixture"},
+{"source":"boot.extraModulePackages","label":"Kernel module","name":"nvidia-open","version":"610.43.03-7.1.4","storePath":"/nix/store/abababababababababababababababab-nvidia-open-610.43.03-7.1.4","drvPath":"/nix/store/nvidia-open.drv","position":"fixture"},
+{"source":"option:services.selector.package","label":"Selector package","name":"selector-old","version":"1.0","storePath":"/nix/store/uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu-selector-old-1.0","drvPath":"/nix/store/selector-old.drv","position":"fixture"}
+]}
 EOF
   fi
 elif [[ "$arguments" == *" eval "* && "$arguments" == *" --raw "* ]]; then

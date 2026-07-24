@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr auto Version = "4.1.9";
+constexpr auto Version = "4.1.11";
 constexpr int DetailRole = Qt::UserRole;
 
 struct AppSettings {
@@ -630,6 +630,7 @@ private:
         updates_->setSelectionBehavior(QAbstractItemView::SelectRows);
         updates_->setSelectionMode(QAbstractItemView::SingleSelection);
         updates_->setTextElideMode(Qt::ElideRight);
+        updates_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         updates_->setStyleSheet(
             "QTableView { outline: 0; }"
             "QTableView::item { border: 0; padding-left: 8px; padding-right: 8px; }");

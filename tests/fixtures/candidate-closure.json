@@ -7,5 +7,15 @@
   "/nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-added-1": { "narSize": 50 },
   "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-active-option-2.0": { "narSize": 13 },
   "/nix/store/ssssssssssssssssssssssssssssssss-command-not-found": { "narSize": 5 },
-  "/nix/store/tttttttttttttttttttttttttttttttt-nixos-manual": { "narSize": 7 }
+  "/nix/store/tttttttttttttttttttttttttttttttt-nixos-manual": { "narSize": 7 },
+  "/nix/store/9pyqnlv2r9qz2wlvpgda7zcp1k0ys971-libreoffice-25.8.5.2-wrapped": { "narSize": 200 },
+  "/nix/store/nw3f6x47d6sjgzjhm7ad5dpkhyz6nkvh-libreoffice-25.8.5.2": { "narSize": 100 },
+  "/nix/store/mr86mmghizv5fm6kn5d5wbhhii1ifi0r-plasma-workspace-6.7.3": { "narSize": 80 },
+  "/nix/store/ndw8m07pldhw8crxf9m5ndxpk4c1jl1w-plasma-workspace-6.7.3-sessions": { "narSize": 20 },
+  "/nix/store/4xzs2h9c4km8vyb00ihlv9k85f11vwg4-nvidia-x11-610.43.03": { "narSize": 100 },
+  "/nix/store/9jivd9s9sgidwxraj5qldank4wvm5jsr-nvidia-x11-610.43.03-bin": { "narSize": 80 },
+  "/nix/store/wph12g24xf5kk83qwbhd61bcm5yyiisg-nvidia-x11-610.43.03-firmware": { "narSize": 40 },
+  "/nix/store/yys36d1h68ypcfjbzjl10vsrra2azfgk-nvidia-x11-610.43.03-lib32": { "narSize": 60 },
+  "/nix/store/uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu-selector-old-1.0": { "narSize": 8 },
+  "/nix/store/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd-nvidia-open-610.43.03-7.1.4": { "narSize": 70 }
 }

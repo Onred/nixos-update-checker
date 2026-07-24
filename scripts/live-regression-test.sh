@@ -238,8 +238,8 @@ echo "Building and switching to the old-content generation..."
 sudo nixos-rebuild switch --flake "path:$config_directory#$host"
 
 installed_version=$(/run/current-system/sw/bin/nixos-update-checker-service --version 2>/dev/null || true)
-[[ "$installed_version" == *"4.1.9"* ]] || {
-  echo "The test generation does not contain updater 4.1.9: $installed_version" >&2
+[[ "$installed_version" == *"4.1.11"* ]] || {
+  echo "The test generation does not contain updater 4.1.11: $installed_version" >&2
   echo "Keep the current updater input in the older lock and try again." >&2
   exit 1
 }

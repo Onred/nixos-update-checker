@@ -77,6 +77,24 @@ jq -e '
   (.packages.changes | map(.name) | index("unused-option-package") | not) and
   all(.packages.changes[]; .sizeKnown == false) and
   .packages.rebuilds.sizeKnown == false and
+  (["libreoffice", "nvidia-open", "nvidia-x11", "plasma-workspace"]
+    - [.packages.rebuilds.items[].name] | length) == 0 and
+  ([.packages.changes[].name]
+    | map(select(
+      . == "libreoffice" or . == "nvidia-open" or
+      . == "nvidia-x11" or . == "plasma-workspace"
+    ))
+    | length) == 0 and
+  any(.discovery.packages[];
+    .name == "nvidia-x11" and
+    (.sources | index("option:hardware.nvidia.package")) != null and
+    (.sources | index("core:nvidia")) == null
+  ) and
+  any(.discovery.packages[];
+    .name == "nvidia-open" and
+    (.sources | index("boot.extraModulePackages")) != null
+  ) and
+  (.baselineDiscovery.packages | type) == "array" and
   .packages.system.count == 2 and .packages.system.sizeKnown == false and
   ([.packages.changes[].after.versions[]?, .packages.rebuilds.items[].versions[]?]
     | index("unversioned") | not) and
@@ -91,6 +109,20 @@ if grep -q 'unused-option-package' "$work/nix-invocations"; then
 fi
 if grep -q 'firefox-option-hint' "$work/nix-invocations"; then
   echo "Preview queried an option hint merely because its name matched" >&2
+  exit 1
+fi
+if grep -q 'selector-other' "$work/nix-invocations"; then
+  echo "Preview followed a proven option source after its package identity changed" >&2
+  exit 1
+fi
+if ! grep -q '4xzs2h9c4km8vyb00ihlv9k85f11vwg4-nvidia-x11-610.43.03' \
+  "$work/nix-invocations"; then
+  echo "Preview did not follow the baseline-proven NVIDIA package option" >&2
+  exit 1
+fi
+if ! grep -q 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd-nvidia-open-610.43.03-7.1.4' \
+  "$work/nix-invocations"; then
+  echo "Preview did not query the configured kernel module package" >&2
   exit 1
 fi
 [[ -s "$candidate_lock" ]]
@@ -281,8 +313,24 @@ jq -e '
   .build.sizeKnown == true and
   (.packages.changes[] | select(.name == "added") | .deltaBytes) == 50 and
   (.packages.changes[] | select(.name == "removed") | .deltaBytes) == -30 and
-  .packages.rebuilds.count == 1 and
+  .packages.rebuilds.count == 5 and
   .packages.rebuilds.deltaBytes == 1 and
+  (["libreoffice", "nvidia-open", "nvidia-x11", "plasma-workspace"]
+    - [.packages.rebuilds.items[].name] | length) == 0 and
+  ([.packages.changes[].name]
+    | map(select(
+      . == "libreoffice" or . == "nvidia-open" or
+      . == "nvidia-x11" or . == "plasma-workspace"
+    ))
+    | length) == 0 and
+  (.packages.rebuilds.items[] | select(.name == "libreoffice") | .versions)
+    == ["25.8.5.2"] and
+  (.packages.rebuilds.items[] | select(.name == "nvidia-x11") | .versions)
+    == ["610.43.03", "610.43.03-firmware"] and
+  (.packages.rebuilds.items[] | select(.name == "nvidia-open") | .versions)
+    == ["610.43.03-7.1.4"] and
+  (.packages.rebuilds.items[] | select(.name == "plasma-workspace") | .versions)
+    == ["6.7.3"] and
   .packages.system.count == 2 and .packages.system.deltaBytes == 2 and
   (.analysis.previewComparison.missedByPreview | index("removed")) != null
 ' "$report" >/dev/null

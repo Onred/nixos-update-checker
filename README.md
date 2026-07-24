@@ -202,7 +202,9 @@ leaving it ready for the GUI's Build Update and install flow.
 - Package-valued module options are discovery hints, not proof of closure
   membership. A preview accepts an updated option package only when the same
   option source supplied a package proven present in the realized baseline.
-  Explicit configured packages remain eligible as additions.
+  On a first run, exact current paths in that closure establish the source
+  evidence without requiring a saved snapshot. Explicit configured packages
+  remain eligible as additions.
 - A manual build realizes the exact saved candidate but never activates it.
 - Installing is privileged, installs the exact reviewed `flake.lock`, and runs
   either `nixos-rebuild switch` or `nixos-rebuild boot` for the configuration

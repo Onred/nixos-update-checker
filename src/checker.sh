@@ -277,6 +277,36 @@ build_preview_candidates() {
   ' >"$destination"
 }
 
+anchor_baseline_discovery() {
+  local baseline=$1
+  local saved_discovery=$2
+  local working_discovery=$3
+  local destination=$4
+
+  jq -n \
+    --slurpfile baseline "$baseline" \
+    --slurpfile saved "$saved_discovery" \
+    --slurpfile working "$working_discovery" '
+    ($baseline[0] | keys) as $baselinePaths |
+    (($saved[0].packages // []) + [
+      $working[0].packages[]? |
+      select(.storePath as $path | ($baselinePaths | index($path)) != null)
+    ]) |
+    reduce .[] as $package ({};
+      .[$package.storePath] = (
+        if .[$package.storePath] == null then $package
+        else $package + {
+          sources: ((.[$package.storePath].sources + $package.sources) | unique | sort)
+        } end
+      )
+    ) |
+    {
+      system: ($saved[0].system // $working[0].system // null),
+      packages: ([.[]] | sort_by(.storePath))
+    }
+  ' >"$destination"
+}
+
 filter_preview_discovery() {
   local baseline=$1
   local discovery=$2
@@ -288,16 +318,24 @@ filter_preview_discovery() {
     --slurpfile discovery "$discovery" \
     --slurpfile baselineDiscovery "$baseline_discovery" '
     ($baseline[0] | keys) as $baselinePaths |
-    ([$baselineDiscovery[0].packages[]? |
-      select(.storePath as $path | ($baselinePaths | index($path)) != null) |
-      .sources[]] | unique) as $activeSources |
+    (reduce (
+      $baselineDiscovery[0].packages[]? |
+      select(.storePath as $path | ($baselinePaths | index($path)) != null)
+    ) as $package ({};
+      reduce $package.sources[] as $source (.;
+        .[$source] = (((.[$source] // []) + [$package.name]) | unique | sort)
+      )
+    )) as $activeSources |
     $discovery[0] |
     .packages |= map(
       . as $package |
       select(
         any($package.sources[]; startswith("option:") | not)
         or ($baselinePaths | index($package.storePath)) != null
-        or any($package.sources[]; . as $source | ($activeSources | index($source)) != null)
+        or any($package.sources[];
+          . as $source |
+          (($activeSources[$source] // []) | index($package.name)) != null
+        )
       )
     )
   ' >"$destination"
@@ -306,29 +344,30 @@ filter_preview_discovery() {
 compare_preview() {
   local baseline=$1
   local candidate=$2
-  local discovery=$3
-  local destination=$4
+  local baseline_discovery=$3
+  local candidate_discovery=$4
+  local destination=$5
 
   jq -n \
     --slurpfile baseline "$baseline" \
     --slurpfile candidate "$candidate" \
-    --slurpfile discovery "$discovery" '
+    --slurpfile baselineDiscovery "$baseline_discovery" \
+    --slurpfile candidateDiscovery "$candidate_discovery" '
     def parsedIdentity($path):
       ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
       (try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$")) catch null)
         // {name: $base, version: ""};
-    def rootMap:
-      reduce $discovery[0].packages[] as $package ({};
+    def rootMap($discovery):
+      reduce $discovery.packages[] as $package ({};
         .[$package.storePath] = $package
       );
-    rootMap as $roots |
-    def identity($path):
+    def identity($path; $roots):
       if $roots[$path] != null then
         {name: $roots[$path].name, version: $roots[$path].version}
       else parsedIdentity($path) end;
-    def packages($closure):
+    def packages($closure; $roots):
       $closure | to_entries |
-      map(.key as $path | (identity($path)) + {
+      map(.key as $path | (identity($path; $roots)) + {
         path: $path,
         narSize: .value.narSize,
         explicit: any($roots[$path].sources[]?; startswith("option:") | not),
@@ -354,8 +393,12 @@ compare_preview() {
         sizeKnown: false,
         confidence: $package.confidence
       } end;
-    packages($baseline[0]) as $before |
-    packages($candidate[0]) as $after |
+    # Use discovered identities for roots in each system. Output suffixes
+    # such as -wrapped, -sessions, and -lib32 are not package versions.
+    rootMap($baselineDiscovery[0]) as $baselineRoots |
+    rootMap($candidateDiscovery[0]) as $candidateRoots |
+    packages($baseline[0]; $baselineRoots) as $before |
+    packages($candidate[0]; $candidateRoots) as $after |
     [($after | keys[]) as $name |
       (($before[$name].entries // []) | map(.path)) as $beforePaths |
       [$after[$name].entries[] |
@@ -412,32 +455,33 @@ compare_preview() {
 compare_closures() {
   local baseline=$1
   local candidate=$2
-  local discovery=$3
-  local destination=$4
+  local baseline_discovery=$3
+  local candidate_discovery=$4
+  local destination=$5
 
   jq -n \
     --slurpfile baseline "$baseline" \
     --slurpfile candidate "$candidate" \
-    --slurpfile discovery "$discovery" '
+    --slurpfile baselineDiscovery "$baseline_discovery" \
+    --slurpfile candidateDiscovery "$candidate_discovery" '
     def parsedIdentity($path):
       ($path | split("/")[-1] | sub("^[^-]+-"; "")) as $base |
       (try ($base | capture("^(?<name>.*?)-(?<version>[0-9].*)$")) catch null)
         // {name: $base, version: ""};
-    def rootMap:
-      reduce $discovery[0].packages[] as $package ({};
+    def rootMap($discovery):
+      reduce $discovery.packages[] as $package ({};
         .[$package.storePath] = $package
       );
-    rootMap as $roots |
-    def identity($path; $value):
+    def identity($path; $roots):
       if $roots[$path] != null then
         {name: $roots[$path].name, version: $roots[$path].version}
       else parsedIdentity($path) end;
     def confidence($entries):
       if any($entries[]; .previewSource == "configured") then "configured"
       else "confirmed" end;
-    def packages($closure):
+    def packages($closure; $roots):
       $closure | to_entries |
-      map(.key as $path | (identity($path; .value)) + {
+      map(.key as $path | (identity($path; $roots)) + {
         path: $path,
         narSize: .value.narSize,
         explicit: any($roots[$path].sources[]?; startswith("option:") | not),
@@ -463,12 +507,16 @@ compare_closures() {
         sizeKnown: $package.sizeKnown,
         confidence: $package.confidence
       } end;
-    packages($baseline[0]) as $before |
-    packages($candidate[0]) as $after |
+    # Keep root identity symmetric instead of parsing only baseline store names.
+    rootMap($baselineDiscovery[0]) as $baselineRoots |
+    rootMap($candidateDiscovery[0]) as $candidateRoots |
+    packages($baseline[0]; $baselineRoots) as $before |
+    packages($candidate[0]; $candidateRoots) as $after |
     [((($before | keys) + ($after | keys)) | unique)[] as $name |
       (($before[$name].entries // []) | map(.path)) as $beforePaths |
       (($after[$name].entries // []) | map(.path)) as $afterPaths |
       select($beforePaths != $afterPaths) |
+      (($after[$name].versions // []) - ($before[$name].versions // [])) as $introducedVersions |
       ([($after[$name].entries // [])[] |
         select(.path as $path | ($beforePaths | index($path) | not)) |
         .narSize | select(type == "number")] | add // 0) as $added |
@@ -480,7 +528,8 @@ compare_closures() {
         userFacing: (($after[$name].userFacing // false) or ($before[$name].userFacing // false)),
         kind: (if $before[$name] == null then "added"
                elif $after[$name] == null then "removed"
-               elif $before[$name].versions != $after[$name].versions then "version"
+               # Match preview semantics: an update introduces a version.
+               elif ($introducedVersions | length) > 0 then "version"
                else "rebuild" end),
         confidence: ($after[$name].confidence // "confirmed"),
         sizeKnown: (($before[$name] == null or $before[$name].sizeKnown == true)
@@ -791,6 +840,10 @@ run_preview() {
     "$temporary_directory/baseline-path-info.log" "$baseline_system" || \
     fail "Could not read packages from the current system." \
       "$({ cat "$temporary_directory/baseline-path-info.log"; } 2>/dev/null)"
+  anchor_baseline_discovery "$temporary_directory/baseline.json" \
+    "$baseline_discovery" "$temporary_directory/working-discovery.json" \
+    "$temporary_directory/anchored-baseline-discovery.json"
+  baseline_discovery="$temporary_directory/anchored-baseline-discovery.json"
 
   local analysis_mode=preview
   local candidate_closure_complete=false
@@ -800,7 +853,8 @@ run_preview() {
     log "The available update matches the current system; reusing its package information."
     install -m 0644 "$temporary_directory/baseline.json" "$candidate_data"
     compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
-      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+      "$baseline_discovery" "$temporary_directory/discovery.json" \
+      "$temporary_directory/comparison.json"
     analysis_mode=verified
     candidate_closure_complete=true
     build_size_known=true
@@ -812,7 +866,8 @@ run_preview() {
       fail "Could not read packages from the available update." \
         "$({ cat "$temporary_directory/candidate-path-info.log"; } 2>/dev/null)"
     compare_closures "$temporary_directory/baseline.json" "$candidate_data" \
-      "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+      "$baseline_discovery" "$temporary_directory/discovery.json" \
+      "$temporary_directory/comparison.json"
     analysis_mode=verified
     candidate_closure_complete=true
     build_size_known=true
@@ -832,7 +887,8 @@ run_preview() {
     build_preview_candidates "$temporary_directory/preview-discovery.json" \
       "$temporary_directory/candidate-metadata.json" "$candidate_data"
     compare_preview "$temporary_directory/baseline.json" "$candidate_data" \
-      "$temporary_directory/preview-discovery.json" "$temporary_directory/comparison.json"
+      "$baseline_discovery" "$temporary_directory/preview-discovery.json" \
+      "$temporary_directory/comparison.json"
 
     log "Checking which parts of the update need to be built on this computer."
     local dry_run_status=0
@@ -894,6 +950,7 @@ run_preview() {
     --argjson elapsed "$elapsed" \
     --slurpfile inputs "$temporary_directory/inputs.json" \
     --slurpfile comparison "$temporary_directory/comparison.json" \
+    --slurpfile baselineDiscovery "$baseline_discovery" \
     --slurpfile discovery "$temporary_directory/discovery.json" \
     --slurpfile localBuilds "$temporary_directory/local-builds.json" \
     --slurpfile candidatePreview "$candidate_data" '
@@ -922,6 +979,7 @@ run_preview() {
         complete: $inputBaselineComplete,
         system: $baselineSystem
       },
+      baselineDiscovery: $baselineDiscovery[0],
       discovery: $discovery[0],
       packages: {
         changes: $diff.changes,
@@ -1031,8 +1089,11 @@ run_build() {
     "$temporary_directory/candidate.log" "$candidate_system" || \
     fail "Could not read packages from the built update." "$({ cat "$temporary_directory/candidate.log"; } 2>/dev/null)"
   jq '.discovery' "$preview" >"$temporary_directory/discovery.json"
+  jq '.baselineDiscovery // {packages: []}' "$preview" \
+    >"$temporary_directory/baseline-discovery.json"
   compare_closures "$temporary_directory/baseline.json" "$temporary_directory/candidate.json" \
-    "$temporary_directory/discovery.json" "$temporary_directory/comparison.json"
+    "$temporary_directory/baseline-discovery.json" "$temporary_directory/discovery.json" \
+    "$temporary_directory/comparison.json"
 
   local elapsed=$(( $(date +%s) - started ))
   local verified_at
@@ -1120,7 +1181,7 @@ while (($#)); do
       exit 0
       ;;
     --version)
-      echo "nixos-update-checker-service 4.1.9"
+      echo "nixos-update-checker-service 4.1.11"
       exit 0
       ;;
     --*)
