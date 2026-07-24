@@ -639,6 +639,7 @@ private:
         updates_->horizontalHeader()->setSectionsMovable(false);
         updates_->horizontalHeader()->setSectionsClickable(false);
         updates_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        updates_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
         updates_->horizontalHeader()->setMinimumSectionSize(70);
         updates_->horizontalHeader()->setStretchLastSection(false);
         updates_->setInitialColumnWidths(500, 190, 110);
